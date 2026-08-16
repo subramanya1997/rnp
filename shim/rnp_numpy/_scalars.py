@@ -39,6 +39,26 @@ ndarray = _rnp.ndarray
 _SCALAR_BY_NAME = {}
 
 
+def _void_key(v):
+    """A comparable rendering of a structured void.
+
+    `item()` hands subarray fields back as *arrays*, exactly as numpy does, so
+    it cannot be compared with `==` directly -- the array comparison would be
+    elementwise. Equality is defined on the values, so the arrays are
+    flattened to lists first.
+    """
+    return tuple(x.tolist() if hasattr(x, "tolist") and hasattr(x, "shape")
+                 else x for x in v.item())
+
+
+def _raw_bytes(arr):
+    """The raw item bytes of a (0-d) array; the port has no `ndarray.tobytes`."""
+    try:
+        return bytes(memoryview(arr))
+    except (TypeError, BufferError, ValueError):
+        return bytes(memoryview(arr.copy()))
+
+
 # ---------------------------------------------------------------------------
 # repr helpers
 # ---------------------------------------------------------------------------
@@ -1137,34 +1157,253 @@ class str_(str, character, metaclass=_FlexMeta, char="U"):
 
 
 class void(flexible, metaclass=_FlexMeta, char="V"):
+    """`np.void`: either an opaque run of bytes (`V<n>`) or a **structured
+    scalar** — one element of a structured array.
+
+    A structured void is backed by a genuine 0-d *view* of the element it came
+    from (`_arr`), which is how numpy's own behaviour falls out for free:
+    `a[1]['f0'] = 7` writes through to `a`, `v.base` is the parent array, and
+    `setfield` mutates shared memory.
+    """
+
     __module__ = "numpy"
-    __slots__ = ("_v",)
+    __slots__ = ("_b", "_arr")
 
     def __new__(cls, value=b"", dtype=None):
         self = object.__new__(cls)
+        self._arr = None
+        if dtype is not None:
+            d = _rnp.dtype(dtype)
+            if d.names is not None:
+                # `np.void((1, 2.0), dtype='i4,f8')` builds a real structured
+                # scalar, as numpy 2.x does.
+                a = _rnp.array([value], dtype=d)
+                self._arr = a[0]._arr
+                self._b = None
+                return self
         if isinstance(value, int):
-            self._v = b"\x00" * value
-        elif isinstance(value, (bytes, bytearray, memoryview)):
-            self._v = bytes(value)
+            self._b = b"\x00" * value
         else:
-            self._v = bytes(value)
+            self._b = bytes(value)
         return self
+
+    @classmethod
+    def _from_array(cls, arr):
+        """Wrap a 0-d array *view* of one element. Called from Rust."""
+        self = object.__new__(cls)
+        self._arr = arr
+        self._b = None
+        return self
+
+    # -- the byte payload --------------------------------------------------
+
+    @property
+    def _v(self):
+        if self._arr is None:
+            return self._b
+        if self._arr.dtype.names is None:
+            return _raw_bytes(self._arr)
+        return self.item()
 
     @property
     def dtype(self):
-        return dtype(f"V{len(self._v)}")
+        if self._arr is not None:
+            return self._arr.dtype
+        return _rnp.dtype(f"V{len(self._b)}")
+
+    @property
+    def base(self):
+        return None if self._arr is None else self._arr.base
+
+    @property
+    def flags(self):
+        if self._arr is not None:
+            return self._arr.flags
+        return _rnp.array(self._b, dtype=self.dtype).flags
+
+    def __array__(self, dtype=None, copy=None):
+        a = self._arr if self._arr is not None else _rnp.array(
+            self._b, dtype=self.dtype)
+        return a if dtype is None else a.astype(dtype)
 
     def __bytes__(self):
-        return self._v
+        return self.tobytes()
+
+    def tobytes(self, order="C"):
+        if self._arr is None:
+            return self._b
+        return _raw_bytes(self._arr)
 
     def __len__(self):
-        return len(self._v)
+        # Probed: `len(np.void(b'abc'))` is 0 -- an unstructured void has no
+        # fields, and numpy reports the *field* count.
+        names = self.dtype.names
+        return 0 if names is None else len(names)
+
+    # -- field access ------------------------------------------------------
+
+    def _field_name(self, indx):
+        names = self.dtype.names
+        if names is None:
+            raise IndexError(
+                "too many indices for array: array is 0-dimensional, "
+                "but 1 were indexed")
+        n = len(names)
+        i = indx + n if indx < 0 else indx
+        if i < 0 or i >= n:
+            # Probed: numpy reports the *normalised* index, so `v[-99]` on a
+            # two-field void says `invalid index (-97)`.
+            raise IndexError(f"invalid index ({i})")
+        return names[i]
+
+    def __getitem__(self, indx):
+        if indx == () or indx is Ellipsis:
+            return self
+        if self._arr is None:
+            if isinstance(indx, str):
+                raise TypeError("void data-type with no fields")
+            raise IndexError(
+                "too many indices for array: array is 0-dimensional, "
+                "but 1 were indexed")
+        if isinstance(indx, _numbers.Integral) and not isinstance(indx, _builtins.bool):
+            indx = self._field_name(int(indx))
+        if isinstance(indx, str) or isinstance(indx, list):
+            v = self._arr[indx]
+            # A *subarray* field of a 0-d void is a real array, not a scalar:
+            # `tuple(np.zeros(1,[('x','i4',(2,2))])[0])` yields an ndarray.
+            return v[()] if getattr(v, "ndim", 0) == 0 else v
+        raise IndexError(
+            "only integers, slices (`:`), ellipsis (`...`), numpy.newaxis "
+            "(`None`) and integer or boolean arrays are valid indices")
+
+    def __setitem__(self, indx, value):
+        if self._arr is None:
+            raise TypeError("void data-type with no fields")
+        if isinstance(indx, _numbers.Integral) and not isinstance(indx, _builtins.bool):
+            indx = self._field_name(int(indx))
+        self._arr[indx] = value
+
+    def __iter__(self):
+        names = self.dtype.names
+        if names is None:
+            raise TypeError("iteration over a 0-d array")
+        for name in names:
+            yield self[name]
+
+    def __contains__(self, item):
+        names = self.dtype.names
+        return bool(names) and item in names
+
+    def getfield(self, dt, offset=0):
+        return self.__array__().getfield(dt, offset)[()]
+
+    def setfield(self, val, dt, offset=0):
+        if self._arr is None:
+            raise TypeError("Cannot set fields on an unstructured void")
+        self._arr.setfield(val, dt, offset)
+
+    def view(self, dt=None, type_=None):
+        # numpy's `(scalar_class, dtype)` spelling: `v.view((np.record, dt))`
+        # is how `numpy._core.records` re-labels a structured void as a
+        # `record`. Reuse the same backing view so writeback still works.
+        if isinstance(dt, tuple) and len(dt) == 2 and isinstance(dt[0], type):
+            cls, want = dt
+            if issubclass(cls, void) and self._arr is not None:
+                arr = self._arr
+                if _rnp.dtype(want) != arr.dtype:
+                    arr = arr.astype(_rnp.dtype(want))
+                return cls._from_array(arr)
+        if isinstance(dt, type) and issubclass(dt, void):
+            return dt._from_array(self._arr) if self._arr is not None \
+                else dt(self._b)
+        if dt is None:
+            return self
+        v = self.__array__().view(dt)
+        return v[()] if getattr(v, "ndim", 1) == 0 else v
+
+    # -- value surface -----------------------------------------------------
+
+    def item(self, *args):
+        if args and args not in ((0,), ((),)):
+            raise ValueError("can only convert an array of size 1 to a "
+                             "Python scalar")
+        if self._arr is None:
+            return self._b
+        names = self.dtype.names
+        if names is None:
+            return _raw_bytes(self._arr)
+        out = []
+        for name in names:
+            f = self._arr[name]
+            # Probed: a *subarray* field comes back from `item()` as a real
+            # ndarray, not as nested lists -- unlike every scalar field.
+            out.append(f[()].item() if f.ndim == 0 else f)
+        return tuple(out)
+
+    def tolist(self):
+        return self.item()
+
+    def __eq__(self, other):
+        # numpy hands back `np.True_`/`np.False_`, not Python bools.
+        if isinstance(other, void):
+            if (self.dtype.names is None) != (other.dtype.names is None):
+                return NotImplemented
+            return bool_(_void_key(self) == _void_key(other))
+        if isinstance(other, (bytes, bytearray)) and self.dtype.names is None:
+            return bool_(self.tobytes() == bytes(other))
+        if self.dtype.names is not None:
+            raise TypeError(
+                "Cannot compare structured or void to non-void arrays.")
+        return NotImplemented
+
+    def __ne__(self, other):
+        r = self.__eq__(other)
+        return r if r is NotImplemented else bool_(not r)
+
+    def __hash__(self):
+        if self.dtype.names is None:
+            return hash(self.tobytes())
+        return hash(_void_key(self))
+
+    def __reduce__(self):
+        if self.dtype.names is None:
+            return (type(self), (self.tobytes(),))
+        return (type(self), (self.item(), self.dtype))
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
 
     def __repr__(self):
-        inner = "".join("\\x%02x" % b for b in self._v)
-        return f"np.void(b'{inner}')"
+        if self.dtype.names is None:
+            inner = "".join("\\x%02x" % b for b in self.tobytes())
+            return f"np.void(b'{inner}')"
+        return self._struct_repr()
 
-    __str__ = __repr__
+    def _struct_repr(self):
+        # numpy's own `_void_scalar_to_string(x, is_repr=True)` wraps the value
+        # in `np.dtype((np.void, x.dtype))`, which for a structured dtype is
+        # just that dtype again. The wrapper is rebuilt here rather than taken
+        # from arrayprint because the port's `dtype((void, struct))` spelling
+        # is not yet accepted by the dtype constructor.
+        cls = type(self)
+        fqn = cls.__module__.replace("numpy", "np") + "." + cls.__name__
+        return f"{fqn}({self._struct_str(False)}, dtype={self.dtype!s})"
+
+    def _struct_str(self, is_repr):
+        # Delegates to the faithful port of numpy's own arrayprint, which is
+        # exactly what numpy's C `scalartypes.c.src` does for a structured
+        # void: per-field elementwise formatters, `float_kind` forced to str.
+        from ._core.arrayprint import _void_scalar_to_string
+        return _void_scalar_to_string(self, is_repr=is_repr)
+
+    def __str__(self):
+        if self.dtype.names is None:
+            inner = "".join("\\x%02x" % b for b in self.tobytes())
+            return f"b'{inner}'"
+        return self._struct_str(False)
 
 
 class object_(generic, metaclass=_ScalarMeta):

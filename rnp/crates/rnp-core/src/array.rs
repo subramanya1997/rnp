@@ -917,6 +917,46 @@ impl NdArray {
         out
     }
 
+    /// A view onto one *field* of a structured array: same buffer, the field's
+    /// byte offset folded into `byte_offset`, and the field's descriptor.
+    ///
+    /// A **subarray** field (`('f', 'i4', (2, 2))`) splices its shape onto the
+    /// end of the array's own shape with C-order strides inside the item, so
+    /// `np.zeros(3, [('x','i4',(2,2))])['x']` has shape `(3, 2, 2)` and
+    /// strides `(itemsize, 8, 4)` — exactly what numpy reports.
+    ///
+    /// `descr` must be the field's declared descriptor and `offset` its byte
+    /// offset within one item; see `Descr::field`.
+    pub fn field_view(&self, descr: Descr, offset: usize) -> NdArray {
+        let mut out = self.clone();
+        out.byte_offset += offset as isize;
+        out.flags.owndata = false;
+        match descr.subarray_def() {
+            Some(sub) => {
+                let base = sub.base;
+                let inner = c_strides(&sub.shape, base.itemsize());
+                out.shape.extend_from_slice(&sub.shape);
+                out.strides.extend_from_slice(&inner);
+                out.descr = base;
+            }
+            None => out.descr = descr,
+        }
+        out.update_flags();
+        out
+    }
+
+    /// A view of the same items reinterpreted through a different descriptor
+    /// of the *same* itemsize — what a multi-field selection needs, since
+    /// numpy 2.x keeps the parent's itemsize and the fields' original offsets.
+    pub fn with_descr_same_itemsize(&self, descr: Descr) -> NdArray {
+        debug_assert_eq!(descr.itemsize(), self.itemsize());
+        let mut out = self.clone();
+        out.descr = descr;
+        out.flags.owndata = false;
+        out.update_flags();
+        out
+    }
+
     /// Drop `axis` (which must have been reduced to a single index already).
     pub fn remove_axis(&self, axis: usize) -> NdArray {
         let mut out = self.clone();
@@ -988,11 +1028,20 @@ impl NdArray {
 
     /// Typed contiguous slice, if the array is C-contiguous and matches `T`.
     pub fn as_slice<T: Element>(&self) -> Option<&[T]> {
-        if self.dtype() != T::DTYPE || !self.flags.c_contiguous || !self.is_native() {
+        // `flags.aligned` matters here for the same reason it does in
+        // `loops::flat_ptr`: a field view of a packed structured array can be
+        // C-contiguous at a byte offset that is not a multiple of its dtype's
+        // alignment, and a `&[T]` over it would be unsound.
+        if self.dtype() != T::DTYPE
+            || !self.flags.c_contiguous
+            || !self.flags.aligned
+            || !self.is_native()
+        {
             return None;
         }
-        // SAFETY: the array is C-contiguous with `size()` elements of exactly
-        // `T`'s dtype starting at `byte_offset`, all inside the allocation.
+        // SAFETY: the array is C-contiguous and aligned, with `size()`
+        // elements of exactly `T`'s dtype starting at `byte_offset`, all
+        // inside the allocation.
         unsafe {
             Some(std::slice::from_raw_parts(
                 self.buffer.as_ptr().offset(self.byte_offset) as *const T,
@@ -1023,6 +1072,81 @@ mod tests {
         // np.zeros((2,3,4), np.float64, order='F').strides == (8, 16, 48)
         assert_eq!(f_strides(&[2, 3, 4], 8), vec![8, 16, 48]);
         assert_eq!(c_strides(&[], 8), Vec::<isize>::new());
+    }
+
+    /// Every number below was read off real numpy 2.5.2.
+    #[test]
+    fn field_view_arithmetic() {
+        use crate::descr::{make_struct, make_subarray, FieldSpec};
+
+        let spec = |name: &str, d: Descr| FieldSpec {
+            name: name.into(),
+            descr: d,
+            offset: None,
+            title: None,
+        };
+        // np.dtype([('f0','i4'),('f1','f8'),('f2','u1')]) -> itemsize 13,
+        // offsets 0, 4, 12.
+        let d = make_struct(
+            vec![
+                spec("f0", Descr::native(DType::I32)),
+                spec("f1", Descr::native(DType::F64)),
+                spec("f2", Descr::native(DType::U8)),
+            ],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.itemsize(), 13);
+        assert_eq!(d.field("f1").unwrap().1, 4);
+        assert_eq!(d.field("f2").unwrap().1, 12);
+        assert!(d.field("nope").is_none());
+
+        let a = NdArray::zeros_descr(vec![4], d).unwrap();
+        assert_eq!(a.strides, vec![13]);
+        let f1 = a.field_view(d.field("f1").unwrap().0, d.field("f1").unwrap().1);
+        assert_eq!(f1.shape, vec![4]);
+        assert_eq!(f1.strides, vec![13]);
+        assert_eq!(f1.byte_offset, 4);
+        assert_eq!(f1.dtype(), DType::F64);
+        assert!(!f1.flags.owndata);
+        assert!(!f1.is_c_contiguous());
+        // The buffer really is shared.
+        assert!(Arc::ptr_eq(&a.buffer, &f1.buffer));
+
+        // Multi-field selection keeps the parent's itemsize and the original
+        // offsets: np.zeros(4,'i4,f8,u1')[['f0','f2']].dtype.itemsize == 13.
+        let sel = crate::descr::select_fields(d, &["f0".into(), "f2".into()]).unwrap();
+        assert_eq!(sel.itemsize(), 13);
+        assert_eq!(sel.field("f0").unwrap().1, 0);
+        assert_eq!(sel.field("f2").unwrap().1, 12);
+        assert!(sel.field("f1").is_none());
+        let m = a.with_descr_same_itemsize(sel);
+        assert_eq!(m.strides, vec![13]);
+        assert_eq!(m.byte_offset, 0);
+        assert!(crate::descr::select_fields(d, &["nope".into()]).is_none());
+
+        // A subarray field splices its shape onto the array's:
+        // np.zeros(3,[('x','i4',(2,2)),('y','f4')])['x'] has shape (3,2,2)
+        // and strides (20, 8, 4).
+        let sd = make_struct(
+            vec![
+                spec("x", make_subarray(Descr::native(DType::I32), vec![2, 2])),
+                spec("y", Descr::native(DType::F32)),
+            ],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(sd.itemsize(), 20);
+        assert_eq!(sd.field("y").unwrap().1, 16);
+        let b = NdArray::zeros_descr(vec![3], sd).unwrap();
+        let (xd, xo) = sd.field("x").unwrap();
+        let x = b.field_view(xd, xo);
+        assert_eq!(x.shape, vec![3, 2, 2]);
+        assert_eq!(x.strides, vec![20, 8, 4]);
+        assert_eq!(x.byte_offset, 0);
+        assert_eq!(x.dtype(), DType::I32);
     }
 
     #[test]

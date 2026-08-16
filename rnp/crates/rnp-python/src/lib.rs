@@ -9,6 +9,7 @@ use rnp_core::reduce::ReduceOp;
 use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod convert;
+mod fields;
 mod index;
 mod itemsel;
 mod pyarray;

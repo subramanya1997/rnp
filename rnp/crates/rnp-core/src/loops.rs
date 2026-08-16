@@ -30,10 +30,15 @@ pub(crate) const PAR_CHUNK: usize = 1 << 14;
 /// order, i.e. a flat typed slice can be formed.
 #[inline]
 pub(crate) fn flat_ptr<T>(a: &NdArray) -> Option<*const T> {
-    if !a.flags.c_contiguous {
+    // `flags.aligned` is not redundant with contiguity: a *field view* of a
+    // packed structured array (`np.zeros(1,'i4,f8')['f1']`) is C-contiguous --
+    // a length-1 axis imposes no stride constraint -- while its `byte_offset`
+    // is 4, so the typed pointer below would be misaligned. Such arrays fall
+    // through to the `read_unaligned` walk further down.
+    if !a.flags.c_contiguous || !a.flags.aligned {
         return None;
     }
-    // SAFETY: `byte_offset` is always a multiple of the itemsize and the
+    // SAFETY: the array is C-contiguous *and* aligned for its dtype, and the
     // allocation is 64-byte aligned, so the result is well aligned for T; the
     // array's `size()` elements from here are inside the allocation.
     unsafe { Some(a.buffer.as_ptr().offset(a.byte_offset) as *const T) }

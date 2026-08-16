@@ -344,6 +344,24 @@ impl Descr {
         }
     }
 
+    /// Look a field up by name *or title*, as numpy's `dtype.fields` mapping
+    /// does (a titled field is reachable under both keys).
+    ///
+    /// Returns the field's descriptor and its byte offset within the item.
+    pub fn field(&self, name: &str) -> Option<(Descr, usize)> {
+        let def = self.struct_def()?;
+        def.fields
+            .iter()
+            .find(|f| f.name == name || f.title.as_deref() == Some(name))
+            .map(|f| (f.descr, f.offset))
+    }
+
+    /// The field names in declaration order, or `None` for a non-struct.
+    pub fn field_names(&self) -> Option<Vec<String>> {
+        self.struct_def()
+            .map(|d| d.fields.iter().map(|f| f.name.clone()).collect())
+    }
+
     pub fn subarray_def(&self) -> Option<Arc<SubArrayDef>> {
         match self.dt {
             DType::SubArray(id) => Some(registry::subarray_def(id)),
@@ -928,6 +946,42 @@ pub fn make_struct(specs: Vec<FieldSpec>, itemsize: Option<usize>, align: bool) 
     };
     Ok(Descr::new(
         DType::Struct(registry::intern_struct(def)),
+        ByteOrder::NotApplicable,
+    ))
+}
+
+/// The dtype numpy 2.x hands back for a multi-field selection `a[['f0','f2']]`.
+///
+/// Probed from numpy 2.5.2: the result is a genuine **view**, so the selected
+/// fields keep their *original* offsets and the dtype keeps the *parent's*
+/// itemsize — `np.zeros(4, 'i4,f8,u1')[['f0','f2']].dtype` is
+/// `{'names': ['f0','f2'], 'formats': ['<i4','u1'], 'offsets': [0,12],
+/// 'itemsize': 13}`. Field order follows the requested order, not the
+/// declaration order.
+/// `names` must already have been validated (see the caller in
+/// `rnp-python/src/fields.rs`, which owns numpy's exact error messages for
+/// duplicate and unknown names); an unknown name yields `None`.
+pub fn select_fields(parent: Descr, names: &[String]) -> Option<Descr> {
+    let def = parent.struct_def()?;
+    let mut fields = Vec::with_capacity(names.len());
+    for name in names {
+        let f = def
+            .fields
+            .iter()
+            .find(|f| &f.name == name || f.title.as_deref() == Some(name.as_str()))?;
+        fields.push(f.clone());
+    }
+    let new = StructDef {
+        fields,
+        itemsize: def.itemsize,
+        // Probed: the selected dtype reports `alignment == 1` even when the
+        // parent is an aligned struct (numpy builds it through the
+        // offsets/itemsize dict form), while `isalignedstruct` is inherited.
+        alignment: 1,
+        aligned: def.aligned,
+    };
+    Some(Descr::new(
+        DType::Struct(registry::intern_struct(new)),
         ByteOrder::NotApplicable,
     ))
 }
