@@ -12,7 +12,7 @@ use pyo3::types::{PyDict, PyTuple};
 use rnp_core::element::Scalar;
 use rnp_core::{fpe, BinOp, DType, NdArray, UnOp};
 
-use crate::convert::{array_from_any, np_scalar, scalar_from_py, weak_dtype, weak_promote};
+use crate::convert::{array_from_any, np_scalar, scalar_from_py, weak_dtype};
 use crate::pyarray::{store_or_wrap, PyNdArray};
 use crate::pydtype::{dtype_from_any, PyDType};
 
@@ -150,6 +150,171 @@ fn resolve_operands(
     Ok(out)
 }
 
+/// Does this call belong to the object loop?
+///
+/// `object` absorbs every other dtype (`np.result_type(object, int64)` is
+/// `object`), so a single object operand decides the loop -- unless an
+/// explicit non-object `dtype=` overrides it, which is how `np.any` on an
+/// object array still reduces in `bool`.
+fn object_call(
+    objs: &[Bound<'_, PyAny>],
+    dtype: Option<&Bound<'_, PyAny>>,
+) -> PyResult<bool> {
+    // `__call__` never leaves the object loop: an incompatible `dtype=` is an
+    // error there, not a cast (unlike `.reduce`, which does accept one).
+    if let Some(d) = dtype {
+        if !d.is_none() && dtype_from_any(d).map(|t| t.is_object()).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    has_object_operand(objs)
+}
+
+/// As `object_call`, but for `.reduce`/`.accumulate`, where an explicit
+/// non-object `dtype=` *does* take the operand out of the object loop.
+fn wants_object(
+    objs: &[Bound<'_, PyAny>],
+    dtype: Option<&Bound<'_, PyAny>>,
+) -> PyResult<bool> {
+    if let Some(d) = dtype {
+        if !d.is_none() {
+            return Ok(dtype_from_any(d).map(|t| t.is_object()).unwrap_or(false));
+        }
+    }
+    has_object_operand(objs)
+}
+
+fn has_object_operand(objs: &[Bound<'_, PyAny>]) -> PyResult<bool> {
+    for o in objs {
+        if let Ok(a) = o.cast::<PyNdArray>() {
+            if a.borrow().arr.dtype().is_object() {
+                return Ok(true);
+            }
+            continue;
+        }
+        // A numpy scalar or a bare Python number never lands on object.
+        if np_scalar(o)?.is_some() || scalar_from_py(o).is_some() {
+            continue;
+        }
+        match array_from_any(o, None, false) {
+            Ok(a) => {
+                if a.dtype().is_object() {
+                    return Ok(true);
+                }
+            }
+            // Anything the array constructor cannot type is what numpy stores
+            // as `object` (a `Fraction`, a `Decimal`, `None`, a dict, a user
+            // class). A *sequence* that fails may instead be ragged input,
+            // which is a real error and must keep reporting as one -- so it
+            // only takes the object path when it actually holds an element no
+            // dtype describes.
+            Err(_) => {
+                if has_untyped_leaf(o, 0) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Does this (possibly nested) value contain a leaf that no numeric or text
+/// dtype describes -- which is exactly when numpy's array coercion falls back
+/// to `object`?
+fn has_untyped_leaf(o: &Bound<'_, PyAny>, depth: usize) -> bool {
+    if depth > 32 {
+        return true;
+    }
+    let is_seq =
+        o.is_instance_of::<pyo3::types::PyList>() || o.is_instance_of::<pyo3::types::PyTuple>();
+    if is_seq {
+        let seq = match o.cast::<pyo3::types::PySequence>() {
+            Ok(s) => s,
+            Err(_) => return true,
+        };
+        let n = seq.len().unwrap_or(0);
+        for i in 0..n {
+            match seq.get_item(i) {
+                Ok(item) => {
+                    if has_untyped_leaf(&item, depth + 1) {
+                        return true;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+        return false;
+    }
+    if o.is_instance_of::<pyo3::types::PyString>() || o.is_instance_of::<pyo3::types::PyBytes>() {
+        return false;
+    }
+    if o.is_instance_of::<PyNdArray>() {
+        return false;
+    }
+    if scalar_from_py(o).is_some() {
+        return false;
+    }
+    !matches!(np_scalar(o), Ok(Some(_)))
+}
+
+/// The operand an object loop reads from: an existing array keeps its own
+/// dtype (its elements are converted one at a time), anything else is interned
+/// straight into an `object` array.
+fn object_operand(a: &Bound<'_, PyAny>) -> PyResult<NdArray> {
+    if let Ok(x) = a.cast::<PyNdArray>() {
+        return Ok(x.borrow().arr.clone());
+    }
+    crate::objects::array_from_objects(a)
+}
+
+/// Read an object array back into a concrete dtype, element by element. Used
+/// when an explicit `dtype=` overrides the object loop.
+fn from_object(py: Python<'_>, a: &NdArray, dt: DType) -> PyResult<NdArray> {
+    if !a.dtype().is_object() {
+        return Ok(a.astype(dt));
+    }
+    let out = NdArray::zeros(a.shape.clone(), dt).map_err(crate::err)?;
+    let src: Vec<isize> = rnp_core::iter::offsets(&a.shape, &a.strides, a.byte_offset).collect();
+    let dst: Vec<isize> =
+        rnp_core::iter::offsets(&out.shape, &out.strides, out.byte_offset).collect();
+    for (k, &s) in src.iter().enumerate() {
+        let v = crate::objects::read(py, a, s);
+        let sc = crate::convert::any_scalar(&v)?
+            .or_else(|| v.is_truthy().ok().map(Scalar::Bool))
+            .unwrap_or(Scalar::Int(0));
+        out.write_at(dst[k], sc.cast(dt));
+    }
+    Ok(out)
+}
+
+/// Wrap a computed result into an `object` array, so that `out=` an object
+/// array stores real Python objects rather than raw handles.
+fn to_object(py: Python<'_>, a: &NdArray) -> PyResult<NdArray> {
+    if a.dtype().is_object() {
+        return Ok(a.clone());
+    }
+    let out = NdArray::zeros(a.shape.clone(), DType::Object).map_err(crate::err)?;
+    let src: Vec<isize> = rnp_core::iter::offsets(&a.shape, &a.strides, a.byte_offset).collect();
+    let dst: Vec<isize> =
+        rnp_core::iter::offsets(&out.shape, &out.strides, out.byte_offset).collect();
+    for (k, &s) in src.iter().enumerate() {
+        let v = crate::convert::element_to_py(py, a, s)?;
+        crate::objects::write(&out, dst[k], &v);
+    }
+    Ok(out)
+}
+
+/// The object array an operand carries, converted to `dt`, when an explicit
+/// non-object `dtype=` was asked for.
+fn demote_objects(py: Python<'_>, inputs: &mut [NdArray], dt: DType) -> PyResult<()> {
+    for a in inputs.iter_mut() {
+        if a.dtype().is_object() {
+            *a = from_object(py, a, dt)?;
+        }
+    }
+    Ok(())
+}
+
 /// Overlay `res` onto `base` wherever `mask` is true (numpy's `where=`).
 fn apply_where(res: &NdArray, base: &NdArray, mask: &NdArray) -> PyResult<NdArray> {
     let m = rnp_core::iter::broadcast_to(mask, &res.shape).map_err(crate::err)?;
@@ -182,15 +347,26 @@ pub fn _ufunc_call<'py>(
     dtype: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let _ = casting;
+    let objs: Vec<Bound<'py, PyAny>> = args.iter().collect();
+    // Object operands take the object loop, which dispatches to the elements'
+    // own Python protocols. It is chosen before the numeric type resolution
+    // because `object` absorbs every other dtype under NEP 50.
+    if object_call(&objs, dtype)? {
+        let dt = match dtype {
+            Some(d) if !d.is_none() => Some(dtype_from_any(d)?),
+            _ => None,
+        };
+        return crate::objloops::call(py, name, &objs, out, where_, dt);
+    }
     let f = lookup(name).ok_or_else(|| {
         PyNotImplementedErrorShim::new(format!("ufunc '{name}' is not implemented by rnp yet"))
     })?;
-    let objs: Vec<Bound<'py, PyAny>> = args.iter().collect();
     let mut inputs =
         resolve_operands(&objs, matches!(f, Ufn::Bin(b) if b.is_comparison()), f)?;
     if let Some(d) = dtype {
         if !d.is_none() {
             let dt = dtype_from_any(d)?;
+            demote_objects(py, &mut inputs, dt)?;
             inputs = inputs.iter().map(|a| a.astype(dt)).collect();
         }
     }
@@ -248,7 +424,20 @@ pub fn _ufunc_call<'py>(
         let b = store_or_wrap(py, second, None)?;
         return Ok(PyTuple::new(py, [a, b])?.into_any());
     }
+    // Storing into an `object` destination has to intern real Python objects,
+    // not the raw element bits.
+    let res = match out {
+        Some(o) if out_is_object(o) => to_object(py, &res)?,
+        _ => res,
+    };
     store_or_wrap(py, res, out)
+}
+
+/// Is `out` an `object` array?
+fn out_is_object(o: &Bound<'_, PyAny>) -> bool {
+    o.cast::<PyNdArray>()
+        .map(|a| a.borrow().arr.dtype().is_object())
+        .unwrap_or(false)
 }
 
 /// `frexp` / `modf`: the two-output float decompositions.
@@ -430,6 +619,14 @@ pub fn _ufunc_reduce<'py>(
     initial: Option<&Bound<'py, PyAny>>,
     where_: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if wants_object(std::slice::from_ref(a), dtype)? {
+        let arr = object_operand(a)?;
+        if let Some(r) = zero_d_reduce(py, &arr, axis, out)? {
+            return Ok(r);
+        }
+        let axes = resolve_axes(&arr, axis)?;
+        return crate::objloops::reduce(py, name, &arr, &axes, keepdims, initial, out, where_);
+    }
     let op = match lookup(name) {
         Some(Ufn::Bin(b)) => b,
         _ => {
@@ -441,7 +638,8 @@ pub fn _ufunc_reduce<'py>(
     let mut arr = array_from_any(a, None, false)?;
     if let Some(d) = dtype {
         if !d.is_none() {
-            arr = arr.astype(dtype_from_any(d)?);
+            let dt = dtype_from_any(d)?;
+            arr = from_object(py, &arr, dt)?;
         }
     }
     // `where=` replaces the masked-out elements with the identity.
@@ -460,8 +658,8 @@ pub fn _ufunc_reduce<'py>(
                 .or_else(|| identity_of(op, arr.dtype()))
                 .ok_or_else(|| {
                     PyValueError::new_err(format!(
-                        "reduction operation '{}' does not have an identity, so a \
-                         where mask requires an initial value",
+                        "reduction operation '{}' does not have an identity, so to \
+                         use a where mask one has to specify 'initial'",
                         op.name()
                     ))
                 })?;
@@ -474,8 +672,8 @@ pub fn _ufunc_reduce<'py>(
             arr = apply_where(&arr, &base, &mask)?;
         }
     }
-    if arr.ndim() == 0 {
-        return Err(PyValueError::new_err("cannot reduce on a scalar"));
+    if let Some(r) = zero_d_reduce(py, &arr, axis, out)? {
+        return Ok(r);
     }
     // numpy accumulates `add`/`multiply` over bool and narrow integers in the
     // platform integer, exactly as `np.sum`/`np.prod` do.
@@ -561,7 +759,41 @@ pub fn _ufunc_reduce<'py>(
         }
         cur = cur.reshape(&shape).map_err(crate::err)?;
     }
+    // An explicit `dtype=` names the *result* dtype, so the accumulator's own
+    // promotion (bool sums accumulate in the platform int) does not survive it.
+    if let Some(d) = dtype {
+        if !d.is_none() {
+            let dt = dtype_from_any(d)?;
+            if cur.dtype() != dt {
+                cur = cur.astype(dt);
+            }
+        }
+    }
     store_or_wrap(py, cur, out)
+}
+
+/// Reducing a 0-d array is a no-op that hands the element straight back, which
+/// is what numpy does for every dtype (`np.add.reduce(np.array(1))` is `1`).
+/// Only an out-of-range `axis` still errors.
+fn zero_d_reduce<'py>(
+    py: Python<'py>,
+    arr: &NdArray,
+    axis: &Bound<'py, PyAny>,
+    out: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if arr.ndim() != 0 {
+        return Ok(None);
+    }
+    if !axis.is_none() {
+        if let Ok(i) = axis.extract::<isize>() {
+            if i != 0 && i != -1 {
+                return Err(crate::objloops::axis_error(format!(
+                    "axis {i} is out of bounds for array of dimension 0"
+                )));
+            }
+        }
+    }
+    Ok(Some(store_or_wrap(py, arr.clone(), out)?))
 }
 
 fn resolve_axes(arr: &NdArray, axis: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
@@ -569,7 +801,7 @@ fn resolve_axes(arr: &NdArray, axis: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> 
     let norm = |i: isize| -> PyResult<usize> {
         let j = if i < 0 { i + nd } else { i };
         if j < 0 || j >= nd {
-            return Err(PyValueError::new_err(format!(
+            return Err(crate::objloops::axis_error(format!(
                 "axis {i} is out of bounds for array of dimension {nd}"
             )));
         }
@@ -595,6 +827,17 @@ pub fn _ufunc_accumulate<'py>(
     dtype: Option<&Bound<'py, PyAny>>,
     out: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if wants_object(std::slice::from_ref(a), dtype)? {
+        let arr = object_operand(a)?;
+        let nd = arr.ndim() as isize;
+        let ax = if axis < 0 { axis + nd } else { axis };
+        if ax < 0 || ax >= nd {
+            return Err(PyValueError::new_err(format!(
+                "axis {axis} is out of bounds for array of dimension {nd}"
+            )));
+        }
+        return crate::objloops::accumulate(py, name, &arr, ax as usize, out);
+    }
     let op = match lookup(name) {
         Some(Ufn::Bin(b)) => b,
         _ => {
@@ -606,7 +849,7 @@ pub fn _ufunc_accumulate<'py>(
     let mut arr = array_from_any(a, None, false)?;
     if let Some(d) = dtype {
         if !d.is_none() {
-            arr = arr.astype(dtype_from_any(d)?);
+            arr = from_object(py, &arr, dtype_from_any(d)?)?;
         }
     } else if matches!(op, BinOp::Add | BinOp::Mul)
         && arr.dtype().is_exact()
@@ -626,7 +869,7 @@ pub fn _ufunc_accumulate<'py>(
     let nd = arr.ndim() as isize;
     let ax = if axis < 0 { axis + nd } else { axis };
     if ax < 0 || ax >= nd {
-        return Err(PyValueError::new_err(format!(
+        return Err(crate::objloops::axis_error(format!(
             "axis {axis} is out of bounds for array of dimension {nd}"
         )));
     }
@@ -728,7 +971,7 @@ pub fn _scalar_binop<'py>(
     let op = match lookup(name) {
         Some(Ufn::Bin(o)) => o,
         Some(Ufn::DivMod) => {
-            let (x, y) = scalar_pair(a, b)?;
+            let (x, y) = scalar_pair(a, b, false)?;
             let dt = rnp_core::promote(x.0, y.0);
             let dt = if dt == DType::Bool { DType::I8 } else { dt };
             fpe::clear();
@@ -749,7 +992,7 @@ pub fn _scalar_binop<'py>(
             )))
         }
     };
-    let (x, y) = scalar_pair(a, b)?;
+    let (x, y) = scalar_pair(a, b, op.is_comparison())?;
     let mut xa = NdArray::zeros(vec![], x.0).map_err(crate::err)?;
     xa.set(&[], x.1).map_err(crate::err)?;
     let mut ya = NdArray::zeros(vec![], y.0).map_err(crate::err)?;
@@ -824,6 +1067,7 @@ fn one_scalar(a: &Bound<'_, PyAny>) -> PyResult<(DType, Scalar)> {
 fn scalar_pair(
     a: &Bound<'_, PyAny>,
     b: &Bound<'_, PyAny>,
+    comparison: bool,
 ) -> PyResult<((DType, Scalar), (DType, Scalar))> {
     let sa = np_scalar(a)?;
     let sb = np_scalar(b)?;
@@ -832,11 +1076,11 @@ fn scalar_pair(
         (Some(x), Some(y)) => Ok((x, y)),
         (Some(x), None) => {
             let s = vb.ok_or_else(|| PyTypeError::new_err("unsupported operand"))?;
-            Ok((x, (weak_promote(x.0, s), s)))
+            Ok((x, (weak_dtype(x.0, s, comparison)?, s)))
         }
         (None, Some(y)) => {
             let s = va.ok_or_else(|| PyTypeError::new_err("unsupported operand"))?;
-            Ok(((weak_promote(y.0, s), s), y))
+            Ok(((weak_dtype(y.0, s, comparison)?, s), y))
         }
         (None, None) => {
             let (s, t) = (
@@ -1095,6 +1339,15 @@ fn unusable<'py>(
     if !numberish(a) || !numberish(b) {
         return Ok(None);
     }
+    // The only numeric operand the engine has no `Scalar` for is an int wider
+    // than 64 bits, and numpy reports that as an OverflowError.
+    for o in [a, b] {
+        if o.is_instance_of::<pyo3::types::PyInt>() && scalar_from_py(o).is_none() {
+            return Err(pyo3::exceptions::PyOverflowError::new_err(
+                "Python int too large to convert to C long",
+            ));
+        }
+    }
     Err(PyTypeError::new_err("unsupported operand"))
 }
 
@@ -1113,8 +1366,16 @@ pub fn _scalar_binop2<'py>(
     let (oa, ob) = (classify(a)?, classify(b)?);
     let ((dta, xa), (dtb, xb)) = match (oa, ob) {
         (SOperand::Strong(d, s), SOperand::Strong(e, t)) => ((d, s), (e, t)),
-        (SOperand::Strong(d, s), SOperand::Weak(t)) => ((d, s), (weak_promote(d, t), t)),
-        (SOperand::Weak(s), SOperand::Strong(e, t)) => ((weak_promote(e, s), s), (e, t)),
+        // NEP 50: the weak operand adopts the strong one's dtype, and a
+        // Python int that does not fit that dtype is an OverflowError -- except
+        // under a comparison, which widens instead so `np.uint8(200) < -1`
+        // still answers correctly.
+        (SOperand::Strong(d, s), SOperand::Weak(t)) => {
+            ((d, s), (weak_dtype(d, t, op.is_comparison())?, t))
+        }
+        (SOperand::Weak(s), SOperand::Strong(e, t)) => {
+            ((weak_dtype(e, s, op.is_comparison())?, s), (e, t))
+        }
         (SOperand::Weak(s), SOperand::Weak(t)) => ((s.natural_dtype(), s), (t.natural_dtype(), t)),
         _ => return unusable(py, a, b),
     };
@@ -1182,6 +1443,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_scalar_dtype_names, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_class, m)?)?;
     m.add_function(wrap_pyfunction!(_register_generic_class, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::objloops::_register_object_cast_error, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::objloops::_register_axis_error, m)?)?;
     Ok(())
 }
 

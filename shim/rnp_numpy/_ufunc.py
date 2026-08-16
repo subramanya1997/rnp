@@ -283,7 +283,9 @@ class ufunc:
             if not isinstance(indices, int) else [indices]
         n = a.shape[axis]
         # See the comment on the branch below.
-        _split_head = self.__name__ == "add"
+        # Object `add` folds sequentially, not with a pairwise tree, so the
+        # head/tail split below would only change the bracketing for nothing.
+        _split_head = self.__name__ == "add" and a.dtype.kind != "O"
         pieces = []
         for k, start in enumerate(idx):
             if start < 0:
@@ -319,10 +321,26 @@ class ufunc:
                     red = head
             else:
                 sl[axis] = slice(start, stop)
-                red = self.reduce(a[tuple(sl)], axis=axis, dtype=dtype)
+                # Not `self.reduce`: that unwraps a 0-d result to the Python
+                # object it holds, which for an object array loses the dtype.
+                red = _rnp._ufunc_reduce(
+                    self.__name__, a[tuple(sl)], axis=axis, dtype=dtype,
+                    out=None, keepdims=False, initial=None, where_=True)
             pieces.append(_rnp.asarray(red))
-        from ._core.shape_base import stack
-        res = stack(pieces, axis=axis)
+        if a.dtype.kind == "O":
+            # `stack` goes through `array(..., dtype=object)`, whose element
+            # discovery does not descend into arrays -- each segment would
+            # become one *element*.  Assemble the object result directly.
+            oshape = list(a.shape)
+            oshape[axis] = len(pieces)
+            res = _rnp.empty(tuple(oshape), a.dtype)
+            for i, p in enumerate(pieces):
+                sl = [slice(None)] * a.ndim
+                sl[axis] = i
+                res[tuple(sl)] = p[()] if p.ndim == 0 else p
+        else:
+            from ._core.shape_base import stack
+            res = stack(pieces, axis=axis)
         if out is not None:
             out[...] = res
             return out

@@ -13,6 +13,7 @@ mod index;
 mod itemsel;
 mod pyarray;
 mod objects;
+mod objloops;
 mod pydtype;
 mod ufuncs;
 
