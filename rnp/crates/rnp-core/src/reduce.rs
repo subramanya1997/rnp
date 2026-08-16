@@ -537,21 +537,26 @@ extreme_by_intrinsic!(f32, f64);
 /// by hand is what lets it use vector lanes. That is safe here because
 /// ordered min/max *is* associative once NaN and signed zero are handled
 /// separately (see `extreme_contig`), and rayon may therefore split it too.
-fn ordered_extreme<T>(s: &[T], want_max: bool) -> T
+fn ordered_extreme<T>(s: &[T], want_max: bool) -> (T, bool)
 where
-    T: Element + Extreme + Send + Sync,
+    T: Element + Extreme + MaybeNan + Send + Sync,
 {
     const LANES: usize = 16;
     if s.len() >= PAR_THRESHOLD {
         let mid = s.len() / 2;
         let (l, r) = s.split_at(mid);
-        let (a, b) = rayon::join(
+        let ((a, na), (b, nb)) = rayon::join(
             || ordered_extreme(l, want_max),
             || ordered_extreme(r, want_max),
         );
-        return if want_max { a.omax(b) } else { a.omin(b) };
+        return (if want_max { a.omax(b) } else { a.omin(b) }, na | nb);
     }
     let mut r: [T; LANES] = [s[0]; LANES];
+    // NaN detection rides along in the same pass: min/max is memory-bound at
+    // these sizes, so a second scan over the data doubled the cost. The fold
+    // is branchless, and `elem_is_nan` is a constant `false` for the integer
+    // dtypes, so the whole thing disappears for them.
+    let mut nan = [false; LANES];
     let mut it = s.chunks_exact(LANES);
     // `try_into` on a `chunks_exact` block gives the optimiser a fixed-size
     // array, which removes the bounds checks and lets it use vector lanes.
@@ -560,6 +565,7 @@ where
             let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES");
             for k in 0..LANES {
                 r[k] = r[k].omax(c[k]);
+                nan[k] |= c[k].elem_is_nan();
             }
         }
     } else {
@@ -567,18 +573,22 @@ where
             let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES");
             for k in 0..LANES {
                 r[k] = r[k].omin(c[k]);
+                nan[k] |= c[k].elem_is_nan();
             }
         }
     }
     let tail = it.remainder();
     let mut acc = r[0];
+    let mut saw_nan = nan[0];
     for k in 1..LANES {
         acc = if want_max { acc.omax(r[k]) } else { acc.omin(r[k]) };
+        saw_nan |= nan[k];
     }
     for &v in tail {
         acc = if want_max { acc.omax(v) } else { acc.omin(v) };
+        saw_nan |= v.elem_is_nan();
     }
-    acc
+    (acc, saw_nan)
 }
 
 /// The contiguous min/max fast path: an ordered reduction plus numpy's NaN
@@ -593,11 +603,7 @@ where
 {
     // SAFETY: guaranteed by the caller.
     let s: &[T] = unsafe { std::slice::from_raw_parts(p, n) };
-    let acc = ordered_extreme(s, want_max);
-    // A branchless fold: `any` would short-circuit, which keeps the scan
-    // scalar and costs more than the reduction itself. For integer dtypes
-    // `elem_is_nan` is a constant `false`, so this disappears entirely.
-    let saw_nan = s.iter().fold(false, |a, &v| a | v.elem_is_nan());
+    let (acc, saw_nan) = ordered_extreme(s, want_max);
     if saw_nan {
         // numpy returns the NaN itself, and the first one at that.
         for &v in s {

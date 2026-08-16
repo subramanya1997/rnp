@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-08-16T10:18:41.538659+00:00",
-  "overall_passed": 968,
-  "overall_total": 2109,
+  "timestamp": "2026-08-16T11:12:09.159579+00:00",
+  "overall_passed": 1462,
+  "overall_total": 3565,
   "files": [
     {
       "file": "test__exceptions.py",
@@ -21,11 +21,11 @@
     },
     {
       "file": "test_api.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 2,
+      "failed": 52,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 54
     },
     {
       "file": "test_argparse.py",
@@ -55,9 +55,9 @@
       "file": "test_array_interface.py",
       "passed": 0,
       "failed": 0,
-      "errors": 0,
+      "errors": 1,
       "skipped": 0,
-      "total": 0
+      "total": 1
     },
     {
       "file": "test_arraymethod.py",
@@ -150,10 +150,10 @@
     {
       "file": "test_defchararray.py",
       "passed": 0,
-      "failed": 0,
+      "failed": 100,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 100
     },
     {
       "file": "test_deprecations.py",
@@ -166,18 +166,18 @@
     {
       "file": "test_dlpack.py",
       "passed": 0,
-      "failed": 0,
-      "errors": 0,
+      "failed": 82,
+      "errors": 13,
       "skipped": 0,
-      "total": 0
+      "total": 95
     },
     {
       "file": "test_dtype.py",
-      "passed": 660,
-      "failed": 230,
+      "passed": 711,
+      "failed": 229,
       "errors": 0,
       "skipped": 4,
-      "total": 894
+      "total": 944
     },
     {
       "file": "test_einsum.py",
@@ -206,10 +206,10 @@
     {
       "file": "test_finfo.py",
       "passed": 0,
-      "failed": 0,
+      "failed": 30,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 30
     },
     {
       "file": "test_function_base.py",
@@ -245,27 +245,27 @@
     },
     {
       "file": "test_indexerrors.py",
-      "passed": 2,
-      "failed": 6,
+      "passed": 5,
+      "failed": 3,
       "errors": 0,
       "skipped": 0,
       "total": 8
     },
     {
       "file": "test_indexing.py",
-      "passed": 17,
-      "failed": 89,
+      "passed": 60,
+      "failed": 46,
       "errors": 0,
       "skipped": 0,
       "total": 106
     },
     {
       "file": "test_item_selection.py",
-      "passed": 0,
-      "failed": 244,
+      "passed": 204,
+      "failed": 50,
       "errors": 0,
       "skipped": 0,
-      "total": 244
+      "total": 254
     },
     {
       "file": "test_limited_api.py",
@@ -285,11 +285,11 @@
     },
     {
       "file": "test_mem_overlap.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 1,
+      "failed": 24,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 25
     },
     {
       "file": "test_mem_policy.py",
@@ -302,10 +302,10 @@
     {
       "file": "test_memmap.py",
       "passed": 0,
-      "failed": 0,
+      "failed": 24,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 24
     },
     {
       "file": "test_multiarray.py",
@@ -357,8 +357,8 @@
     },
     {
       "file": "test_numerictypes.py",
-      "passed": 76,
-      "failed": 62,
+      "passed": 77,
+      "failed": 61,
       "errors": 0,
       "skipped": 0,
       "total": 138
@@ -373,11 +373,11 @@
     },
     {
       "file": "test_print.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 8,
+      "failed": 14,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 22
     },
     {
       "file": "test_protocols.py",
@@ -413,11 +413,11 @@
     },
     {
       "file": "test_scalar_methods.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 97,
+      "failed": 118,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 215
     },
     {
       "file": "test_scalarbuffer.py",
@@ -445,11 +445,11 @@
     },
     {
       "file": "test_scalarprint.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 3,
+      "failed": 26,
       "errors": 0,
-      "skipped": 0,
-      "total": 0
+      "skipped": 1,
+      "total": 30
     },
     {
       "file": "test_shape_base.py",
@@ -501,11 +501,11 @@
     },
     {
       "file": "test_umath.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 81,
+      "failed": 720,
       "errors": 0,
-      "skipped": 0,
-      "total": 0
+      "skipped": 109,
+      "total": 910
     },
     {
       "file": "test_umath_accuracy.py",

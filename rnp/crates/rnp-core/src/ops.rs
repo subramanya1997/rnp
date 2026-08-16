@@ -384,6 +384,66 @@ const PAR_THRESHOLD: usize = 1 << 16;
 /// Chunk handed to each rayon task.
 const PAR_CHUNK: usize = 1 << 14;
 
+/// A raw pointer that rayon is allowed to move into a task.
+///
+/// Safety is argued at each use: the pointed-at buffers are read-only for the
+/// duration of the parallel section (or, for the output, split into disjoint
+/// chunks by `par_chunks_mut`).
+#[derive(Copy, Clone)]
+struct SendPtr(*const u8);
+
+impl SendPtr {
+    /// A method, not a field access: edition-2021 closures capture disjoint
+    /// *fields*, so `p.0` inside a rayon task would capture the bare raw
+    /// pointer (which is not `Sync`) instead of this wrapper.
+    #[inline]
+    fn ptr(self) -> *const u8 {
+        self.0
+    }
+}
+// SAFETY: see the type comment; the pointer is only dereferenced inside
+// bounds already validated on the owning thread.
+unsafe impl Send for SendPtr {}
+// SAFETY: as above; shared access is read-only.
+unsafe impl Sync for SendPtr {}
+
+/// If every element of `a` sits at `base + i * stride` in C order, return
+/// `(stride, base)`.
+///
+/// This is true for any array whose axes, read from the innermost out, keep
+/// the product `stride_k * shape_k == stride_{k-1}` invariant -- i.e. exactly
+/// the shapes numpy's iterator coalesces into one dimension. Axes of length
+/// one impose no constraint, and a zero stride (a broadcast axis) only
+/// collapses when the whole walk is degenerate.
+#[inline]
+fn linear_walk(a: &NdArray) -> Option<(isize, isize)> {
+    if a.ndim() == 0 {
+        return Some((0, a.byte_offset));
+    }
+    let mut stride = 0isize;
+    let mut expect = 0isize;
+    let mut first = true;
+    for ax in (0..a.ndim()).rev() {
+        if a.shape[ax] == 1 {
+            continue;
+        }
+        if a.shape[ax] == 0 {
+            return Some((0, a.byte_offset));
+        }
+        if first {
+            stride = a.strides[ax];
+            expect = stride * a.shape[ax];
+            first = false;
+        } else {
+            if a.strides[ax] != expect {
+                return None;
+            }
+            expect *= a.shape[ax];
+        }
+    }
+    Some((stride, a.byte_offset))
+}
+
 /// The inner loop, generic over the element type *and* the operation.
 ///
 /// `F` is a distinct zero-sized type per call site, so the operation inlines
@@ -426,24 +486,47 @@ where
         }
         return;
     }
-    if a.ndim() <= 1 && b.ndim() <= 1 {
-        // 1-D strided operands (`x[::2] + y[::2]`): step two pointers instead
-        // of running the odometer for every element.
-        let (sa, sb) = (
-            a.strides.first().copied().unwrap_or(0),
-            b.strides.first().copied().unwrap_or(0),
-        );
-        let (base_a, base_b) = (a.byte_offset, b.byte_offset);
+    // Collapse trailing axes whose strides are already "one step per
+    // element" on both operands: a strided view like `x[::2]` reshaped to
+    // 2-D still walks a single arithmetic progression, and numpy's nditer
+    // does the same coalescing before it buffers.
+    if let (Some((sa, base_a)), Some((sb, base_b))) = (linear_walk(a), linear_walk(b)) {
+        // 1-D (or collapsible) strided operands (`x[::2] + y[::2]`): step two
+        // pointers instead of running the odometer for every element.
+        let pa = a.buffer.as_ptr();
+        let pb = b.buffer.as_ptr();
+        if n >= PAR_THRESHOLD {
+            use rayon::prelude::*;
+            // SAFETY: `o` owns `n` freshly allocated elements nothing else
+            // refers to, and each chunk touches a disjoint slice of them.
+            let dst = unsafe { std::slice::from_raw_parts_mut(o, n) };
+            let (pa, pb) = (SendPtr(pa), SendPtr(pb));
+            dst.par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .for_each(|(c, chunk)| {
+                    let start = (c * PAR_CHUNK) as isize;
+                    for (k, slot) in chunk.iter_mut().enumerate() {
+                        let i = start + k as isize;
+                        // SAFETY: as the serial path below.
+                        unsafe {
+                            let x = std::ptr::read_unaligned(
+                                pa.ptr().offset(base_a + i * sa) as *const T,
+                            );
+                            let y = std::ptr::read_unaligned(
+                                pb.ptr().offset(base_b + i * sb) as *const T,
+                            );
+                            *slot = f(x, y);
+                        }
+                    }
+                });
+            return;
+        }
         for i in 0..n {
             // SAFETY: base + i*stride stays within a's (and b's) elements for
             // i < n, since both were broadcast to the output shape.
             unsafe {
-                let x = std::ptr::read_unaligned(
-                    a.buffer.as_ptr().offset(base_a + i as isize * sa) as *const T,
-                );
-                let y = std::ptr::read_unaligned(
-                    b.buffer.as_ptr().offset(base_b + i as isize * sb) as *const T,
-                );
+                let x = std::ptr::read_unaligned(pa.offset(base_a + i as isize * sa) as *const T);
+                let y = std::ptr::read_unaligned(pb.offset(base_b + i as isize * sb) as *const T);
                 *o.add(i) = f(x, y);
             }
         }

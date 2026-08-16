@@ -28,15 +28,28 @@ except ImportError as e:
 RESULTS = ROOT / "benchmarks" / "results.json"
 
 
-def bench(fn, *args, reps=25, inner=1):
-    fn(*args)  # warmup
-    best = float("inf")
+def _time_once(fn, inner):
+    t0 = time.perf_counter()
+    for _ in range(inner):
+        fn()
+    return (time.perf_counter() - t0) / inner
+
+
+def bench_pair(fn_a, fn_b, reps=25, inner=1):
+    """Time two implementations of the same case, interleaved.
+
+    Interleaving matters: running one library's rounds to completion before
+    the other's hands the second one a warm allocator and warm caches, which
+    was worth up to 3x on the 1e6 rows.
+    """
+    for _ in range(3):  # warmup, both sides
+        fn_a()
+        fn_b()
+    best_a = best_b = float("inf")
     for _ in range(reps):
-        t0 = time.perf_counter()
-        for _ in range(inner):
-            fn(*args)
-        best = min(best, (time.perf_counter() - t0) / inner)
-    return best
+        best_a = min(best_a, _time_once(fn_a, inner))
+        best_b = min(best_b, _time_once(fn_b, inner))
+    return best_a, best_b
 
 
 def cases(np_mod, size):
@@ -51,6 +64,22 @@ def cases(np_mod, size):
     yield "astype", lambda: a.astype(np_mod.float32)
     yield "copy", lambda: a.copy()
     yield "strided_add", lambda: np_mod.add(a[::2], b[::2])
+
+    # ---- M2: indexing ----------------------------------------------------
+    idx = np_mod.arange(0, size, 3, dtype=np_mod.int64)
+    mask = np_mod.zeros(size, dtype=np_mod.bool_)
+    mask[idx] = True
+    rows_n = max(1, size // 100)
+    m = np_mod.arange(rows_n * 100, dtype=np_mod.float64).reshape(rows_n, 100)
+    row_idx = np_mod.arange(0, rows_n, 2, dtype=np_mod.int64)
+    yield "slice_view", lambda: a[::2]
+    yield "slice_copy", lambda: a[1:size - 1].copy()
+    yield "fancy_1d", lambda: a[idx]
+    yield "fancy_2d_rows", lambda: m[row_idx]
+    yield "bool_mask", lambda: a[mask]
+    yield "fancy_setitem", lambda: b.__setitem__(idx, 1.0)
+    yield "bool_setitem", lambda: b.__setitem__(mask, 2.0)
+    yield "take_axis0", lambda: m.take(row_idx, axis=0)
 
 
 def main():
@@ -67,11 +96,12 @@ def main():
         port = dict(cases(port_np, size))
         for name in real:
             try:
-                t_port = bench(port[name], inner=inner) * 1e6
+                t_real, t_port = bench_pair(real[name], port[name], inner=inner)
             except Exception as e:
                 print(f"{name:16s} {size:>10d}  port FAILED: {e}")
                 continue
-            t_real = bench(real[name], inner=inner) * 1e6
+            t_real *= 1e6
+            t_port *= 1e6
             ratio = t_port / t_real
             rows.append({"case": name, "size": size, "numpy_us": t_real,
                          "port_us": t_port, "ratio": ratio})

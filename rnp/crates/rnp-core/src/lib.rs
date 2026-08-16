@@ -8,6 +8,7 @@ pub mod descr;
 pub mod dtype;
 pub mod element;
 pub mod error;
+pub mod indexing;
 pub mod iter;
 pub mod ops;
 pub mod printing;
@@ -19,6 +20,7 @@ pub use casting::{can_cast, common_type, min_scalar_type, result_type, Casting, 
 pub use descr::{ByteOrder, Descr, Field, FieldSpec, StructDef, SubArrayDef};
 pub use dtype::{promote, promote_for_division, DType, Kind, ALL_DTYPES};
 pub use element::{Element, NpBool, Scalar, F16};
+pub use indexing::{IndexItem, Indexed, SliceSpec, TakeMode};
 pub use reduce::{reduce_all, reduce_axis, reduce_dtype, ReduceOp};
 pub use error::{Error, Result};
 pub use ops::{binary, BinOp};

@@ -13,8 +13,18 @@ class _Unavailable:
     dtype = _dtype("V8")
 
     def __init__(self, *args, **kwargs):
+        # Upstream test modules construct rationals at import time; the value
+        # is inert and every operation on it raises.
+        self._args = args
+
+    def _nope(self, *args, **kwargs):
         raise NotImplementedError(
             "the rational user dtype is not implemented by rnp")
+
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _nope
+    __truediv__ = __rtruediv__ = __floordiv__ = __eq__ = __lt__ = _nope
+    __int__ = __float__ = __index__ = __array__ = _nope
+    __hash__ = None
 
 
 class rational(_Unavailable):

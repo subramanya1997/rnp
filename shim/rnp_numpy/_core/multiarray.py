@@ -1,0 +1,81 @@
+"""`numpy._core.multiarray` — the names upstream tests import from the C
+module. Everything real is re-exported from the top-level shim; the rest are
+loud stubs (they raise NotImplementedError when *used*, never silently)."""
+
+from .. import (  # noqa: F401
+    arange,
+    array,
+    asarray,
+    broadcast_to,
+    can_cast,
+    choose,
+    compress,
+    dtype,
+    empty,
+    flatiter,
+    flatnonzero,
+    full,
+    ndarray,
+    nonzero,
+    ones,
+    promote_types,
+    put,
+    putmask,
+    result_type,
+    take,
+    where,
+    zeros,
+)
+from .._stubs import not_implemented
+
+# numpy exposes the ABI/API version numbers of the C extension here. The port
+# has no C ABI, so it reports the versions of the numpy it targets (2.5.2).
+_ARRAY_API_VERSION = 0x00000012
+
+
+def _get_ndarray_c_version():
+    return _ARRAY_API_VERSION
+
+
+def _reconstruct(subtype, shape, dtype_):
+    return ndarray.__new__(subtype) if False else empty(shape, dtype_)
+
+
+dot = not_implemented("numpy._core.multiarray.dot")
+inner = not_implemented("numpy._core.multiarray.inner")
+vdot = not_implemented("numpy._core.multiarray.vdot")
+matmul = not_implemented("numpy._core.multiarray.matmul")
+lexsort = not_implemented("numpy._core.multiarray.lexsort")
+bincount = not_implemented("numpy._core.multiarray.bincount")
+c_einsum = not_implemented("numpy._core.multiarray.c_einsum")
+copyto = not_implemented("numpy._core.multiarray.copyto")
+concatenate = not_implemented("numpy._core.multiarray.concatenate")
+correlate = not_implemented("numpy._core.multiarray.correlate")
+correlate2 = not_implemented("numpy._core.multiarray.correlate2")
+_vec_string = not_implemented("numpy._core.multiarray._vec_string")
+scalar = not_implemented("numpy._core.multiarray.scalar")
+set_datetimeparse_function = not_implemented(
+    "numpy._core.multiarray.set_datetimeparse_function")
+datetime_data = not_implemented("numpy._core.multiarray.datetime_data")
+busday_count = not_implemented("numpy._core.multiarray.busday_count")
+busday_offset = not_implemented("numpy._core.multiarray.busday_offset")
+is_busday = not_implemented("numpy._core.multiarray.is_busday")
+frombuffer = not_implemented("numpy._core.multiarray.frombuffer")
+fromfile = not_implemented("numpy._core.multiarray.fromfile")
+fromiter = not_implemented("numpy._core.multiarray.fromiter")
+fromstring = not_implemented("numpy._core.multiarray.fromstring")
+nested_iters = not_implemented("numpy._core.multiarray.nested_iters")
+shares_memory = not_implemented("numpy._core.multiarray.shares_memory")
+may_share_memory = not_implemented("numpy._core.multiarray.may_share_memory")
+_get_madvise_hugepage = not_implemented(
+    "numpy._core.multiarray._get_madvise_hugepage")
+_set_madvise_hugepage = not_implemented(
+    "numpy._core.multiarray._set_madvise_hugepage")
+
+
+def normalize_axis_index(axis, ndim, msg_prefix=None):
+    """Transcribed from numpy's `normalize_axis_index`."""
+    from ..exceptions import AxisError
+    if axis < -ndim or axis >= ndim:
+        raise AxisError(axis, ndim, msg_prefix)
+    return axis % ndim

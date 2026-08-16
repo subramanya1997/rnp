@@ -10,6 +10,7 @@ use pyo3::types::{PyDict, PyList, PySlice, PySliceMethods, PyTuple};
 
 use rnp_core::reduce::{mean_dtype, reduce_all, reduce_axis, reduce_dtype, ReduceOp};
 use rnp_core::element::Element;
+use rnp_core::indexing::{Indexed, TakeMode};
 use rnp_core::{binary, BinOp, DType, NdArray, Scalar};
 
 use crate::convert::{array_from_any, flexible_to_py, operand, scalar_from_py, scalar_to_py};
@@ -19,119 +20,37 @@ use crate::pydtype::{dtype_from_any, PyDType};
 #[pyclass(name = "ndarray", module = "_rnp", subclass)]
 pub struct PyNdArray {
     pub arr: NdArray,
+    /// numpy's `a.base`: the object that actually owns the memory. Views of
+    /// views collapse onto the owner, exactly as numpy does.
+    pub base: Option<Py<PyAny>>,
 }
 
 impl PyNdArray {
     pub fn wrap(arr: NdArray) -> PyNdArray {
-        PyNdArray { arr }
+        PyNdArray { arr, base: None }
     }
 
     pub fn into_py_any(arr: NdArray, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
         Py::new(py, PyNdArray::wrap(arr))
     }
-}
 
-/// One parsed element of an index expression.
-enum Idx {
-    Int(isize),
-    Slice(Py<PySlice>),
-    NewAxis,
-    Ellipsis,
-}
-
-fn parse_index_items(key: &Bound<'_, PyAny>) -> PyResult<Vec<Idx>> {
-    let py = key.py();
-    let items: Vec<Bound<'_, PyAny>> = if let Ok(t) = key.cast::<PyTuple>() {
-        t.iter().collect()
-    } else {
-        vec![key.clone()]
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        if it.is_none() {
-            out.push(Idx::NewAxis);
-        } else if it.is(&py.Ellipsis()) {
-            out.push(Idx::Ellipsis);
-        } else if let Ok(s) = it.cast::<PySlice>() {
-            out.push(Idx::Slice(s.clone().unbind()));
-        } else if let Ok(i) = it.extract::<isize>() {
-            out.push(Idx::Int(i));
-        } else if it.cast::<PyNdArray>().is_ok() || it.cast::<PyList>().is_ok() {
-            return Err(PyNotImplementedError::new_err(
-                "advanced (fancy/boolean) indexing is not implemented yet",
-            ));
-        } else {
-            return Err(PyIndexError::new_err(
-                "only integers, slices (`:`), ellipsis (`...`) and newaxis \
-                 (`None`) are valid indices",
-            ));
-        }
+    /// Wrap a *view* of `parent`, propagating the base chain.
+    pub fn view_of(
+        arr: NdArray,
+        parent: &Bound<'_, PyNdArray>,
+    ) -> PyResult<Py<PyNdArray>> {
+        let base = match &parent.borrow().base {
+            Some(b) => b.clone_ref(parent.py()),
+            None => parent.clone().into_any().unbind(),
+        };
+        Py::new(
+            parent.py(),
+            PyNdArray {
+                arr,
+                base: Some(base),
+            },
+        )
     }
-    Ok(out)
-}
-
-/// Apply a basic-indexing expression, returning the resulting view and
-/// whether every axis was consumed by an integer (numpy returns a scalar in
-/// that case).
-fn index_view(arr: &NdArray, key: &Bound<'_, PyAny>) -> PyResult<(NdArray, bool)> {
-    let py = key.py();
-    let items = parse_index_items(key)?;
-    let consuming = items
-        .iter()
-        .filter(|i| matches!(i, Idx::Int(_) | Idx::Slice(_)))
-        .count();
-    if consuming > arr.ndim() {
-        return Err(PyIndexError::new_err(format!(
-            "too many indices for array: array is {}-dimensional, but {} were indexed",
-            arr.ndim(),
-            consuming
-        )));
-    }
-    let mut ellipsis_seen = false;
-    let mut cur = arr.clone();
-    let mut ax = 0usize;
-    let mut all_int = true;
-
-    for item in items {
-        match item {
-            Idx::NewAxis => {
-                all_int = false;
-                cur = cur.insert_axis(ax);
-                ax += 1;
-            }
-            Idx::Ellipsis => {
-                if ellipsis_seen {
-                    return Err(PyIndexError::new_err(
-                        "an index can only have a single ellipsis ('...')",
-                    ));
-                }
-                ellipsis_seen = true;
-                all_int = false;
-                ax += arr.ndim() - consuming;
-            }
-            Idx::Int(i) => {
-                let n = cur.shape[ax];
-                let i = if i < 0 { i + n } else { i };
-                if i < 0 || i >= n {
-                    return Err(PyIndexError::new_err(format!(
-                        "index {} is out of bounds for axis {} with size {}",
-                        if i < 0 { i - n } else { i },
-                        ax,
-                        n
-                    )));
-                }
-                cur = cur.slice_axis(ax, i, 1, 1).remove_axis(ax);
-            }
-            Idx::Slice(s) => {
-                all_int = false;
-                let ind = s.bind(py).indices(cur.shape[ax])?;
-                cur = cur.slice_axis(ax, ind.start, ind.slicelength as isize, ind.step);
-                ax += 1;
-            }
-        }
-    }
-    let scalarize = all_int && cur.ndim() == 0;
-    Ok((cur, scalarize))
 }
 
 fn nested_list<'py>(
@@ -154,6 +73,370 @@ fn nested_list<'py>(
         index.pop();
     }
     Ok(PyList::new(py, items)?.into_any())
+}
+
+/// `np.flatiter`: a 1-D, C-order view of an array's elements that supports
+/// iteration, indexing and assignment (writing through to the base array).
+#[pyclass(name = "flatiter", module = "_rnp")]
+pub struct PyFlatIter {
+    pub arr: NdArray,
+    pos: usize,
+    base: Py<PyAny>,
+}
+
+const FLAT_BAD_INDEX: &str = "only integers, slices (`:`), ellipsis (`...`) and \
+                              integer or boolean arrays are valid indices";
+
+/// What a flatiter index resolves to.
+enum FlatKey {
+    /// Every element (`...`, `()`).
+    All,
+    One(isize),
+    Range(isize, isize, isize),
+    /// Explicit flat positions plus the shape the result should take.
+    Gather(Vec<i64>, Vec<isize>),
+}
+
+impl PyFlatIter {
+    fn n(&self) -> isize {
+        self.arr.size() as isize
+    }
+
+    fn offset(&self, i: usize) -> isize {
+        rnp_core::indexing::flat_offset(&self.arr, i)
+    }
+
+    /// Materialise the iterator as a fresh 1-D array.
+    fn to_array(&self) -> NdArray {
+        let n = self.arr.size();
+        let out = NdArray::empty(vec![n as isize], self.arr.dtype).expect("flat alloc");
+        let isz = self.arr.itemsize() as isize;
+        for i in 0..n {
+            let s = self.offset(i);
+            if self.arr.dtype.is_flexible() {
+                out.write_raw_at(i as isize * isz, self.arr.raw_bytes_at(s));
+            } else {
+                out.write_at(i as isize * isz, self.arr.read_at(s));
+            }
+        }
+        out
+    }
+
+    fn gather(&self, positions: &[i64], shape: &[isize]) -> PyResult<NdArray> {
+        let n = self.n();
+        let out = NdArray::empty(shape.to_vec(), self.arr.dtype).map_err(crate::err)?;
+        let isz = self.arr.itemsize() as isize;
+        for (k, &raw) in positions.iter().enumerate() {
+            let v = if raw < 0 { raw + n as i64 } else { raw };
+            if v < 0 || v >= n as i64 {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} is out of bounds for axis 0 with size {}",
+                    raw, n
+                )));
+            }
+            let s = self.offset(v as usize);
+            if self.arr.dtype.is_flexible() {
+                out.write_raw_at(k as isize * isz, self.arr.raw_bytes_at(s));
+            } else {
+                out.write_at(k as isize * isz, self.arr.read_at(s));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Classify a flatiter index expression.
+    fn parse(&self, key: &Bound<'_, PyAny>, assigning: bool) -> PyResult<FlatKey> {
+        let py = key.py();
+        if let Ok(t) = key.cast::<PyTuple>() {
+            return match t.len() {
+                0 => {
+                    if assigning {
+                        Err(PyIndexError::new_err(
+                            "Assigning to a flat iterator with a 0-D index is not supported",
+                        ))
+                    } else {
+                        Ok(FlatKey::All)
+                    }
+                }
+                1 => self.parse(&t.get_item(0)?, assigning),
+                k => Err(PyIndexError::new_err(format!(
+                    "too many indices for flat iterator: flat iterator is \
+                     1-dimensional, but {} were indexed",
+                    k
+                ))),
+            };
+        }
+        if key.is(&py.Ellipsis()) {
+            return Ok(FlatKey::All);
+        }
+        if key.is_none() {
+            return Err(PyIndexError::new_err(FLAT_BAD_INDEX));
+        }
+        if key.is_instance_of::<pyo3::types::PyBool>() {
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+                std::ffi::CString::new(
+                    "In the future, 0-dimensional boolean index will be treated as \
+                     a mask, not as a scalar. (Deprecated NumPy 2.5)",
+                )
+                .unwrap()
+                .as_c_str(),
+                1,
+            )?;
+            let v: bool = key.extract()?;
+            return Ok(FlatKey::Range(0, if v { 1 } else { 0 }, 1));
+        }
+        if let Ok(s) = key.cast::<PySlice>() {
+            let ind = s.indices(self.n())?;
+            return Ok(FlatKey::Range(ind.start, ind.slicelength as isize, ind.step));
+        }
+        // A flatiter used as an index behaves like its underlying array.
+        let owned;
+        let as_arr: Option<&NdArray> = if let Ok(f) = key.cast::<PyFlatIter>() {
+            owned = f.borrow().to_array();
+            Some(&owned)
+        } else if let Ok(a) = key.cast::<PyNdArray>() {
+            owned = a.borrow().arr.clone();
+            Some(&owned)
+        } else {
+            None
+        };
+        if let Some(a) = as_arr {
+            if a.dtype == DType::Bool {
+                if a.size() as isize != self.n() {
+                    return Err(PyIndexError::new_err(format!(
+                        "boolean index did not match indexed flat iterator; size of \
+                         iterator is {} but size of corresponding boolean is {}",
+                        self.n(),
+                        a.size()
+                    )));
+                }
+                let pos: Vec<i64> = a
+                    .to_vec()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| matches!(s, Scalar::Bool(true)))
+                    .map(|(i, _)| i as i64)
+                    .collect();
+                let n = pos.len() as isize;
+                return Ok(FlatKey::Gather(pos, vec![n]));
+            }
+            if a.dtype.is_flexible() || !a.dtype.is_integer() {
+                // An empty non-integer index is accepted (it matches the array
+                // path, where `arr[[]]` must work).
+                if a.size() == 0 {
+                    return Ok(FlatKey::Gather(vec![], vec![0]));
+                }
+                return Err(PyIndexError::new_err(FLAT_BAD_INDEX));
+            }
+            return Ok(FlatKey::Gather(int_values(a), a.shape.clone()));
+        }
+        if let Ok(i) = key.extract::<isize>() {
+            return Ok(FlatKey::One(i));
+        }
+        if key.is_instance_of::<PyList>() {
+            let a = array_from_any(key, None, false)
+                .map_err(|_| PyIndexError::new_err(FLAT_BAD_INDEX))?;
+            if a.dtype == DType::Bool {
+                return Err(PyIndexError::new_err(
+                    "boolean indices for iterators are not supported",
+                ));
+            }
+            if a.size() == 0 {
+                return Ok(FlatKey::Gather(vec![], vec![0]));
+            }
+            if !a.dtype.is_integer() {
+                if !a.dtype.is_float() {
+                    return Err(PyIndexError::new_err(FLAT_BAD_INDEX));
+                }
+                PyErr::warn(
+                    py,
+                    &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+                    std::ffi::CString::new(
+                        "Invalid non-array indices for iterator objects are \
+                         deprecated. (Deprecated NumPy 2.5)",
+                    )
+                    .unwrap()
+                    .as_c_str(),
+                    1,
+                )?;
+            }
+            return Ok(FlatKey::Gather(int_values(&a), a.shape.clone()));
+        }
+        Err(PyIndexError::new_err(FLAT_BAD_INDEX))
+    }
+}
+
+fn int_values(a: &NdArray) -> Vec<i64> {
+    a.to_vec()
+        .into_iter()
+        .map(|s| match s {
+            Scalar::Int(i) => i,
+            Scalar::Uint(u) => u as i64,
+            Scalar::Bool(b) => b as i64,
+            Scalar::Float(f) => f as i64,
+            Scalar::Complex(c) => c.re as i64,
+        })
+        .collect()
+}
+
+#[pymethods]
+impl PyFlatIter {
+    fn __len__(&self) -> usize {
+        self.arr.size()
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(mut slf: PyRefMut<'py, Self>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if slf.pos >= slf.arr.size() {
+            return Ok(None);
+        }
+        let py = slf.py();
+        let off = slf.offset(slf.pos);
+        slf.pos += 1;
+        if slf.arr.dtype.is_flexible() {
+            return Ok(Some(flexible_to_py(py, &slf.arr, off)?));
+        }
+        Ok(Some(scalar_to_py(py, slf.arr.read_at(off))?))
+    }
+
+    #[getter]
+    fn base(&self, py: Python<'_>) -> Py<PyAny> {
+        self.base.clone_ref(py)
+    }
+
+    #[getter]
+    fn index(&self) -> usize {
+        self.pos
+    }
+
+    #[getter]
+    fn coords<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let mut rem = self.pos;
+        let mut out = vec![0usize; self.arr.ndim()];
+        for ax in (0..self.arr.ndim()).rev() {
+            let d = self.arr.shape[ax].max(1) as usize;
+            out[ax] = rem % d;
+            rem /= d;
+        }
+        PyTuple::new(py, out)
+    }
+
+    fn copy(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
+        PyNdArray::into_py_any(self.to_array(), py)
+    }
+
+    #[pyo3(signature = (dtype = None, copy = None))]
+    fn __array__(
+        &self,
+        py: Python<'_>,
+        dtype: Option<&Bound<'_, PyAny>>,
+        copy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyNdArray>> {
+        let _ = copy;
+        let a = self.to_array();
+        let a = match dtype {
+            Some(d) if !d.is_none() => a.astype(dtype_from_any(d)?),
+            _ => a,
+        };
+        PyNdArray::into_py_any(a, py)
+    }
+
+    fn __getitem__<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let out = match self.parse(key, false)? {
+            FlatKey::All => self.to_array(),
+            FlatKey::One(i) => {
+                let n = self.n();
+                let v = if i < 0 { i + n } else { i };
+                if v < 0 || v >= n {
+                    return Err(PyIndexError::new_err(format!(
+                        "index {} is out of bounds for axis 0 with size {}",
+                        i, n
+                    )));
+                }
+                let off = self.offset(v as usize);
+                if self.arr.dtype.is_flexible() {
+                    return flexible_to_py(py, &self.arr, off);
+                }
+                return scalar_to_py(py, self.arr.read_at(off));
+            }
+            FlatKey::Range(start, len, step) => {
+                let pos: Vec<i64> = (0..len).map(|k| (start + k * step) as i64).collect();
+                self.gather(&pos, &[len])?
+            }
+            FlatKey::Gather(pos, shape) => self.gather(&pos, &shape)?,
+        };
+        Ok(PyNdArray::into_py_any(out, py)?.into_bound(py).into_any())
+    }
+
+    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if !self.arr.flags.writeable {
+            return Err(PyValueError::new_err("assignment destination is read-only"));
+        }
+        let positions: Vec<i64> = match self.parse(key, true)? {
+            FlatKey::All => (0..self.n() as i64).collect(),
+            FlatKey::One(i) => vec![i as i64],
+            FlatKey::Range(start, len, step) => {
+                (0..len).map(|k| (start + k * step) as i64).collect()
+            }
+            FlatKey::Gather(pos, _) => pos,
+        };
+        let n = self.n();
+        let mut resolved = Vec::with_capacity(positions.len());
+        for &raw in &positions {
+            let v = if raw < 0 { raw + n as i64 } else { raw };
+            if v < 0 || v >= n as i64 {
+                return Err(PyIndexError::new_err(format!(
+                    "index {} is out of bounds for axis 0 with size {}",
+                    raw, n
+                )));
+            }
+            resolved.push(v as usize);
+        }
+        if !self.arr.dtype.is_flexible() {
+            if let Some(s) = scalar_from_py(value) {
+                for &v in &resolved {
+                    self.arr.write_at(self.offset(v), s);
+                }
+                return Ok(());
+            }
+        }
+        let src = array_from_any(value, Some(self.arr.dtype), false)?;
+        let want = [resolved.len() as isize];
+        let src = match rnp_core::iter::broadcast_to(&src, &want) {
+            Ok(s) => s,
+            Err(_) => {
+                // A multi-dimensional value is flattened first, as numpy does
+                // for flatiter assignment.
+                let n = src.size() as isize;
+                let flat = src.copy().reshape(&[n]).map_err(crate::err)?;
+                rnp_core::iter::broadcast_to(&flat, &want).map_err(crate::err)?
+            }
+        };
+        let src_offs: Vec<isize> =
+            rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
+        for (k, &v) in resolved.iter().enumerate() {
+            let d = self.offset(v);
+            if self.arr.dtype.is_flexible() {
+                self.arr.write_raw_at(d, src.raw_bytes_at(src_offs[k]));
+            } else {
+                self.arr.write_at(d, src.read_at(src_offs[k]));
+            }
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<numpy.flatiter object at 0x{:x}>", self as *const _ as usize)
+    }
 }
 
 /// numpy's `a.flags` object: attribute *and* item access.
@@ -290,44 +573,58 @@ impl PyNdArray {
     }
 
     #[getter]
-    fn base(&self) -> Option<()> {
-        None
+    fn base(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.base.as_ref().map(|b| b.clone_ref(py))
     }
 
     #[getter]
     #[pyo3(name = "T")]
-    fn t(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
-        PyNdArray::into_py_any(self.arr.transpose(), py)
+    fn t(slf: &Bound<'_, Self>) -> PyResult<Py<PyNdArray>> {
+        let arr = slf.borrow().arr.transpose();
+        PyNdArray::view_of(arr, slf)
     }
 
     #[pyo3(signature = (*axes))]
-    fn transpose(&self, py: Python<'_>, axes: &Bound<'_, PyTuple>) -> PyResult<Py<PyNdArray>> {
-        if axes.is_empty() {
-            return PyNdArray::into_py_any(self.arr.transpose(), py);
+    fn transpose(slf: &Bound<'_, Self>, axes: &Bound<'_, PyTuple>) -> PyResult<Py<PyNdArray>> {
+        let me = slf.borrow().arr.clone();
+        if axes.is_empty() || (axes.len() == 1 && axes.get_item(0)?.is_none()) {
+            return PyNdArray::view_of(me.transpose(), slf);
         }
         let spec = shape_from_args(axes)?;
         let perm: Vec<usize> = spec
             .iter()
             .map(|&a| {
                 if a < 0 {
-                    (a + self.arr.ndim() as isize) as usize
+                    (a + me.ndim() as isize) as usize
                 } else {
                     a as usize
                 }
             })
             .collect();
-        PyNdArray::into_py_any(self.arr.permute(&perm).map_err(crate::err)?, py)
+        PyNdArray::view_of(me.permute(&perm).map_err(crate::err)?, slf)
     }
 
     #[pyo3(signature = (*shape))]
-    fn reshape(&self, py: Python<'_>, shape: &Bound<'_, PyTuple>) -> PyResult<Py<PyNdArray>> {
+    fn reshape(slf: &Bound<'_, Self>, shape: &Bound<'_, PyTuple>) -> PyResult<Py<PyNdArray>> {
+        let me = slf.borrow().arr.clone();
         let spec = shape_from_args(shape)?;
-        PyNdArray::into_py_any(self.arr.reshape(&spec).map_err(crate::err)?, py)
+        let out = me.reshape(&spec).map_err(crate::err)?;
+        if std::sync::Arc::ptr_eq(&out.buffer, &me.buffer) {
+            PyNdArray::view_of(out, slf)
+        } else {
+            PyNdArray::into_py_any(out, slf.py())
+        }
     }
 
-    fn ravel(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
-        let n = self.arr.size() as isize;
-        PyNdArray::into_py_any(self.arr.reshape(&[n]).map_err(crate::err)?, py)
+    fn ravel(slf: &Bound<'_, Self>) -> PyResult<Py<PyNdArray>> {
+        let me = slf.borrow().arr.clone();
+        let n = me.size() as isize;
+        let out = me.reshape(&[n]).map_err(crate::err)?;
+        if std::sync::Arc::ptr_eq(&out.buffer, &me.buffer) {
+            PyNdArray::view_of(out, slf)
+        } else {
+            PyNdArray::into_py_any(out, slf.py())
+        }
     }
 
     fn flatten(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
@@ -413,6 +710,298 @@ impl PyNdArray {
         scalar_to_py(py, v)
     }
 
+
+    /// `a.view(dtype)` — reinterpret the same bytes under another dtype.
+    #[pyo3(signature = (dtype = None, type_ = None))]
+    fn view(
+        slf: &Bound<'_, Self>,
+        dtype: Option<&Bound<'_, PyAny>>,
+        type_: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyNdArray>> {
+        if type_.is_some_and(|t| !t.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "ndarray.view(type=) is not implemented yet",
+            ));
+        }
+        let me = slf.borrow().arr.clone();
+        let d = match dtype {
+            None => return PyNdArray::view_of(me, slf),
+            Some(o) if o.is_none() => return PyNdArray::view_of(me, slf),
+            // `a.view(np.ndarray)` asks for a type, not a dtype.
+            Some(o) if o.cast::<pyo3::types::PyType>().is_ok()
+                && dtype_from_any(o).is_err() =>
+            {
+                return PyNdArray::view_of(me, slf)
+            }
+            Some(o) => dtype_from_any(o)?,
+        };
+        let old = me.itemsize();
+        let new = d.itemsize();
+        let mut out = me.clone();
+        out.dtype = d;
+        if old != new {
+            if me.ndim() == 0 {
+                return Err(PyValueError::new_err(
+                    "Changing the dtype of a 0d array is only supported if the \
+                     itemsize is unchanged",
+                ));
+            }
+            let last = me.ndim() - 1;
+            if me.strides[last] != old as isize {
+                return Err(PyValueError::new_err(
+                    "To change to a dtype of a different size, the last axis \
+                     must be contiguous",
+                ));
+            }
+            let bytes = me.shape[last] * old as isize;
+            if bytes % new as isize != 0 {
+                return Err(PyValueError::new_err(
+                    "When changing to a larger dtype, its size must be a \
+                     divisor of the total size in bytes of the last axis of \
+                     the array.",
+                ));
+            }
+            out.shape[last] = bytes / new as isize;
+            out.strides[last] = new as isize;
+        }
+        out.flags.owndata = false;
+        out.update_flags();
+        PyNdArray::view_of(out, slf)
+    }
+
+    #[pyo3(signature = (axis = None, out = None, keepdims = false))]
+    fn all<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.bool_reduce(py, true, axis, out, keepdims)
+    }
+
+    #[pyo3(signature = (axis = None, out = None, keepdims = false))]
+    fn any<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.bool_reduce(py, false, axis, out, keepdims)
+    }
+
+    /// `a.repeat(repeats, axis=None)`.
+    #[pyo3(signature = (repeats, axis = None))]
+    fn repeat<'py>(
+        &self,
+        py: Python<'py>,
+        repeats: &Bound<'py, PyAny>,
+        axis: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ax = resolve_axis(&self.arr, axis)?;
+        let n = match ax {
+            None => self.arr.size(),
+            Some(a) => self.arr.shape[a].max(0) as usize,
+        };
+        let reps = array_from_any(repeats, None, false)?;
+        let counts: Vec<i64> = if reps.size() == 1 {
+            let v = as_i64(reps.get_flat(0));
+            vec![v; n]
+        } else {
+            if reps.size() != n {
+                return Err(PyValueError::new_err(format!(
+                    "operands could not be broadcast together with shape ({},) ({},)",
+                    n,
+                    reps.size()
+                )));
+            }
+            (0..reps.size()).map(|i| as_i64(reps.get_flat(i))).collect()
+        };
+        let mut idx = Vec::new();
+        for (i, &c) in counts.iter().enumerate() {
+            if c < 0 {
+                return Err(PyValueError::new_err("negative dimensions are not allowed"));
+            }
+            for _ in 0..c {
+                idx.push(Scalar::Int(i as i64));
+            }
+        }
+        let iarr = NdArray::from_scalars(&idx, DType::I64).map_err(crate::err)?;
+        let res = rnp_core::indexing::take(&self.arr, &iarr, ax, TakeMode::Raise)
+            .map_err(crate::err)?;
+        Ok(PyNdArray::into_py_any(res, py)?.into_bound(py).into_any())
+    }
+
+    #[pyo3(signature = (axis = None))]
+    fn squeeze(slf: &Bound<'_, Self>, axis: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyNdArray>> {
+        let me = slf.borrow().arr.clone();
+        let drop: Vec<usize> = match axis {
+            None => (0..me.ndim()).filter(|&i| me.shape[i] == 1).collect(),
+            Some(o) if o.is_none() => (0..me.ndim()).filter(|&i| me.shape[i] == 1).collect(),
+            Some(o) => {
+                let mut v = Vec::new();
+                for a in shape_from_any(o)? {
+                    let a = if a < 0 { a + me.ndim() as isize } else { a };
+                    if a < 0 || a as usize >= me.ndim() {
+                        return Err(PyValueError::new_err(format!(
+                            "axis {} is out of bounds for array of dimension {}",
+                            a,
+                            me.ndim()
+                        )));
+                    }
+                    if me.shape[a as usize] != 1 {
+                        return Err(PyValueError::new_err(
+                            "cannot select an axis to squeeze out which has size \
+                             not equal to one",
+                        ));
+                    }
+                    v.push(a as usize);
+                }
+                v
+            }
+        };
+        let mut out = me.clone();
+        for &a in drop.iter().rev() {
+            out.shape.remove(a);
+            out.strides.remove(a);
+        }
+        out.flags.owndata = false;
+        out.update_flags();
+        PyNdArray::view_of(out, slf)
+    }
+
+    fn swapaxes(slf: &Bound<'_, Self>, a: isize, b: isize) -> PyResult<Py<PyNdArray>> {
+        let me = slf.borrow().arr.clone();
+        let nd = me.ndim() as isize;
+        let (i, j) = (
+            if a < 0 { a + nd } else { a },
+            if b < 0 { b + nd } else { b },
+        );
+        if i < 0 || i >= nd || j < 0 || j >= nd {
+            return Err(PyValueError::new_err(format!(
+                "axis {} is out of bounds for array of dimension {}",
+                a, nd
+            )));
+        }
+        let mut perm: Vec<usize> = (0..me.ndim()).collect();
+        perm.swap(i as usize, j as usize);
+        PyNdArray::view_of(me.permute(&perm).map_err(crate::err)?, slf)
+    }
+
+    // ---- item selection --------------------------------------------------
+
+    #[pyo3(signature = (indices, axis = None, out = None, mode = "raise"))]
+    fn take<'py>(
+        &self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyAny>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        mode: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = TakeMode::from_str(mode).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "clipmode not understood; expected 'raise', 'wrap' or 'clip' (got '{mode}')"
+            ))
+        })?;
+        let idx = array_from_any(indices, None, false)?;
+        if !idx.dtype.is_integer() && idx.dtype != DType::Bool {
+            if idx.size() != 0 {
+                return Err(PyIndexError::new_err(
+                    "arrays used as indices must be of integer (or boolean) type",
+                ));
+            }
+        }
+        let ax = resolve_axis(&self.arr, axis)?;
+        let res = rnp_core::indexing::take(&self.arr, &idx, ax, m).map_err(crate::err)?;
+        store_or_wrap(py, res, out)
+    }
+
+    #[pyo3(signature = (indices, values, mode = "raise"))]
+    fn put(
+        &mut self,
+        indices: &Bound<'_, PyAny>,
+        values: &Bound<'_, PyAny>,
+        mode: &str,
+    ) -> PyResult<()> {
+        let m = TakeMode::from_str(mode).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "clipmode not understood; expected 'raise', 'wrap' or 'clip' (got '{mode}')"
+            ))
+        })?;
+        let idx = array_from_any(indices, None, false)?;
+        let ivals: Vec<i64> = idx
+            .to_vec()
+            .into_iter()
+            .map(|s| match s {
+                Scalar::Int(i) => i,
+                Scalar::Uint(u) => u as i64,
+                Scalar::Bool(b) => b as i64,
+                Scalar::Float(f) => f as i64,
+                Scalar::Complex(c) => c.re as i64,
+            })
+            .collect();
+        let vals = array_from_any(values, Some(self.arr.dtype), false)?;
+        rnp_core::indexing::put(&self.arr, &ivals, &vals, m).map_err(crate::err)
+    }
+
+    #[pyo3(signature = (condition, axis = None, out = None))]
+    fn compress<'py>(
+        &self,
+        py: Python<'py>,
+        condition: &Bound<'py, PyAny>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cond = array_from_any(condition, None, false)?;
+        let ax = resolve_axis(&self.arr, axis)?;
+        let res = rnp_core::indexing::compress(&self.arr, &cond, ax).map_err(crate::err)?;
+        store_or_wrap(py, res, out)
+    }
+
+    #[pyo3(signature = (choices, out = None, mode = "raise"))]
+    fn choose<'py>(
+        &self,
+        py: Python<'py>,
+        choices: &Bound<'py, PyAny>,
+        out: Option<&Bound<'py, PyAny>>,
+        mode: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = TakeMode::from_str(mode)
+            .ok_or_else(|| PyValueError::new_err("mode must be 'raise', 'wrap' or 'clip'"))?;
+        let mut arrays = Vec::new();
+        for c in choices.try_iter()? {
+            arrays.push(array_from_any(&c?, None, false)?);
+        }
+        let res = rnp_core::indexing::choose(&self.arr, &arrays, m).map_err(crate::err)?;
+        store_or_wrap(py, res, out)
+    }
+
+    fn nonzero<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let cols = rnp_core::indexing::nonzero(&self.arr);
+        let mut out = Vec::with_capacity(cols.len());
+        for c in cols {
+            out.push(PyNdArray::into_py_any(c, py)?);
+        }
+        PyTuple::new(py, out)
+    }
+
+    #[getter]
+    fn flat(slf: &Bound<'_, Self>) -> PyResult<Py<PyFlatIter>> {
+        let base = match &slf.borrow().base {
+            Some(b) => b.clone_ref(slf.py()),
+            None => slf.clone().into_any().unbind(),
+        };
+        Py::new(
+            slf.py(),
+            PyFlatIter {
+                arr: slf.borrow().arr.clone(),
+                pos: 0,
+                base,
+            },
+        )
+    }
 
     // ---- reductions ----------------------------------------------------
 
@@ -591,54 +1180,79 @@ impl PyNdArray {
     }
 
     fn __getitem__<'py>(
-        &self,
-        py: Python<'py>,
+        slf: &Bound<'py, Self>,
         key: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (view, scalarize) = index_view(&self.arr, key)?;
-        if scalarize {
-            if view.dtype.is_flexible() {
-                return flexible_to_py(py, &view, view.byte_offset);
+        let py = slf.py();
+        let me = slf.borrow().arr.clone();
+        let items = crate::index::parse_index(key)?;
+        match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
+            Indexed::View { arr: view, scalarize } => {
+                if scalarize {
+                    if view.dtype.is_flexible() {
+                        return flexible_to_py(py, &view, view.byte_offset);
+                    }
+                    return scalar_to_py(py, view.get(&[]).map_err(crate::err)?);
+                }
+                Ok(PyNdArray::view_of(view, slf)?.into_bound(py).into_any())
             }
-            return scalar_to_py(py, view.get(&[]).map_err(crate::err)?);
+            Indexed::Fancy(plan) => {
+                let out = rnp_core::indexing::gather(&me, &plan).map_err(crate::err)?;
+                if plan.scalarize {
+                    if out.dtype.is_flexible() {
+                        return flexible_to_py(py, &out, out.byte_offset);
+                    }
+                    return scalar_to_py(py, out.get_flat(0));
+                }
+                Ok(PyNdArray::into_py_any(out, py)?.into_bound(py).into_any())
+            }
         }
-        Ok(PyNdArray::into_py_any(view, py)?.into_bound(py).into_any())
     }
 
-    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let (mut view, _) = index_view(&self.arr, key)?;
-        if !view.flags.writeable {
+    fn __setitem__(
+        slf: &Bound<'_, Self>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        // Borrow immutably and clone the header: the buffer is shared, and a
+        // mutable borrow would deadlock when the key or the value *is* this
+        // same array (`a[a > 0] = a`).
+        let me = slf.borrow().arr.clone();
+        if !me.flags.writeable {
             return Err(PyValueError::new_err(
                 "assignment destination is read-only",
             ));
         }
-        if view.dtype.is_flexible() {
-            let src = array_from_any(value, Some(view.dtype), false)?;
-            let src = rnp_core::iter::broadcast_to(&src, &view.shape).map_err(crate::err)?;
-            let dst_offsets: Vec<isize> =
-                rnp_core::iter::offsets(&view.shape, &view.strides, view.byte_offset).collect();
-            let src_offsets: Vec<isize> =
-                rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
-            for (&d, &s) in dst_offsets.iter().zip(src_offsets.iter()) {
-                view.write_raw_at(d, src.raw_bytes_at(s));
+        let items = crate::index::parse_index(key)?;
+        match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
+            Indexed::View { arr: mut view, .. } => {
+                if !view.dtype.is_flexible() {
+                    if let Some(s) = scalar_from_py(value) {
+                        view.fill(s.cast(view.dtype));
+                        return Ok(());
+                    }
+                }
+                let src = assignment_source(value, &view.shape, view.dtype)?;
+                let dst_offsets: Vec<isize> =
+                    rnp_core::iter::offsets(&view.shape, &view.strides, view.byte_offset).collect();
+                let src_offsets: Vec<isize> =
+                    rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
+                if view.dtype.is_flexible() {
+                    for (&d, &s) in dst_offsets.iter().zip(src_offsets.iter()) {
+                        view.write_raw_at(d, src.raw_bytes_at(s));
+                    }
+                } else {
+                    for (&d, &s) in dst_offsets.iter().zip(src_offsets.iter()) {
+                        view.write_at(d, src.read_at(s));
+                    }
+                }
+                Ok(())
             }
-            return Ok(());
+            Indexed::Fancy(plan) => {
+                let src = assignment_source(value, &plan.shape, me.dtype)?;
+                rnp_core::indexing::scatter(&me, &plan, &src).map_err(crate::err)
+            }
         }
-        if let Some(s) = scalar_from_py(value) {
-            view.fill(s);
-            return Ok(());
-        }
-        // Array (or nested-sequence) assignment: broadcast the source.
-        let src = array_from_any(value, Some(view.dtype), false)?;
-        let src = rnp_core::iter::broadcast_to(&src, &view.shape).map_err(crate::err)?;
-        let dst_offsets: Vec<isize> =
-            rnp_core::iter::offsets(&view.shape, &view.strides, view.byte_offset).collect();
-        let src_offsets: Vec<isize> =
-            rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
-        for (&d, &s) in dst_offsets.iter().zip(src_offsets.iter()) {
-            view.write_at(d, src.read_at(s));
-        }
-        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -815,6 +1429,74 @@ impl PyNdArray {
     }
 }
 
+/// Return `res`, or copy it into a caller-supplied `out=` array (casting to
+/// the output dtype, as numpy does).
+pub fn store_or_wrap<'py>(
+    py: Python<'py>,
+    res: NdArray,
+    out: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dest = match out {
+        None => return Ok(PyNdArray::into_py_any(res, py)?.into_bound(py).into_any()),
+        Some(o) if o.is_none() => {
+            return Ok(PyNdArray::into_py_any(res, py)?.into_bound(py).into_any())
+        }
+        Some(o) => o,
+    };
+    let cell = dest.cast::<PyNdArray>().map_err(|_| {
+        PyTypeError::new_err("return arrays must be of ArrayType")
+    })?;
+    let target = cell.borrow().arr.clone();
+    if target.shape != res.shape {
+        return Err(PyValueError::new_err(format!(
+            "could not broadcast input array from shape {} into shape {}",
+            fmt_shape(&res.shape),
+            fmt_shape(&target.shape)
+        )));
+    }
+    let src: Vec<isize> =
+        rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset).collect();
+    let dst: Vec<isize> =
+        rnp_core::iter::offsets(&target.shape, &target.strides, target.byte_offset).collect();
+    for (&s, &d) in src.iter().zip(dst.iter()) {
+        if target.dtype.is_flexible() {
+            target.write_raw_at(d, res.raw_bytes_at(s));
+        } else {
+            target.write_at(d, res.read_at(s));
+        }
+    }
+    Ok(dest.clone())
+}
+
+/// Coerce the right-hand side of an assignment: build an array of `dtype`
+/// and broadcast it to `shape`, with numpy's message when it does not fit.
+fn assignment_source(
+    value: &Bound<'_, PyAny>,
+    shape: &[isize],
+    dtype: DType,
+) -> PyResult<NdArray> {
+    let src = array_from_any(value, Some(dtype), false)?;
+    rnp_core::iter::broadcast_to(&src, shape).map_err(|_| {
+        PyValueError::new_err(format!(
+            "shape mismatch: value array of shape {} could not be broadcast \
+             to indexing result of shape {}",
+            fmt_shape(&src.shape),
+            fmt_shape(shape)
+        ))
+    })
+}
+
+fn fmt_shape(s: &[isize]) -> String {
+    if s.len() == 1 {
+        format!("({},)", s[0])
+    } else {
+        format!(
+            "({})",
+            s.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
 /// Normalise an `axis=` argument: `None` means "reduce everything".
 fn resolve_axis(arr: &NdArray, axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<usize>> {
     let a = match axis {
@@ -836,7 +1518,74 @@ fn resolve_axis(arr: &NdArray, axis: Option<&Bound<'_, PyAny>>) -> PyResult<Opti
     Ok(Some(i as usize))
 }
 
+fn as_i64(s: Scalar) -> i64 {
+    match s {
+        Scalar::Int(i) => i,
+        Scalar::Uint(u) => u as i64,
+        Scalar::Bool(b) => b as i64,
+        Scalar::Float(f) => f as i64,
+        Scalar::Complex(c) => c.re as i64,
+    }
+}
+
 impl PyNdArray {
+    /// `all()`/`any()` over the whole array or one axis.
+    fn bool_reduce<'py>(
+        &self,
+        py: Python<'py>,
+        want_all: bool,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let truthy = |s: Scalar| -> bool {
+            match s {
+                Scalar::Bool(b) => b,
+                Scalar::Int(i) => i != 0,
+                Scalar::Uint(u) => u != 0,
+                Scalar::Float(f) => f != 0.0,
+                Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
+            }
+        };
+        match resolve_axis(&self.arr, axis)? {
+            None => {
+                let mut acc = want_all;
+                for o in rnp_core::iter::offsets(&self.arr.shape, &self.arr.strides,
+                                                 self.arr.byte_offset) {
+                    let t = truthy(self.arr.read_at(o));
+                    if want_all {
+                        acc &= t;
+                        if !acc {
+                            break;
+                        }
+                    } else {
+                        acc |= t;
+                        if acc {
+                            break;
+                        }
+                    }
+                }
+                if keepdims {
+                    let mut a = NdArray::zeros(vec![1; self.arr.ndim()], DType::Bool)
+                        .map_err(crate::err)?;
+                    a.fill(Scalar::Bool(acc));
+                    return store_or_wrap(py, a, out);
+                }
+                Ok(acc.into_pyobject(py)?.to_owned().into_any())
+            }
+            Some(ax) => {
+                let bools = self.arr.astype(DType::Bool);
+                let op = if want_all {
+                    rnp_core::ReduceOp::Min
+                } else {
+                    rnp_core::ReduceOp::Max
+                };
+                let res = rnp_core::reduce_axis(&bools, ax, op, keepdims).map_err(crate::err)?;
+                store_or_wrap(py, res, out)
+            }
+        }
+    }
+
     /// The shared body of every reduction method.
     fn reduce<'py>(
         &self,
@@ -906,14 +1655,7 @@ impl PyNdArray {
 /// Accept `reshape(2, 3)` and `reshape((2, 3))` alike.
 pub fn shape_from_args(args: &Bound<'_, PyTuple>) -> PyResult<Vec<isize>> {
     if args.len() == 1 {
-        let first = args.get_item(0)?;
-        if let Ok(t) = first.cast::<PyTuple>() {
-            return t.iter().map(|x| x.extract::<isize>()).collect();
-        }
-        if let Ok(l) = first.cast::<PyList>() {
-            return l.iter().map(|x| x.extract::<isize>()).collect();
-        }
-        return Ok(vec![first.extract::<isize>()?]);
+        return shape_from_any(&args.get_item(0)?);
     }
     args.iter().map(|x| x.extract::<isize>()).collect()
 }
@@ -928,6 +1670,14 @@ pub fn shape_from_any(obj: &Bound<'_, PyAny>) -> PyResult<Vec<isize>> {
     }
     if let Ok(l) = obj.cast::<PyList>() {
         return l.iter().map(|x| x.extract::<isize>()).collect();
+    }
+    // An integer array is a valid axis/shape sequence too
+    // (`a.transpose(np.random.permutation(5))`).
+    if let Ok(a) = obj.cast::<PyNdArray>() {
+        let arr = a.borrow().arr.clone();
+        if arr.dtype.is_integer() && arr.ndim() <= 1 {
+            return Ok(arr.to_vec().into_iter().map(as_i64).map(|v| v as isize).collect());
+        }
     }
     Err(PyTypeError::new_err(
         "shape must be an int or a sequence of ints",

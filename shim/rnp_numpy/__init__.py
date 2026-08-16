@@ -7,6 +7,7 @@ Python, except for a few thin conveniences at the bottom of this file.
 """
 
 import builtins as _builtins
+import enum as _enum
 
 from _rnp import (
     add,
@@ -18,12 +19,17 @@ from _rnp import (
     array,
     asarray,
     broadcast_shapes,
+    broadcast_to,
     can_cast,
+    choose,
     common_type,
+    compress,
     divide,
     dtype,
     empty,
     equal,
+    flatiter,
+    flatnonzero,
     full,
     greater,
     greater_equal,
@@ -33,19 +39,40 @@ from _rnp import (
     min_scalar_type,
     multiply,
     ndarray,
+    nonzero,
     not_equal,
     ones,
     prod,
     promote_types,
+    put,
+    putmask,
     result_type,
     shape,
     subtract,
     sum,
+    take,
     true_divide,
     zeros,
 )
+from _rnp import where_ as where
 from _rnp import _dtype_table as _dtype_table
 import _rnp
+
+from ._stubs import ufunc
+
+# The implemented ufuncs, wrapped so that `isinstance(np.add, np.ufunc)` and
+# `np.add.reduce(...)` behave the way the upstream tests expect.
+add = ufunc("add", 2, 1, add, identity=0)
+subtract = ufunc("subtract", 2, 1, subtract)
+multiply = ufunc("multiply", 2, 1, multiply, identity=1)
+divide = ufunc("divide", 2, 1, divide)
+true_divide = ufunc("true_divide", 2, 1, true_divide)
+equal = ufunc("equal", 2, 1, equal)
+not_equal = ufunc("not_equal", 2, 1, not_equal)
+less = ufunc("less", 2, 1, less)
+less_equal = ufunc("less_equal", 2, 1, less_equal)
+greater = ufunc("greater", 2, 1, greater)
+greater_equal = ufunc("greater_equal", 2, 1, greater_equal)
 
 from . import exceptions
 from .exceptions import AxisError, ComplexWarning, DTypePromotionError, VisibleDeprecationWarning
@@ -184,19 +211,52 @@ complex_ = complex128
 bool = bool_
 
 
+class _InertScalar:
+    """An instance of a scalar type the port does not implement.
+
+    Upstream test modules *construct* these at import time (inside class
+    bodies and parametrize lists), so construction has to succeed; every
+    operation on the result raises NotImplementedError instead.
+    """
+
+    __slots__ = ("_args", "_kwargs")
+
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+
+    def _nope(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"numpy scalar type {type(self).__name__!r} is not implemented "
+            f"by rnp yet")
+
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _nope
+    __truediv__ = __rtruediv__ = __floordiv__ = __rfloordiv__ = _nope
+    __mod__ = __rmod__ = __divmod__ = __pow__ = __neg__ = __abs__ = _nope
+    __int__ = __float__ = __complex__ = __index__ = _nope
+    __array__ = _nope
+
+    def __repr__(self):
+        inner = ", ".join(repr(a) for a in self._args)
+        return f"numpy.{type(self).__name__}({inner})"
+
+
 def _unsupported_scalar_type(name, base=generic):
     """A scalar type the port does not implement yet.
 
-    The name exists (module-level lookups in the test files succeed), but it
-    carries no dtype, so `np.dtype(np.str_)` fails loudly rather than
-    silently doing the wrong thing.
+    The name exists and can be instantiated (upstream modules do so at import
+    time), but it carries no dtype and every operation on an instance raises,
+    so nothing silently produces a wrong answer.
     """
 
     def __new__(cls, *args, **kwargs):
-        raise NotImplementedError(f"numpy scalar type {name!r} is not "
-                                  f"implemented by rnp yet")
+        return _InertScalar.__new__(_ScalarMeta(name, (_InertScalar,), {}))
 
-    return _ScalarMeta(name, (base,), {"__new__": __new__})
+    def __init__(self, *args, **kwargs):
+        _InertScalar.__init__(self, *args, **kwargs)
+
+    return _ScalarMeta(name, (base,), {"__new__": __new__,
+                                       "__init__": __init__})
 
 
 # The flexible scalar types exist as dtype *descriptors* (M1); their scalar
@@ -206,7 +266,9 @@ str_ = _make_scalar_type("str_", dtype("U"), character)
 unicode_ = str_
 bytes_ = _make_scalar_type("bytes_", dtype("S"), character)
 void = _make_scalar_type("void", dtype("V"), flexible)
-object_ = _unsupported_scalar_type("object_")
+# `object` exists as a dtype descriptor only: arrays of it are rejected
+# at creation time rather than silently mis-stored.
+object_ = _make_scalar_type("object_", dtype("O"), generic)
 datetime64 = _unsupported_scalar_type("datetime64")
 timedelta64 = _unsupported_scalar_type("timedelta64", signedinteger)
 # On this platform (macOS/arm64) numpy's long double *is* an IEEE double; it
@@ -236,6 +298,24 @@ sctypeDict.update({d.char: t for d, t in
 
 ScalarType = (int, float, complex, _builtins.bool, bytes, str, memoryview)
 
+True_ = bool_(True)
+False_ = bool_(False)
+
+
+class _CopyMode(_enum.Enum):
+    """numpy's `copy=` enum (NEP 50 / array-API `copy` semantics)."""
+
+    ALWAYS = True
+    NEVER = False
+    IF_NEEDED = 2
+
+    def __bool__(self):
+        if self == _CopyMode.ALWAYS:
+            return True
+        if self == _CopyMode.NEVER:
+            return False
+        raise ValueError(f"{self} is neither True nor False.")
+
 # numpy's typecode groups, minus the codes the port has no dtype for yet
 # (longdouble 'g'/'G', object 'O', datetime 'M'/'m').
 typecodes = {
@@ -247,7 +327,7 @@ typecodes = {
     'AllInteger': 'bBhHiIlLqQnNpP',
     'AllFloat': 'efdFD',
     'Datetime': '',
-    'All': '?bhilqnpBHILQNPefdFDSUV',
+    'All': '?bhilqnpBHILQNPefdFDSUVO',
 }
 
 
@@ -403,16 +483,97 @@ max = amax
 min = amin
 
 
-def all(a, axis=None):
-    if axis is not None:
-        raise NotImplementedError("axis= reductions of all() are not implemented yet")
-    return _builtins.all(_flat_values(a))
+def all(a, axis=None, out=None, keepdims=False):
+    return _asarr(a).all(axis=axis, out=out, keepdims=keepdims)
 
 
-def any(a, axis=None):
-    if axis is not None:
-        raise NotImplementedError("axis= reductions of any() are not implemented yet")
-    return _builtins.any(_flat_values(a))
+def any(a, axis=None, out=None, keepdims=False):
+    return _asarr(a).any(axis=axis, out=out, keepdims=keepdims)
+
+
+def repeat(a, repeats, axis=None):
+    return _asarr(a).repeat(repeats, axis=axis)
+
+
+def squeeze(a, axis=None):
+    return _asarr(a).squeeze(axis)
+
+
+def swapaxes(a, axis1, axis2):
+    return _asarr(a).swapaxes(axis1, axis2)
+
+
+class _IndexExpression:
+    """numpy's `np.s_` / `np.index_exp`."""
+
+    def __init__(self, maketuple):
+        self.maketuple = maketuple
+
+    def __getitem__(self, item):
+        if self.maketuple and not isinstance(item, tuple):
+            return (item,)
+        return item
+
+
+s_ = _IndexExpression(maketuple=False)
+index_exp = _IndexExpression(maketuple=True)
+
+
+class ndindex:
+    """Iterate over the C-order multi-indices of a shape."""
+
+    def __init__(self, *shape):
+        if len(shape) == 1 and not isinstance(shape[0], int):
+            shape = tuple(shape[0])
+        self._shape = tuple(_builtins.int(s) for s in shape)
+        self._total = 1
+        for s in self._shape:
+            self._total *= s
+        self._i = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._i >= self._total:
+            raise StopIteration
+        rem, out = self._i, [0] * len(self._shape)
+        for ax in range(len(self._shape) - 1, -1, -1):
+            d = self._shape[ax]
+            out[ax] = rem % d
+            rem //= d
+        self._i += 1
+        return tuple(out)
+
+    def ndincr(self):
+        next(self)
+
+
+def ix_(*args):
+    """Open mesh from N 1-D sequences (numpy's `np.ix_`)."""
+    out = []
+    nd = len(args)
+    for k, seq in enumerate(args):
+        a = _asarr(seq)
+        if a.ndim != 1:
+            raise ValueError("Cross index must be 1 dimensional")
+        if a.dtype == dtype("bool"):
+            a = nonzero(a)[0]
+        elif a.size == 0:
+            a = a.astype("intp")
+        shape = (1,) * k + (a.size,) + (1,) * (nd - k - 1)
+        out.append(a.reshape(shape))
+    return tuple(out)
+
+
+def indices(dimensions, dtype=int_):
+    dimensions = tuple(dimensions)
+    n = len(dimensions)
+    out = empty((n,) + dimensions, dtype)
+    for i, d in enumerate(dimensions):
+        shape = (1,) * i + (d,) + (1,) * (n - i - 1)
+        out[i] = arange(d, dtype=dtype).reshape(shape)
+    return out
 
 
 
@@ -519,6 +680,61 @@ def seterr(**kwargs):
 
 def geterr():
     return seterr()
+
+
+# --------------------------------------------------------------------------
+# The rest of the ufunc namespace.
+#
+# `np.add` and friends are real (native `_rnp` functions); every other ufunc
+# name exists so that upstream test modules import and collect, but raises
+# NotImplementedError the moment it is called. Real ufuncs land in M3.
+# --------------------------------------------------------------------------
+
+from ._core import umath as _umath  # noqa: E402
+
+for _name in _umath._ALL:
+    globals().setdefault(_name, getattr(_umath, _name))
+del _name
+
+from . import __config__, lib, ma, random  # noqa: E402,F401
+from ._core import multiarray  # noqa: E402,F401
+from ._core.numerictypes import sctypes  # noqa: E402,F401
+from ._stubs import inert_class as _inert_class  # noqa: E402
+from ._stubs import not_implemented as _not_implemented  # noqa: E402
+
+# Classes upstream test modules *instantiate* at import time.
+for _name in ("matrix", "poly1d", "vectorize", "broadcast"):
+    globals().setdefault(_name, _inert_class(_name))
+del _name
+
+
+# Names the upstream tests reference at module level but that belong to later
+# milestones. Each raises NotImplementedError when used.
+for _name in (
+    "argsort", "sort", "searchsorted", "partition", "argpartition", "dot",
+    "vdot", "inner", "outer", "tensordot", "einsum", "cross", "trace",
+    "diagonal", "cumsum", "cumprod", "diff", "gradient", "histogram",
+    "linspace", "logspace", "geomspace", "meshgrid", "roll", "rot90", "flip",
+    "tile", "unique", "sort_complex", "clip", "round", "around", "ptp",
+    "var", "std", "median", "average", "correlate", "convolve", "count_nonzero",
+    "isclose", "allclose", "array_equiv", "moveaxis", "rollaxis", "expand_dims",
+    "split", "array_split", "dsplit", "hsplit", "vsplit", "dstack", "column_stack",
+    "append", "insert", "delete", "resize", "trim_zeros", "fromfunction",
+    "frombuffer", "fromfile", "fromiter", "fromstring", "loadtxt", "savetxt",
+    "save", "load", "matmul", "vecdot", "packbits", "unpackbits", "digitize",
+    "select", "piecewise", "extract", "place", "copyto", "shares_memory",
+    "may_share_memory", "apply_along_axis", "asanyarray", "ascontiguousarray",
+    "asfortranarray", "require", "nan_to_num", "real", "imag", "angle",
+    "asmatrix", "bmat", "poly1d", "recarray", "record", "chararray",
+    "vectorize", "frompyfunc", "busday_count", "busday_offset", "is_busday",
+    "datetime_data", "printoptions", "set_printoptions", "get_printoptions",
+    "array2string", "array_repr", "array_str", "format_float_positional",
+    "format_float_scientific", "base_repr", "binary_repr", "info", "who",
+    "setdiff1d", "union1d", "intersect1d", "in1d", "isin", "genfromtxt",
+    "memmap", "nditer", "broadcast", "errstate_unavailable",
+):
+    globals().setdefault(_name, _not_implemented(f"numpy.{_name}"))
+del _name
 
 
 __all__ = [n for n in dir() if not n.startswith("_")]

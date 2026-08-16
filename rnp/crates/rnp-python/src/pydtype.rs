@@ -68,6 +68,11 @@ pub fn descr_from_any_aligned(obj: &Bound<'_, PyAny>, align: bool) -> PyResult<D
         if t.is(&PyBool::type_object(obj.py())) {
             return Ok(Descr::native(DType::Bool));
         }
+        // `np.dtype(object)` — a descriptor only; arrays of it are rejected
+        // at creation time.
+        if t.is(&PyAny::type_object(obj.py())) {
+            return Ok(Descr::native(DType::Object));
+        }
         if t.is(&PyInt::type_object(obj.py())) {
             return Ok(Descr::native(DType::I64));
         }

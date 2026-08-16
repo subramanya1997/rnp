@@ -203,6 +203,279 @@ def _compare_dtype(label, want, got):
                              f"{got.subdtype!r} != numpy's {want.subdtype!r}"))
 
 
+# --------------------------------------------------------------------------
+# Differential indexing (M2)
+#
+# A few hundred random index expressions are built once and applied to
+# identical arrays in both libraries. Values, dtype, shape, error type *and*
+# view-vs-copy semantics (observed through write-back) must all agree.
+# --------------------------------------------------------------------------
+
+#: The shapes indexed against, with the dtype used for each.
+INDEX_SHAPES = [(7,), (5, 4), (3, 4, 5), (2, 3, 2, 3), (0, 3), (), (1, 1)]
+
+INDEX_DTYPES = ["int32", "int64", "float64", "float32", "bool", "complex128"]
+
+
+def _random_index(rng, shape, allow_advanced=True):
+    """One random index expression, as a tuple of Python-level pieces.
+
+    Returned as a list of *descriptors* so the very same expression can be
+    rebuilt separately for numpy and for the port (index arrays must not be
+    shared between the two libraries).
+    """
+    nd = len(shape)
+    items = []
+    axis = 0
+    n_adv = 0
+    while axis < nd:
+        r = rng.random()
+        if r < 0.05:
+            items.append(("newaxis", None))
+            continue
+        if r < 0.10 and not any(k == "ellipsis" for k, _ in items):
+            # An ellipsis swallows the remaining axes.
+            items.append(("ellipsis", None))
+            axis = nd
+            break
+        n = shape[axis]
+        if r < 0.35:
+            if n == 0:
+                items.append(("slice", (None, None, None)))
+            else:
+                items.append(("int", rng.randrange(-n, n)))
+            axis += 1
+        elif r < 0.70:
+            lo = rng.choice([None, rng.randrange(-n - 1, n + 1)]) if n else None
+            hi = rng.choice([None, rng.randrange(-n - 1, n + 1)]) if n else None
+            st = rng.choice([None, 1, 2, 3, -1, -2])
+            items.append(("slice", (lo, hi, st)))
+            axis += 1
+        elif allow_advanced and r < 0.85 and n > 0 and n_adv < 2:
+            k = rng.randrange(1, 4)
+            vals = [rng.randrange(-n, n) for _ in range(k)]
+            if rng.random() < 0.3:
+                items.append(("intarray2d", (vals, n)))
+            else:
+                items.append(("intarray", vals))
+            n_adv += 1
+            axis += 1
+        elif allow_advanced and n_adv < 1:
+            # A boolean mask over 1 or 2 axes.
+            ax = 2 if (rng.random() < 0.3 and axis + 1 < nd) else 1
+            mask_shape = tuple(shape[axis:axis + ax])
+            mask = [rng.random() < 0.5 for _ in range(int(np.prod(mask_shape)))]
+            items.append(("boolmask", (mask, mask_shape)))
+            n_adv += 1
+            axis += ax
+        else:
+            items.append(("slice", (None, None, None)))
+            axis += 1
+    if rng.random() < 0.15:
+        items.append(("newaxis", None))
+    return items
+
+
+def _build_index(items, mod, mk):
+    """Rebuild an index expression for one library."""
+    out = []
+    for kind, payload in items:
+        if kind == "newaxis":
+            out.append(None)
+        elif kind == "ellipsis":
+            out.append(Ellipsis)
+        elif kind == "int":
+            out.append(payload)
+        elif kind == "slice":
+            out.append(slice(*payload))
+        elif kind == "intarray":
+            out.append(mk(np.array(payload, dtype=np.intp)))
+        elif kind == "intarray2d":
+            vals, _n = payload
+            out.append(mk(np.array([vals, vals[::-1]], dtype=np.intp)))
+        elif kind == "boolmask":
+            mask, mask_shape = payload
+            out.append(mk(np.array(mask, dtype=bool).reshape(mask_shape)))
+        else:  # pragma: no cover
+            raise AssertionError(kind)
+    return tuple(out)
+
+
+def _describe(items):
+    parts = []
+    for kind, payload in items:
+        if kind == "newaxis":
+            parts.append("None")
+        elif kind == "ellipsis":
+            parts.append("...")
+        elif kind == "int":
+            parts.append(str(payload))
+        elif kind == "slice":
+            lo, hi, st = payload
+            parts.append(":".join("" if v is None else str(v)
+                                  for v in (lo, hi, st)).rstrip(":") or ":")
+        elif kind == "intarray":
+            parts.append(str(payload))
+        elif kind == "intarray2d":
+            parts.append(f"2d{payload[0]}")
+        else:
+            parts.append(f"mask{payload[1]}")
+    return "[" + ", ".join(parts) + "]"
+
+
+def check_indexing(rng, n_cases=400):
+    """Differential test of __getitem__/__setitem__ against real numpy."""
+    global CHECKS
+
+    for _ in range(n_cases):
+        shape = rng.choice(INDEX_SHAPES)
+        dt = rng.choice(INDEX_DTYPES)
+        size = int(np.prod(shape)) if shape else 1
+        base = sample(rng, dt, max(size, 1)).reshape(shape) if size else \
+            np.zeros(shape, dt)
+        want_arr = base.copy()
+        got_arr = to_port(base)
+
+        items = _random_index(rng, shape)
+        desc = f"{dt}{shape}{_describe(items)}"
+
+        np_key = _build_index(items, np, lambda a: a)
+        rp_key = _build_index(items, _rnp, to_port)
+
+        CHECKS += 1
+        try:
+            want = want_arr[np_key]
+            np_exc = None
+        except Exception as e:  # noqa: BLE001
+            want, np_exc = None, type(e).__name__
+        try:
+            got = got_arr[rp_key]
+            rp_exc = None
+        except Exception as e:  # noqa: BLE001
+            got, rp_exc = None, type(e).__name__
+
+        if np_exc is not None or rp_exc is not None:
+            if np_exc != rp_exc:
+                FAILURES.append((f"getitem {desc}",
+                                 f"port raised {rp_exc}, numpy raised {np_exc}"))
+            continue
+
+        # numpy returns a scalar where the port still returns a Python number
+        # (no scalar types until M3), so compare through np.asarray.
+        want_a = np.asarray(want)
+        got_a = np.asarray(got) if not isinstance(got, (int, float, complex, bool)) \
+            else np.asarray(got, dtype=want_a.dtype)
+        try:
+            if want_a.shape != got_a.shape:
+                raise AssertionError(f"shape {got_a.shape} != numpy's {want_a.shape}")
+            if want_a.dtype != got_a.dtype:
+                raise AssertionError(f"dtype {got_a.dtype} != numpy's {want_a.dtype}")
+            np.testing.assert_array_equal(got_a, want_a, strict=True)
+        except Exception as exc:  # noqa: BLE001
+            FAILURES.append((f"getitem {desc}",
+                             f"{exc}".strip().splitlines()[0][:200]))
+            continue
+
+        # View-vs-copy parity, observed through write-back: mutate the result
+        # in place in both libraries and compare the *base* arrays.
+        if want_a.size and not isinstance(got, (int, float, complex, bool)):
+            CHECKS += 1
+            try:
+                want[...] = 0
+                probe_ok = True
+            except Exception:  # noqa: BLE001
+                probe_ok = False
+            if probe_ok:
+                try:
+                    got[...] = 0
+                except Exception as e:  # noqa: BLE001
+                    FAILURES.append((f"writeback {desc}",
+                                     f"port raised {type(e).__name__} on `r[...] = 0`"))
+                    continue
+                try:
+                    np.testing.assert_array_equal(np.asarray(got_arr), want_arr,
+                                                  strict=True)
+                except Exception as exc:  # noqa: BLE001
+                    FAILURES.append((
+                        f"view-vs-copy {desc}",
+                        "writing through the result changed the base "
+                        f"differently: {exc}".strip().splitlines()[0][:200]))
+                    continue
+
+        # ---- setitem parity ------------------------------------------------
+        want_arr2 = base.copy()
+        got_arr2 = to_port(base)
+        value = rng.choice([0, 1, -3, 2.5])
+        CHECKS += 1
+        try:
+            want_arr2[np_key] = value
+            np_exc = None
+        except Exception as e:  # noqa: BLE001
+            np_exc = type(e).__name__
+        try:
+            got_arr2[rp_key] = value
+            rp_exc = None
+        except Exception as e:  # noqa: BLE001
+            rp_exc = type(e).__name__
+        if np_exc != rp_exc:
+            FAILURES.append((f"setitem {desc} = {value}",
+                             f"port raised {rp_exc}, numpy raised {np_exc}"))
+            continue
+        if np_exc is None:
+            try:
+                np.testing.assert_array_equal(np.asarray(got_arr2), want_arr2,
+                                              strict=True)
+            except Exception as exc:  # noqa: BLE001
+                FAILURES.append((f"setitem {desc} = {value}",
+                                 f"{exc}".strip().splitlines()[0][:200]))
+
+    # ---- item selection --------------------------------------------------
+    for _ in range(60):
+        shape = rng.choice([(7,), (5, 4), (3, 4, 5)])
+        dt = rng.choice(["int32", "int64", "float64"])
+        base = sample(rng, dt, int(np.prod(shape))).reshape(shape)
+        port = to_port(base)
+        axis = rng.choice([None] + list(range(len(shape))))
+        mode = rng.choice(["raise", "wrap", "clip"])
+        n = base.size if axis is None else shape[axis]
+        idx = np.array([rng.randrange(-2 * n, 2 * n)
+                        for _ in range(rng.randrange(1, 5))], dtype=np.intp)
+        label = f"take({dt}{shape}, {idx.tolist()}, axis={axis}, mode={mode!r})"
+        CHECKS += 1
+        try:
+            want = base.take(idx, axis=axis, mode=mode)
+            np_exc = None
+        except Exception as e:  # noqa: BLE001
+            want, np_exc = None, type(e).__name__
+        try:
+            got = port.take(to_port(idx), axis=axis, mode=mode)
+            rp_exc = None
+        except Exception as e:  # noqa: BLE001
+            got, rp_exc = None, type(e).__name__
+        if np_exc != rp_exc:
+            FAILURES.append((label, f"port raised {rp_exc}, numpy raised {np_exc}"))
+        elif np_exc is None:
+            check(label, want, got)
+
+    # ---- nonzero / where / flatnonzero -----------------------------------
+    for _ in range(40):
+        shape = rng.choice([(7,), (5, 4), (3, 4, 5), (0, 3)])
+        dt = rng.choice(["int32", "float64", "bool"])
+        size = int(np.prod(shape))
+        base = sample(rng, dt, max(size, 1))[:size].reshape(shape)
+        # Force a decent mix of zeros.
+        base = np.where(np.arange(base.size).reshape(shape) % 3 == 0,
+                        np.zeros_like(base), base)
+        port = to_port(base)
+        for k, (w, g) in enumerate(zip(np.nonzero(base), _rnp.nonzero(port))):
+            check(f"nonzero({dt}{shape})[{k}]", w, g)
+        check(f"flatnonzero({dt}{shape})", np.flatnonzero(base),
+              _rnp.flatnonzero(port))
+        mask = base != 0
+        check(f"where({dt}{shape}, 1, 2)", np.where(mask, 1, 2),
+              _rnp.where_(to_port(mask), 1, 2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=20260816)
@@ -586,6 +859,9 @@ def main():
         if want_eq != got_eq:
             FAILURES.append((f"array({values!r}) == itself",
                              f"{got_eq} != numpy's {want_eq}"))
+
+    # ---- indexing (M2) ---------------------------------------------------
+    check_indexing(rng)
 
     # ---- error parity ---------------------------------------------------
     error_cases = [

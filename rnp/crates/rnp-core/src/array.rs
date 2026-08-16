@@ -102,6 +102,17 @@ pub fn is_f_contiguous(shape: &[isize], strides: &[isize], itemsize: usize) -> b
     true
 }
 
+/// The port has no Python-object storage, so `object` dtypes exist only as
+/// descriptors.
+pub fn check_storable(dtype: DType) -> Result<()> {
+    if dtype.is_object() {
+        return Err(Error::NotImplemented(
+            "rnp cannot create arrays of the object dtype".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl NdArray {
     pub fn ndim(&self) -> usize {
         self.shape.len()
@@ -139,6 +150,7 @@ impl NdArray {
     }
 
     fn new_uninit(shape: Vec<isize>, dtype: DType) -> Result<NdArray> {
+        check_storable(dtype)?;
         for &d in &shape {
             if d < 0 {
                 return Err(Error::ValueError(
@@ -169,6 +181,7 @@ impl NdArray {
 
     /// `np.zeros`. Every supported dtype has an all-zero-bytes zero value.
     pub fn zeros(shape: Vec<isize>, dtype: DType) -> Result<NdArray> {
+        check_storable(dtype)?;
         for &d in &shape {
             if d < 0 {
                 return Err(Error::ValueError(
@@ -336,6 +349,15 @@ impl NdArray {
     /// Read the element at a byte offset from the buffer start.
     #[inline]
     pub fn read_at(&self, byte_off: isize) -> Scalar {
+        if self.dtype.is_flexible() || self.dtype.is_object() {
+            // Flexible elements have no scalar value; expose the leading
+            // bytes so that generic code (copies, comparisons) still works.
+            let raw = self.raw_bytes_at(byte_off);
+            let mut buf = [0u8; 8];
+            let k = raw.len().min(8);
+            buf[..k].copy_from_slice(&raw[..k]);
+            return Scalar::Uint(u64::from_le_bytes(buf));
+        }
         // SAFETY: `byte_off` is produced by `byte_index` from an in-bounds
         // index (or by an iterator over in-bounds indices), so the itemsize
         // bytes at that offset lie inside the allocation.
@@ -350,6 +372,20 @@ impl NdArray {
     /// Write a scalar (cast to the array dtype) at a byte offset.
     #[inline]
     pub fn write_at(&self, byte_off: isize, value: Scalar) {
+        if self.dtype.is_flexible() || self.dtype.is_object() {
+            // As `read_at`: store the scalar's little-endian bytes, padded or
+            // truncated to the element size. Nothing interprets them, so no
+            // wrong *numeric* answer can escape.
+            let bits: u64 = match value {
+                Scalar::Bool(b) => b as u64,
+                Scalar::Int(i) => i as u64,
+                Scalar::Uint(u) => u,
+                Scalar::Float(f) => f.to_bits(),
+                Scalar::Complex(c) => c.re.to_bits(),
+            };
+            self.write_raw_at(byte_off, &bits.to_le_bytes());
+            return;
+        }
         // SAFETY: as `read_at`; the caller guarantees the offset is in range,
         // and the array is known writeable.
         unsafe {

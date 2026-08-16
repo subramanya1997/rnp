@@ -44,6 +44,10 @@ pub enum DType {
     Struct(u32),
     /// A subarray dtype (`('f4', (2, 2))`); indexes the subarray registry.
     SubArray(u32),
+    /// `object` — a descriptor only. The port has no Python-object storage,
+    /// so creating an array of it raises NotImplementedError; the descriptor
+    /// exists because upstream test modules build one at import time.
+    Object,
 }
 
 /// Broad category of a dtype, used by the promotion lattice.
@@ -60,6 +64,8 @@ pub enum Kind {
     Str,
     /// `V`, including structured and subarray dtypes.
     Void,
+    /// `O`
+    Object,
 }
 
 /// The numeric dtypes, in numpy's own ordering.
@@ -96,6 +102,7 @@ impl DType {
                 let d = registry::subarray_def(id);
                 d.base.itemsize() * crate::array::shape_size(&d.shape)
             }
+            DType::Object => 8,
         }
     }
 
@@ -108,6 +115,7 @@ impl DType {
             DType::Str(_) => 4,
             DType::Struct(id) => registry::struct_def(id).alignment,
             DType::SubArray(id) => registry::subarray_def(id).base.alignment(),
+            DType::Object => 8,
             other => other.itemsize(),
         }
     }
@@ -122,6 +130,7 @@ impl DType {
             DType::Bytes(_) => Kind::Bytes,
             DType::Str(_) => Kind::Str,
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => Kind::Void,
+            DType::Object => Kind::Object,
         }
     }
 
@@ -136,6 +145,7 @@ impl DType {
             Kind::Bytes => 'S',
             Kind::Str => 'U',
             Kind::Void => 'V',
+            Kind::Object => 'O',
         }
     }
 
@@ -159,6 +169,7 @@ impl DType {
             DType::Bytes(_) => 'S',
             DType::Str(_) => 'U',
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 'V',
+            DType::Object => 'O',
         }
     }
 
@@ -188,6 +199,9 @@ impl DType {
     pub fn name(self) -> String {
         if let Some(n) = self.numeric_name() {
             return n.to_string();
+        }
+        if self == DType::Object {
+            return "object".to_string();
         }
         let stem = match self.category() {
             Kind::Bytes => "bytes",
@@ -222,6 +236,7 @@ impl DType {
             DType::Bytes(_) => 18,
             DType::Str(_) => 19,
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 20,
+            DType::Object => 17,
         }
     }
 
@@ -236,6 +251,7 @@ impl DType {
         match self {
             DType::Str(_) => true,
             DType::Bytes(_) | DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => false,
+            DType::Object => false,
             other => other.itemsize() > 1,
         }
     }
@@ -301,6 +317,10 @@ impl DType {
     pub fn is_flexible(self) -> bool {
         matches!(self.category(), Kind::Bytes | Kind::Str | Kind::Void)
     }
+    /// `object` dtype: a descriptor with no storage behind it.
+    pub fn is_object(self) -> bool {
+        self == DType::Object
+    }
     /// True for bool and all integer types (the "not inexact" set).
     pub fn is_exact(self) -> bool {
         matches!(self.category(), Kind::Bool | Kind::Int | Kind::Uint)
@@ -326,6 +346,7 @@ impl DType {
     /// dtypes, e.g. `"int64"`, `"l"`, `"i8"`, `"double"`.
     pub(crate) fn from_plain_name(s: &str) -> Option<DType> {
         Some(match s {
+            "object" | "object_" | "O" | "O8" => DType::Object,
             "bool" | "bool_" | "?" | "b1" => DType::Bool,
             "int8" | "byte" | "b" | "i1" => DType::I8,
             "int16" | "short" | "h" | "i2" => DType::I16,

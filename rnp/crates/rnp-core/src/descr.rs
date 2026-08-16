@@ -98,6 +98,11 @@ pub enum Alias {
     ULongLong,
     /// `'c'`: an `S1` whose char code stays `'c'`.
     Char,
+    /// `'g'` / `'longdouble'`: on this platform numpy's long double *is* an
+    /// IEEE double, but it keeps `num` 13 and `char` `'g'`.
+    LongDouble,
+    /// `'G'` / `'clongdouble'`: `num` 16, `char` `'G'`.
+    CLongDouble,
 }
 
 /// One field of a structured dtype.
@@ -258,6 +263,8 @@ impl Descr {
         match self.alias {
             Alias::LongLong => 9,
             Alias::ULongLong => 10,
+            Alias::LongDouble => 13,
+            Alias::CLongDouble => 16,
             Alias::None | Alias::Char => self.dt.num(),
         }
     }
@@ -267,6 +274,8 @@ impl Descr {
             Alias::LongLong => 'q',
             Alias::ULongLong => 'Q',
             Alias::Char => 'c',
+            Alias::LongDouble => 'g',
+            Alias::CLongDouble => 'G',
             Alias::None => self.dt.char_code(),
         }
     }
@@ -294,6 +303,10 @@ impl Descr {
             ByteOrder::Native | ByteOrder::Little => '<',
             ByteOrder::Big => '>',
         };
+        if self.dt == DType::Object {
+            // numpy prints the object dtype as `|O`, with no size.
+            return "|O".to_string();
+        }
         format!("{}{}{}", prefix, self.dt.str_kind(), self.dt.str_size())
     }
 
@@ -743,6 +756,14 @@ fn parse_scalar_spec(s: &str) -> Option<Descr> {
     }
     if matches!(rest, "Q" | "ulonglong") {
         return Some(Descr::with_alias(DType::U64, bo, Alias::ULongLong));
+    }
+    // On macOS/arm64 numpy's long double is an IEEE double; the port models
+    // it as float64 with numpy's own num/char (a documented M1 gap).
+    if matches!(rest, "g" | "longdouble" | "longfloat" | "float128" | "f16") {
+        return Some(Descr::with_alias(DType::F64, bo, Alias::LongDouble));
+    }
+    if matches!(rest, "G" | "clongdouble" | "clongfloat" | "complex256" | "c32") {
+        return Some(Descr::with_alias(DType::C128, bo, Alias::CLongDouble));
     }
     let dt = DType::from_plain_name(rest)?;
     Some(Descr::new(dt, bo))

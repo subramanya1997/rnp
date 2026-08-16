@@ -8,6 +8,7 @@ the same semantics.
 
 import contextlib
 import platform
+from functools import wraps
 import sys
 import warnings
 
@@ -370,3 +371,155 @@ def requires_deep_recursion(func=None):
 
 def check_free_memory(free_bytes):
     return None
+
+
+# --------------------------------------------------------------------------
+# Additional names numpy.testing exports (transcribed from
+# upstream/numpy/testing/_private/utils.py, which is the oracle).
+# --------------------------------------------------------------------------
+
+#: numpy probes its BLAS for floating-point-exception support; the port has no
+#: BLAS yet, so the tests that depend on it are simply not applicable.
+BLAS_SUPPORTS_FPE = False
+
+
+class KnownFailureException(Exception):
+    """Raise this exception to mark a test as a known failing test."""
+
+
+KnownFailureTest = KnownFailureException
+
+
+class IgnoreException(Exception):
+    "Ignoring this exception due to disabled feature"
+
+
+def _gen_alignment_data(dtype=None, type='binary', max_size=24):
+    """Generator producing data with different alignment and offsets, used to
+    exercise SIMD paths. Transcribed from numpy's own helper."""
+    import rnp_numpy as _np
+    if dtype is None:
+        dtype = _np.float32
+    arange, empty = _np.arange, _np.empty
+    ufmt = 'unary offset=(%d, %d), size=%d, dtype=%r, %s'
+    bfmt = 'binary offset=(%d, %d, %d), size=%d, dtype=%r, %s'
+    for o in range(3):
+        for s in range(o + 2, max(o + 3, max_size)):
+            if type == 'unary':
+                def inp():
+                    return arange(s, dtype=dtype)[o:]
+                out = empty((s,), dtype=dtype)[o:]
+                yield out, inp(), ufmt % (o, o, s, dtype, 'out of place')
+                d = inp()
+                yield d, d, ufmt % (o, o, s, dtype, 'in place')
+                yield out[1:], inp()[:-1], ufmt % (o + 1, o, s - 1, dtype,
+                                                   'out of place')
+                yield out[:-1], inp()[1:], ufmt % (o, o + 1, s - 1, dtype,
+                                                   'out of place')
+                yield inp()[:-1], inp()[1:], ufmt % (o, o + 1, s - 1, dtype,
+                                                     'aliased')
+                yield inp()[1:], inp()[:-1], ufmt % (o + 1, o, s - 1, dtype,
+                                                     'aliased')
+            if type == 'binary':
+                def inp1():
+                    return arange(s, dtype=dtype)[o:]
+                inp2 = inp1
+                out = empty((s,), dtype=dtype)[o:]
+                yield out, inp1(), inp2(), bfmt % (o, o, o, s, dtype,
+                                                   'out of place')
+                d = inp1()
+                yield d, d, inp2(), bfmt % (o, o, o, s, dtype, 'in place1')
+                d = inp2()
+                yield d, inp1(), d, bfmt % (o, o, o, s, dtype, 'in place2')
+                yield out[1:], inp1()[:-1], inp2()[:-1], bfmt % \
+                    (o + 1, o, o, s - 1, dtype, 'out of place')
+                yield out[:-1], inp1()[1:], inp2()[:-1], bfmt % \
+                    (o, o + 1, o, s - 1, dtype, 'out of place')
+                yield out[:-1], inp1()[:-1], inp2()[1:], bfmt % \
+                    (o, o, o + 1, s - 1, dtype, 'out of place')
+                yield inp1()[1:], inp1()[:-1], inp2()[:-1], bfmt % \
+                    (o + 1, o, o, s - 1, dtype, 'aliased')
+                yield inp1()[:-1], inp1()[1:], inp2()[:-1], bfmt % \
+                    (o, o + 1, o, s - 1, dtype, 'aliased')
+                yield inp1()[:-1], inp1()[:-1], inp2()[1:], bfmt % \
+                    (o, o, o + 1, s - 1, dtype, 'aliased')
+
+
+def _assert_valid_refcount(op):
+    """numpy checks that ufuncs do not mishandle the refcount of the int 1."""
+    if not HAS_REFCOUNT:
+        return True
+    import gc
+
+    import rnp_numpy as np
+    b = np.arange(100 * 100).reshape(100, 100)
+    c = b
+    i = 1
+    gc.disable()
+    try:
+        rc = sys.getrefcount(i)
+        for _ in range(15):
+            op(b, c)
+        assert_(sys.getrefcount(i) >= rc)
+    finally:
+        gc.enable()
+    return True
+
+
+def run_threaded(func, max_workers=8, pass_count=False, pass_barrier=False,
+                 outer_iterations=1, prepare_args=None):
+    """Run `func` many times in parallel (transcribed from numpy)."""
+    import concurrent.futures
+    import threading
+    for _ in range(outer_iterations):
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers) as tpe:
+            args = [] if prepare_args is None else prepare_args()
+            if pass_barrier:
+                args.append(threading.Barrier(max_workers))
+            if pass_count:
+                all_args = [(func, i, *args) for i in range(max_workers)]
+            else:
+                all_args = [(func, *args) for _ in range(max_workers)]
+            futures = [tpe.submit(*a) for a in all_args]
+            for f in futures:
+                f.result()
+
+
+def check_support_sve(__cache=[]):
+    return False
+
+
+def assert_array_max_ulp_unavailable(*a, **k):  # pragma: no cover
+    raise NotImplementedError
+
+
+__all__ += [
+    "BLAS_SUPPORTS_FPE", "IgnoreException", "KnownFailureException",
+    "_gen_alignment_data", "_assert_valid_refcount", "run_threaded",
+]
+
+
+#: On this platform numpy's long double is an IEEE double, never the IBM
+#: double-double format.
+LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE = False
+
+
+def _glibc_older_than(x):
+    return False
+
+
+def _no_tracing(func):
+    """numpy disables sys tracing around tests that count bytecode frames."""
+    if not hasattr(sys, 'gettrace'):
+        return func
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        original_trace = sys.gettrace()
+        try:
+            sys.settrace(None)
+            return func(*args, **kwargs)
+        finally:
+            sys.settrace(original_trace)
+    return wrapper

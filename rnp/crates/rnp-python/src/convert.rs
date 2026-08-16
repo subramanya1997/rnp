@@ -280,6 +280,11 @@ pub fn array_from_any(
             _ => inner,
         });
     }
+    // Structured dtypes: the "scalar" of the array is a Python tuple, one
+    // entry per field.
+    if let Some(DType::Struct(id)) = dtype {
+        return array_from_records(obj, id);
+    }
     // Flexible dtypes take a completely separate path: their elements are
     // Python str/bytes, which `Scalar` cannot carry.
     let wants_text = matches!(dtype, Some(DType::Bytes(_)) | Some(DType::Str(_)));
@@ -311,6 +316,80 @@ pub fn array_from_any(
         "could not convert {} to an array",
         obj.get_type().name().map(|n| n.to_string()).unwrap_or_default()
     )))
+}
+
+/// Build a structured array from nested sequences of record tuples.
+fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
+    let def = rnp_core::descr::registry::struct_def(id);
+    let nfields = def.fields.len();
+    // Descend list/tuple nesting until the first record tuple (a tuple whose
+    // length matches the field count) is reached.
+    let mut shape: Vec<isize> = Vec::new();
+    let mut cur = obj.clone();
+    loop {
+        let is_record = cur
+            .cast::<PyTuple>()
+            .map(|t| t.len() == nfields)
+            .unwrap_or(false);
+        if is_record || !is_sequence(&cur) {
+            break;
+        }
+        let seq = cur.cast::<PySequence>()?;
+        let n = seq.len()?;
+        shape.push(n as isize);
+        if n == 0 {
+            break;
+        }
+        cur = seq.get_item(0)?;
+    }
+    let mut records: Vec<Bound<'_, PyAny>> = Vec::new();
+    collect_objects(obj, 0, &shape, &mut records)?;
+
+    let out = NdArray::zeros(shape, DType::Struct(id)).map_err(crate::err)?;
+    let isz = out.itemsize() as isize;
+    for (i, rec) in records.iter().enumerate() {
+        let base = i as isize * isz;
+        let items: Vec<Bound<'_, PyAny>> = if let Ok(t) = rec.cast::<PyTuple>() {
+            t.iter().collect()
+        } else if let Ok(l) = rec.cast::<PyList>() {
+            l.iter().collect()
+        } else {
+            return Err(PyTypeError::new_err(
+                "a structured array element must be a tuple of field values",
+            ));
+        };
+        if items.len() != nfields {
+            return Err(PyValueError::new_err(format!(
+                "could not assign tuple of length {} to structure with {} fields.",
+                items.len(),
+                nfields
+            )));
+        }
+        for (f, val) in def.fields.iter().zip(items.iter()) {
+            let off = base + f.offset as isize;
+            let fdt = f.descr.dt;
+            if matches!(fdt, DType::Bytes(_) | DType::Str(_)) {
+                let (bytes, _) = text_bytes(val, fdt)?;
+                let n = fdt.itemsize().min(bytes.len());
+                // SAFETY: `off` addresses this field inside a zeroed record.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        out.buffer.as_mut_ptr().offset(off),
+                        n,
+                    );
+                }
+            } else {
+                let sv = scalar_from_py(val).ok_or_else(|| {
+                    PyTypeError::new_err("unsupported field value in a structured array")
+                })?;
+                let mut field = out.clone();
+                field.dtype = fdt;
+                field.write_at(off, sv);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// NEP 50 promotion for `array OP python-scalar`: the Python scalar is

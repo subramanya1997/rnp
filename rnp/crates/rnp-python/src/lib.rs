@@ -9,6 +9,8 @@ use rnp_core::reduce::ReduceOp;
 use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod convert;
+mod index;
+mod itemsel;
 mod pyarray;
 mod pydtype;
 
@@ -486,6 +488,18 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNdArray>()?;
     m.add_class::<PyDType>()?;
     m.add_class::<pyarray::PyFlags>()?;
+    m.add_class::<pyarray::PyFlatIter>()?;
+
+    m.add_function(wrap_pyfunction!(itemsel::take, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::put, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::putmask, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::compress, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::choose, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::nonzero, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::flatnonzero, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::where_, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::broadcast_to, m)?)?;
+    m.add_function(wrap_pyfunction!(itemsel::_as_strided, m)?)?;
 
     m.add_function(wrap_pyfunction!(zeros, m)?)?;
     m.add_function(wrap_pyfunction!(ones, m)?)?;
