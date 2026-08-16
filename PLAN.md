@@ -1,7 +1,7 @@
 # PLAN.md — rnp milestone plan (owner: Fable 5)
 
-Goal: a Rust implementation of NumPy's core that passes NumPy v2.2.6's own
-unmodified tests, cross-verified and benchmarked against real NumPy 2.2.6.
+Goal: a Rust implementation of NumPy's core that passes NumPy v2.5.2's own
+unmodified tests, cross-verified and benchmarked against real NumPy 2.5.2.
 
 Strategy: NumPy's full surface is enormous (69 test files in `_core/tests`
 alone, plus linalg/fft/random/lib). We do NOT try to pass everything at once.
@@ -76,4 +76,4 @@ benchmark run, Fable review, git commit.
 
 ## Status log
 
-- 2026-08-16: repo initialized, upstream v2.2.6 cloned, venv ready. M0 started.
+- 2026-08-16: repo initialized, upstream v2.5.2 cloned, venv ready. M0 started.

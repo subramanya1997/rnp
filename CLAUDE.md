@@ -23,16 +23,16 @@ unmodified test suite and benchmarked against real NumPy.
 - **`upstream/` is read-only. Never edit anything under `upstream/`, especially
   test files. The tests must not change at all — they are the oracle.** The port
   is made to pass the tests; the tests are never made to pass the port.
-- Cross-verification: behavior is checked against real NumPy 2.2.6 installed in
-  `.venv` (the same version as the `upstream/` clone, tag v2.2.6).
+- Cross-verification: behavior is checked against real NumPy 2.5.2 installed in
+  `.venv` (the same version as the `upstream/` clone, tag v2.5.2).
 - Benchmarks compare the Rust port against real NumPy (same venv), never against
   synthetic baselines.
 - No `unsafe` in `rnp-core` without a `// SAFETY:` justification comment.
 
 ## Layout
 
-- `upstream/` — shallow clone of numpy at tag v2.2.6. READ-ONLY oracle.
-- `.venv/` — Python 3.10 venv with real `numpy==2.2.6`, pytest, hypothesis, maturin.
+- `upstream/` — shallow clone of numpy at tag v2.5.2. READ-ONLY oracle.
+- `.venv/` — Python 3.13 venv with real `numpy==2.5.2`, pytest, hypothesis, maturin.
 - `rnp/` — Rust workspace
   - `crates/rnp-core` — pure-Rust ndarray engine (dtypes, strides, broadcasting, ufuncs).
   - `crates/rnp-python` — PyO3 extension module exposing the NumPy-compatible Python API.
