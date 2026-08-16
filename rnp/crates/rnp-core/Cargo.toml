@@ -1,0 +1,9 @@
+[package]
+name = "rnp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust ndarray engine for rnp (a Rust port of NumPy)"
+
+[dependencies]
+num-complex.workspace = true

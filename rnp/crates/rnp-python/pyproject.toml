@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rnp"
+version = "0.1.0"
+description = "Rust port of NumPy's core (M0 scaffold)"
+requires-python = ">=3.10"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+module-name = "_rnp"
+manifest-path = "Cargo.toml"
+features = ["extension-module"]

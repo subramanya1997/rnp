@@ -45,7 +45,15 @@ def run_file(test_file: Path, timeout: int = 900) -> dict:
         str(VENV_PY), "-m", "pytest", str(test_file),
         "-q", "-p", "no:cacheprovider", "--continue-on-collection-errors",
         "--json-report", f"--json-report-file={report}",
-        "--rootdir", str(ROOT / "harness"),
+        "-c", str(ROOT / "harness" / "pytest.ini"),
+        "--rootdir", str(test_file.parent),
+        # importlib mode keeps the test module out of the redirected `numpy.*`
+        # namespace (otherwise pytest would try to import the test file itself
+        # as `numpy._core.tests.<name>`, which the shim does not provide).
+        "--import-mode=importlib",
+        # upstream/numpy/conftest.py imports C extension modules the port has
+        # no equivalent for; cut conftest discovery off below it.
+        f"--confcutdir={test_file.parent}",
     ]
     try:
         proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
