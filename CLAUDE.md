@@ -32,6 +32,30 @@ unmodified test suite and benchmarked against real NumPy.
   tag v2.5.2), run unmodified. Every milestone ends with a full-suite
   scoreboard run (`harness/run.py --all`), not just the targeted files.
 
+## Parallel build protocol (how to use many subagents at once)
+
+Milestone orchestrators SHOULD fan work out to parallel Opus subagents rather
+than working serially. The rules that make this safe:
+
+- **Lane A — shim/Python-only work**: freely parallel. Agents own disjoint
+  file/cluster scopes (assign explicit file lists; no two agents touch the
+  same shim module). No maturin needed.
+- **Lane B — read-only triage/probing**: freely parallel, any number.
+- **Lane C — Rust work**: parallel via **git worktrees**, never in the main
+  checkout. Each Rust agent gets: `git worktree add /tmp/rnp-wt-<name>
+  <branch>`, its own venv there (`python3.13 -m venv .venv-wt && pip install
+  numpy==2.5.2 pytest pytest-json-report maturin`), builds and tests inside
+  the worktree only. The orchestrator merges branches back, resolves
+  conflicts, rebuilds ONCE in the main venv, and re-runs verification there.
+  Partition Rust scopes by module (e.g. one agent owns `reduce.rs`+`ufunc`
+  loops, another owns `datetime.rs`, another `pyarray.rs` indexing) to keep
+  merges mechanical. If two tasks must touch the same hot file, sequence
+  them, don't parallelize them.
+- **Progress visibility**: the orchestrator posts an interim report after
+  each verified integration (scoreboard delta + what merged), not only at
+  the end. Detailed task specs per subagent: exact file scope, oracle-probing
+  expectations, verification commands, and the numeric gate it must move.
+
 ## Hard rules
 
 - **`upstream/` is read-only. Never edit anything under `upstream/`, especially
