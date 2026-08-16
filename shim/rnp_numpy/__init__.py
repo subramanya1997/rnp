@@ -58,22 +58,6 @@ from _rnp import where_ as where
 from _rnp import _dtype_table as _dtype_table
 import _rnp
 
-from ._stubs import ufunc
-
-# The implemented ufuncs, wrapped so that `isinstance(np.add, np.ufunc)` and
-# `np.add.reduce(...)` behave the way the upstream tests expect.
-add = ufunc("add", 2, 1, add, identity=0)
-subtract = ufunc("subtract", 2, 1, subtract)
-multiply = ufunc("multiply", 2, 1, multiply, identity=1)
-divide = ufunc("divide", 2, 1, divide)
-true_divide = ufunc("true_divide", 2, 1, true_divide)
-equal = ufunc("equal", 2, 1, equal)
-not_equal = ufunc("not_equal", 2, 1, not_equal)
-less = ufunc("less", 2, 1, less)
-less_equal = ufunc("less_equal", 2, 1, less_equal)
-greater = ufunc("greater", 2, 1, greater)
-greater_equal = ufunc("greater_equal", 2, 1, greater_equal)
-
 from . import exceptions
 from .exceptions import AxisError, ComplexWarning, DTypePromotionError, VisibleDeprecationWarning
 
@@ -91,215 +75,79 @@ NaN = nan
 
 
 # --------------------------------------------------------------------------
-# Scalar type aliases.
-#
-# Real numpy exposes these as scalar *classes*. Until the port grows real
-# scalar types (a later milestone), each alias is a callable class carrying a
-# `dtype` attribute, which is enough for `dtype=np.int32`, `np.int32(3)` and
-# `np.dtype(np.int32)` to behave.
+# The scalar type hierarchy (M3) — real Python types with numpy's MRO.
 # --------------------------------------------------------------------------
 
-_DTYPES = _dtype_table()
+from . import _scalars as _sc  # noqa: E402
+from ._scalars import (  # noqa: E402,F401
+    ScalarType,
+    bool_,
+    byte,
+    bytes_,
+    cdouble,
+    character,
+    clongdouble,
+    complex64,
+    complex128,
+    complexfloating,
+    csingle,
+    datetime64,
+    double,
+    flexible,
+    float16,
+    float32,
+    float64,
+    floating,
+    generic,
+    half,
+    inexact,
+    int8,
+    int16,
+    int32,
+    int64,
+    int_,
+    intc,
+    integer,
+    intp,
+    long,
+    longdouble,
+    longlong,
+    number,
+    object_,
+    sctypeDict,
+    sctypes,
+    short,
+    signedinteger,
+    single,
+    str_,
+    timedelta64,
+    typecodes,
+    ubyte,
+    uint,
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+    uintc,
+    uintp,
+    ulong,
+    ulonglong,
+    unicode_,
+    unsignedinteger,
+    ushort,
+    void,
+)
+from ._scalars import False_, True_  # noqa: E402
 
-
-class _ScalarMeta(type):
-    def __repr__(cls):
-        return f"<class 'numpy.{cls.__name__}'>"
-
-    def __eq__(cls, other):
-        own = getattr(cls, "dtype", None)
-        if own is not None and isinstance(other, (dtype, str)):
-            return own == other
-        return type.__eq__(cls, other)
-
-    def __ne__(cls, other):
-        return not cls.__eq__(other)
-
-    def __hash__(cls):
-        return type.__hash__(cls)
-
-
-# The abstract scalar hierarchy. Real numpy scalars land in a later
-# milestone; these exist so that `np.integer`-style checks and third-party
-# code (hypothesis.extra.numpy) can at least import.
-class generic(metaclass=_ScalarMeta):
-    pass
-
-
-class number(generic):
-    pass
-
-
-class integer(number):
-    pass
-
-
-class signedinteger(integer):
-    pass
-
-
-class unsignedinteger(integer):
-    pass
-
-
-class inexact(number):
-    pass
-
-
-class floating(inexact):
-    pass
-
-
-class complexfloating(inexact):
-    pass
-
-
-class flexible(generic):
-    pass
-
-
-class character(flexible):
-    pass
-
-
-def _make_scalar_type(name, dt, base=generic):
-    def __new__(cls, value=0):
-        # numpy scalars are not implemented yet; return the Python value the
-        # cast produces so arithmetic still works.
-        return array(value, dtype=cls.dtype).item()
-
-    return _ScalarMeta(name, (base,), {"dtype": dt, "__new__": __new__})
-
-
-bool_ = _make_scalar_type("bool_", _DTYPES["bool"], generic)
-int8 = _make_scalar_type("int8", _DTYPES["int8"], signedinteger)
-int16 = _make_scalar_type("int16", _DTYPES["int16"], signedinteger)
-int32 = _make_scalar_type("int32", _DTYPES["int32"], signedinteger)
-int64 = _make_scalar_type("int64", _DTYPES["int64"], signedinteger)
-uint8 = _make_scalar_type("uint8", _DTYPES["uint8"], unsignedinteger)
-uint16 = _make_scalar_type("uint16", _DTYPES["uint16"], unsignedinteger)
-uint32 = _make_scalar_type("uint32", _DTYPES["uint32"], unsignedinteger)
-uint64 = _make_scalar_type("uint64", _DTYPES["uint64"], unsignedinteger)
-float16 = _make_scalar_type("float16", _DTYPES["float16"], floating)
-float32 = _make_scalar_type("float32", _DTYPES["float32"], floating)
-float64 = _make_scalar_type("float64", _DTYPES["float64"], floating)
-complex64 = _make_scalar_type("complex64", _DTYPES["complex64"], complexfloating)
-complex128 = _make_scalar_type("complex128", _DTYPES["complex128"], complexfloating)
-
-# Platform aliases, matching numpy on 64-bit Linux/macOS.
-byte = int8
-short = int16
-intc = int32
-int_ = int64
-long = int64
-longlong = int64
-intp = int64
-ubyte = uint8
-ushort = uint16
-uintc = uint32
-uint = uint64
-ulong = uint64
-ulonglong = uint64
-uintp = uint64
-half = float16
-single = float32
-double = float64
-float_ = float64
-csingle = complex64
-cdouble = complex128
-complex_ = complex128
 bool = bool_
-
-
-class _InertScalar:
-    """An instance of a scalar type the port does not implement.
-
-    Upstream test modules *construct* these at import time (inside class
-    bodies and parametrize lists), so construction has to succeed; every
-    operation on the result raises NotImplementedError instead.
-    """
-
-    __slots__ = ("_args", "_kwargs")
-
-    def __init__(self, *args, **kwargs):
-        self._args = args
-        self._kwargs = kwargs
-
-    def _nope(self, *args, **kwargs):
-        raise NotImplementedError(
-            f"numpy scalar type {type(self).__name__!r} is not implemented "
-            f"by rnp yet")
-
-    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _nope
-    __truediv__ = __rtruediv__ = __floordiv__ = __rfloordiv__ = _nope
-    __mod__ = __rmod__ = __divmod__ = __pow__ = __neg__ = __abs__ = _nope
-    __int__ = __float__ = __complex__ = __index__ = _nope
-    __array__ = _nope
-
-    def __repr__(self):
-        inner = ", ".join(repr(a) for a in self._args)
-        return f"numpy.{type(self).__name__}({inner})"
-
-
-def _unsupported_scalar_type(name, base=generic):
-    """A scalar type the port does not implement yet.
-
-    The name exists and can be instantiated (upstream modules do so at import
-    time), but it carries no dtype and every operation on an instance raises,
-    so nothing silently produces a wrong answer.
-    """
-
-    def __new__(cls, *args, **kwargs):
-        return _InertScalar.__new__(_ScalarMeta(name, (_InertScalar,), {}))
-
-    def __init__(self, *args, **kwargs):
-        _InertScalar.__init__(self, *args, **kwargs)
-
-    return _ScalarMeta(name, (base,), {"__new__": __new__,
-                                       "__init__": __init__})
-
-
-# The flexible scalar types exist as dtype *descriptors* (M1); their scalar
-# behaviour (indexing an array of them returns a plain str/bytes for now)
-# arrives with the real scalar hierarchy.
-str_ = _make_scalar_type("str_", dtype("U"), character)
-unicode_ = str_
-bytes_ = _make_scalar_type("bytes_", dtype("S"), character)
-void = _make_scalar_type("void", dtype("V"), flexible)
-# `object` exists as a dtype descriptor only: arrays of it are rejected
-# at creation time rather than silently mis-stored.
-object_ = _make_scalar_type("object_", dtype("O"), generic)
-datetime64 = _unsupported_scalar_type("datetime64")
-timedelta64 = _unsupported_scalar_type("timedelta64", signedinteger)
-# On this platform (macOS/arm64) numpy's long double *is* an IEEE double; it
-# keeps a distinct type number (13) that the port does not model yet, so the
-# aliases below behave like float64/complex128.
-longdouble = _make_scalar_type("longdouble", _DTYPES["float64"], floating)
-clongdouble = _make_scalar_type("clongdouble", _DTYPES["complex128"], complexfloating)
+float_ = float64
+complex_ = complex128
 longfloat = longdouble
 clongfloat = clongdouble
+string_ = bytes_
 
-sctypeDict = {t.__name__: t for t in (
-    bool_, int8, int16, int32, int64, uint8, uint16, uint32, uint64,
-    float16, float32, float64, complex64, complex128,
-)}
-
-
-_rnp._register_scalar_types({
-    **{t.__name__: t for t in (
-        bool_, int8, int16, int32, int64, uint8, uint16, uint32, uint64,
-        float16, float32, float64, complex64, complex128,
-    )},
-    "str_": str_, "bytes_": bytes_, "void": void,
-})
-
-sctypeDict.update({d.char: t for d, t in
-                   ((t.dtype, t) for t in sctypeDict.values())})
-
-ScalarType = (int, float, complex, _builtins.bool, bytes, str, memoryview)
-
-True_ = bool_(True)
-False_ = bool_(False)
+_DTYPES = _dtype_table()
+_rnp._register_scalar_types(_sc.registry())
 
 
 class _CopyMode(_enum.Enum):
@@ -315,21 +163,6 @@ class _CopyMode(_enum.Enum):
         if self == _CopyMode.NEVER:
             return False
         raise ValueError(f"{self} is neither True nor False.")
-
-# numpy's typecode groups, minus the codes the port has no dtype for yet
-# (longdouble 'g'/'G', object 'O', datetime 'M'/'m').
-typecodes = {
-    'Character': 'c',
-    'Integer': 'bhilqnp',
-    'UnsignedInteger': 'BHILQNP',
-    'Float': 'efd',
-    'Complex': 'FD',
-    'AllInteger': 'bBhHiIlLqQnNpP',
-    'AllFloat': 'efdFD',
-    'Datetime': '',
-    'All': '?bhilqnpBHILQNPefdFDSUVO',
-}
-
 
 def issubdtype(arg1, arg2):
     """numpy's `issubdtype`, over the abstract scalar hierarchy above."""
@@ -584,12 +417,6 @@ def array_equal(a1, a2):
     return _builtins.all(_flat_values(equal(a1, a2)))
 
 
-def nextafter(x, y):
-    """Scalar-only `nextafter`; the ufunc version lands with M3."""
-    import math
-    return math.nextafter(_builtins.float(x), _builtins.float(y))
-
-
 def isscalar(x):
     return isinstance(x, (int, float, complex, str, bytes, _builtins.bool))
 
@@ -658,47 +485,26 @@ class finfo:
         return f"finfo(resolution={self.resolution}, dtype={self.dtype.name})"
 
 
-class errstate:
-    """No-op stand-in: the port does not raise FP warnings yet."""
-
-    def __init__(self, **kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def __call__(self, func):
-        return func
-
-
-def seterr(**kwargs):
-    return {"divide": "warn", "over": "warn", "under": "ignore", "invalid": "warn"}
-
-
-def geterr():
-    return seterr()
+from ._errstate import (  # noqa: E402,F401
+    errstate,
+    geterr,
+    geterrcall,
+    seterr,
+    seterrcall,
+)
 
 
 # --------------------------------------------------------------------------
-# The rest of the ufunc namespace.
-#
-# `np.add` and friends are real (native `_rnp` functions); every other ufunc
-# name exists so that upstream test modules import and collect, but raises
-# NotImplementedError the moment it is called. Real ufuncs land in M3.
+# The ufunc namespace: one real `ufunc` object per name numpy exposes.
 # --------------------------------------------------------------------------
 
-from ._core import umath as _umath  # noqa: E402
+from ._ufunc import ALL as _UFUNCS  # noqa: E402
+from ._ufunc import ufunc  # noqa: E402
 
-for _name in _umath._ALL:
-    globals().setdefault(_name, getattr(_umath, _name))
-del _name
+globals().update(_UFUNCS)
 
 from . import __config__, lib, ma, random  # noqa: E402,F401
 from ._core import multiarray  # noqa: E402,F401
-from ._core.numerictypes import sctypes  # noqa: E402,F401
 from ._stubs import inert_class as _inert_class  # noqa: E402
 from ._stubs import not_implemented as _not_implemented  # noqa: E402
 
@@ -724,7 +530,7 @@ for _name in (
     "save", "load", "matmul", "vecdot", "packbits", "unpackbits", "digitize",
     "select", "piecewise", "extract", "place", "copyto", "shares_memory",
     "may_share_memory", "apply_along_axis", "asanyarray", "ascontiguousarray",
-    "asfortranarray", "require", "nan_to_num", "real", "imag", "angle",
+    "asfortranarray", "require", "nan_to_num",  "angle",
     "asmatrix", "bmat", "poly1d", "recarray", "record", "chararray",
     "vectorize", "frompyfunc", "busday_count", "busday_offset", "is_busday",
     "datetime_data", "printoptions", "set_printoptions", "get_printoptions",

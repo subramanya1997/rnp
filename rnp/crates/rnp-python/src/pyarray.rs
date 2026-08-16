@@ -13,7 +13,8 @@ use rnp_core::element::Element;
 use rnp_core::indexing::{Indexed, TakeMode};
 use rnp_core::{binary, BinOp, DType, NdArray, Scalar};
 
-use crate::convert::{array_from_any, flexible_to_py, operand, scalar_from_py, scalar_to_py};
+use crate::convert::{array_from_any, flexible_to_py, npflexible_to_py, npscalar_to_py,
+                     operand_for, scalar_from_py, scalar_to_py};
 use rnp_core::printing;
 use crate::pydtype::{dtype_from_any, PyDType};
 
@@ -59,11 +60,7 @@ fn nested_list<'py>(
     index: &mut Vec<isize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if index.len() == arr.ndim() {
-        if arr.dtype.is_flexible() {
-            return flexible_to_py(py, arr, arr.byte_index(index));
-        }
-        let v = arr.get(index).map_err(crate::err)?;
-        return scalar_to_py(py, v);
+        return crate::convert::element_to_py(py, arr, arr.byte_index(index));
     }
     let n = arr.shape[index.len()];
     let mut items = Vec::with_capacity(n.max(0) as usize);
@@ -298,10 +295,10 @@ impl PyFlatIter {
         let py = slf.py();
         let off = slf.offset(slf.pos);
         slf.pos += 1;
-        if slf.arr.dtype.is_flexible() {
-            return Ok(Some(flexible_to_py(py, &slf.arr, off)?));
+        if slf.arr.dtype.is_flexible() || slf.arr.dtype.is_object() {
+            return Ok(Some(npflexible_to_py(py, &slf.arr, off)?));
         }
-        Ok(Some(scalar_to_py(py, slf.arr.read_at(off))?))
+        Ok(Some(npscalar_to_py(py, slf.arr.dtype, slf.arr.read_at(off))?))
     }
 
     #[getter]
@@ -364,9 +361,9 @@ impl PyFlatIter {
                 }
                 let off = self.offset(v as usize);
                 if self.arr.dtype.is_flexible() {
-                    return flexible_to_py(py, &self.arr, off);
+                    return npflexible_to_py(py, &self.arr, off);
                 }
-                return scalar_to_py(py, self.arr.read_at(off));
+                return npscalar_to_py(py, self.arr.dtype, self.arr.read_at(off));
             }
             FlatKey::Range(start, len, step) => {
                 let pos: Vec<i64> = (0..len).map(|k| (start + k * step) as i64).collect();
@@ -572,6 +569,18 @@ impl PyNdArray {
         }
     }
 
+    /// `a.real` — a view for real dtypes, a strided view of the real parts
+    /// for complex ones (numpy returns a view in both cases).
+    #[getter]
+    fn real(slf: &Bound<'_, Self>) -> PyResult<Py<PyNdArray>> {
+        Self::component(slf, 0)
+    }
+
+    #[getter]
+    fn imag(slf: &Bound<'_, Self>) -> PyResult<Py<PyNdArray>> {
+        Self::component(slf, 1)
+    }
+
     #[getter]
     fn base(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.base.as_ref().map(|b| b.clone_ref(py))
@@ -627,7 +636,9 @@ impl PyNdArray {
         }
     }
 
-    fn flatten(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
+    #[pyo3(signature = (order = "C"))]
+    fn flatten(&self, py: Python<'_>, order: &str) -> PyResult<Py<PyNdArray>> {
+        let _ = order;
         let n = self.arr.size() as isize;
         let c = self.arr.copy();
         PyNdArray::into_py_any(c.reshape(&[n]).map_err(crate::err)?, py)
@@ -680,6 +691,14 @@ impl PyNdArray {
 
     #[pyo3(signature = (*args))]
     fn item<'py>(&self, py: Python<'py>, args: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyAny>> {
+        if self.arr.dtype.is_object() {
+            if self.arr.size() != 1 {
+                return Err(PyValueError::new_err(
+                    "can only convert an array of size 1 to a Python scalar",
+                ));
+            }
+            return Ok(crate::objects::read(py, &self.arr, self.arr.byte_offset));
+        }
         if self.arr.dtype.is_flexible() {
             if self.arr.size() != 1 || !args.is_empty() {
                 return Err(PyNotImplementedError::new_err(
@@ -1152,7 +1171,7 @@ impl PyNdArray {
                     a.fill(v);
                     return Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any());
                 }
-                scalar_to_py(py, v)
+                npscalar_to_py(py, out_dt, v)
             }
             Some(a) => {
                 let sums = reduce_axis(&promoted, a, ReduceOp::Sum, keepdims)
@@ -1179,6 +1198,26 @@ impl PyNdArray {
         Ok(self.arr.shape[0] as usize)
     }
 
+    /// Iterating a 0-d array is numpy's own TypeError; without this the
+    /// `__getitem__` fallback protocol would stop at the first IndexError and
+    /// look like an empty iterator.
+    fn __iter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        if slf.borrow().arr.ndim() == 0 {
+            return Err(PyTypeError::new_err("iteration over a 0-d array"));
+        }
+        // A lazy sequence iterator over `__getitem__`, which is what CPython
+        // would have used had we not defined `__iter__` at all.
+        // SAFETY: `slf` is a live object; PySeqIter_New borrows it and
+        // returns a new strong reference (or NULL with an exception set).
+        let it = unsafe { ffi::PySeqIter_New(slf.as_ptr()) };
+        if it.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        // SAFETY: `it` is a new strong reference we now own.
+        Ok(unsafe { Py::from_owned_ptr(py, it) })
+    }
+
     fn __getitem__<'py>(
         slf: &Bound<'py, Self>,
         key: &Bound<'py, PyAny>,
@@ -1189,20 +1228,20 @@ impl PyNdArray {
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: view, scalarize } => {
                 if scalarize {
-                    if view.dtype.is_flexible() {
-                        return flexible_to_py(py, &view, view.byte_offset);
+                    if view.dtype.is_flexible() || view.dtype.is_object() {
+                        return npflexible_to_py(py, &view, view.byte_offset);
                     }
-                    return scalar_to_py(py, view.get(&[]).map_err(crate::err)?);
+                    return npscalar_to_py(py, view.dtype, view.get(&[]).map_err(crate::err)?);
                 }
                 Ok(PyNdArray::view_of(view, slf)?.into_bound(py).into_any())
             }
             Indexed::Fancy(plan) => {
                 let out = rnp_core::indexing::gather(&me, &plan).map_err(crate::err)?;
                 if plan.scalarize {
-                    if out.dtype.is_flexible() {
-                        return flexible_to_py(py, &out, out.byte_offset);
+                    if out.dtype.is_flexible() || out.dtype.is_object() {
+                        return npflexible_to_py(py, &out, out.byte_offset);
                     }
-                    return scalar_to_py(py, out.get_flat(0));
+                    return npscalar_to_py(py, out.dtype, out.get_flat(0));
                 }
                 Ok(PyNdArray::into_py_any(out, py)?.into_bound(py).into_any())
             }
@@ -1226,6 +1265,22 @@ impl PyNdArray {
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: mut view, .. } => {
+                if view.dtype.is_object() {
+                    let src = crate::objects::array_from_objects(value)?;
+                    let src = if src.shape == view.shape {
+                        src
+                    } else {
+                        rnp_core::iter::broadcast_to(&src, &view.shape).map_err(crate::err)?
+                    };
+                    let dst: Vec<isize> = rnp_core::iter::offsets(
+                        &view.shape, &view.strides, view.byte_offset).collect();
+                    let so: Vec<isize> = rnp_core::iter::offsets(
+                        &src.shape, &src.strides, src.byte_offset).collect();
+                    for (&d, &s) in dst.iter().zip(so.iter()) {
+                        view.write_at(d, src.read_at(s));
+                    }
+                    return Ok(());
+                }
                 if !view.dtype.is_flexible() {
                     if let Some(s) = scalar_from_py(value) {
                         view.fill(s.cast(view.dtype));
@@ -1255,12 +1310,19 @@ impl PyNdArray {
         }
     }
 
-    fn __repr__(&self) -> String {
-        printing::repr(&self.arr)
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        if self.arr.dtype.is_object() {
+            return Ok(format!("array({}, dtype=object)",
+                              object_body(py, &self.arr, &mut Vec::new())?));
+        }
+        Ok(printing::repr(&self.arr))
     }
 
-    fn __str__(&self) -> String {
-        printing::to_str(&self.arr)
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        if self.arr.dtype.is_object() {
+            return object_body(py, &self.arr, &mut Vec::new());
+        }
+        Ok(printing::to_str(&self.arr))
     }
 
     fn __bool__(&self) -> PyResult<bool> {
@@ -1337,6 +1399,141 @@ impl PyNdArray {
     }
     fn __rtruediv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         self.binop(py, other, BinOp::Div, true)
+    }
+    fn __floordiv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::FloorDiv, false)
+    }
+    fn __rfloordiv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::FloorDiv, true)
+    }
+    fn __mod__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::Mod, false)
+    }
+    fn __rmod__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::Mod, true)
+    }
+    fn __pow__(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if modulo.is_some_and(|m| !m.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "pow() with a modulus is not supported for arrays",
+            ));
+        }
+        self.binop(py, other, BinOp::Pow, false)
+    }
+    fn __rpow__(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let _ = modulo;
+        self.binop(py, other, BinOp::Pow, true)
+    }
+    fn __and__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::BitAnd, false)
+    }
+    fn __rand__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::BitAnd, true)
+    }
+    fn __or__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::BitOr, false)
+    }
+    fn __ror__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::BitOr, true)
+    }
+    fn __xor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::BitXor, false)
+    }
+    fn __rxor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::BitXor, true)
+    }
+    fn __lshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::LShift, false)
+    }
+    fn __rlshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::LShift, true)
+    }
+    fn __rshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::RShift, false)
+    }
+    fn __rrshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.binop(py, other, BinOp::RShift, true)
+    }
+    fn __divmod__<'py>(
+        slf: &Bound<'py, Self>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::divmod_pair(slf, other, false)
+    }
+    fn __rdivmod__<'py>(
+        slf: &Bound<'py, Self>,
+        other: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::divmod_pair(slf, other, true)
+    }
+
+    // ---- unary operators -----------------------------------------------
+
+    fn __neg__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.unop(py, rnp_core::UnOp::Negative)
+    }
+    fn __pos__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.unop(py, rnp_core::UnOp::Positive)
+    }
+    fn __abs__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.unop(py, rnp_core::UnOp::Absolute)
+    }
+    fn __invert__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.unop(py, rnp_core::UnOp::Invert)
+    }
+
+    // ---- in-place operators ---------------------------------------------
+
+    fn __iadd__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::Add)
+    }
+    fn __isub__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::Sub)
+    }
+    fn __imul__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::Mul)
+    }
+    fn __itruediv__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::Div)
+    }
+    fn __ifloordiv__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::FloorDiv)
+    }
+    fn __imod__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::Mod)
+    }
+    fn __ipow__(
+        slf: &Bound<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let _ = modulo;
+        Self::inplace(slf, other, BinOp::Pow)
+    }
+    fn __iand__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::BitAnd)
+    }
+    fn __ior__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::BitOr)
+    }
+    fn __ixor__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::BitXor)
+    }
+    fn __ilshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::LShift)
+    }
+    fn __irshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        Self::inplace(slf, other, BinOp::RShift)
     }
 
     fn __richcmp__(
@@ -1427,6 +1624,23 @@ impl PyNdArray {
             }
         }
     }
+}
+
+/// numpy prints an object array by `repr`-ing each element, so the body has
+/// to be built on the Python side.
+fn object_body(py: Python<'_>, arr: &NdArray, index: &mut Vec<isize>) -> PyResult<String> {
+    if index.len() == arr.ndim() {
+        let o = crate::objects::read(py, arr, arr.byte_index(index));
+        return Ok(o.repr()?.to_string());
+    }
+    let n = arr.shape[index.len()];
+    let mut parts = Vec::with_capacity(n.max(0) as usize);
+    for i in 0..n {
+        index.push(i);
+        parts.push(object_body(py, arr, index)?);
+        index.pop();
+    }
+    Ok(format!("[{}]", parts.join(", ")))
 }
 
 /// Return `res`, or copy it into a caller-supplied `out=` array (casting to
@@ -1571,7 +1785,7 @@ impl PyNdArray {
                     a.fill(Scalar::Bool(acc));
                     return store_or_wrap(py, a, out);
                 }
-                Ok(acc.into_pyobject(py)?.to_owned().into_any())
+                npscalar_to_py(py, DType::Bool, Scalar::Bool(acc))
             }
             Some(ax) => {
                 let bools = self.arr.astype(DType::Bool);
@@ -1622,13 +1836,32 @@ impl PyNdArray {
                     a.fill(v);
                     return Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any());
                 }
-                scalar_to_py(py, v)
+                npscalar_to_py(py, reduce_dtype(op, src.dtype), v)
             }
             Some(ax) => {
                 let a = reduce_axis(src, ax, op, keepdims).map_err(crate::err)?;
                 Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any())
             }
         }
+    }
+
+    /// The real (`k == 0`) or imaginary (`k == 1`) component view.
+    fn component(slf: &Bound<'_, Self>, k: isize) -> PyResult<Py<PyNdArray>> {
+        let a = slf.borrow().arr.clone();
+        if !a.dtype.is_complex() {
+            if k == 0 {
+                return PyNdArray::view_of(a, slf);
+            }
+            // numpy's `.imag` on a real array is a read-only zero array.
+            let z = NdArray::zeros(a.shape.clone(), a.dtype).map_err(crate::err)?;
+            return PyNdArray::into_py_any(z, slf.py());
+        }
+        let comp = if a.dtype == DType::C64 { DType::F32 } else { DType::F64 };
+        let mut v = a.clone();
+        v.dtype = comp;
+        v.byte_offset += k * comp.itemsize() as isize;
+        v.update_flags();
+        PyNdArray::view_of(v, slf)
     }
 
     fn binop(
@@ -1638,7 +1871,7 @@ impl PyNdArray {
         op: BinOp,
         reflected: bool,
     ) -> PyResult<Py<PyAny>> {
-        let rhs = match operand(other, self.arr.dtype)? {
+        let rhs = match operand_for(other, self.arr.dtype, op.is_comparison())? {
             Some(a) => a,
             None => return Ok(py.NotImplemented()),
         };
@@ -1647,8 +1880,70 @@ impl PyNdArray {
         } else {
             (&self.arr, &rhs)
         };
+        rnp_core::fpe::clear();
         let out = binary(a, b, op).map_err(crate::err)?;
+        crate::ufuncs::report_fpe(py, op.name())?;
         Ok(PyNdArray::into_py_any(out, py)?.into_any())
+    }
+
+    fn unop(&self, py: Python<'_>, op: rnp_core::UnOp) -> PyResult<Py<PyAny>> {
+        rnp_core::fpe::clear();
+        let out = rnp_core::unary(&self.arr, op).map_err(crate::err)?;
+        crate::ufuncs::report_fpe(py, op.name())?;
+        Ok(PyNdArray::into_py_any(out, py)?.into_any())
+    }
+
+    /// `divmod(a, b)` on arrays: one pass, two outputs.
+    fn divmod_pair<'py>(
+        slf: &Bound<'py, Self>,
+        other: &Bound<'py, PyAny>,
+        reflected: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let me = slf.borrow().arr.clone();
+        let rhs = match operand_for(other, me.dtype, false)? {
+            Some(a) => a,
+            None => return Ok(py.NotImplemented().into_bound(py)),
+        };
+        let (a, b) = if reflected { (&rhs, &me) } else { (&me, &rhs) };
+        rnp_core::fpe::clear();
+        let (q, r) = rnp_core::divmod(a, b).map_err(crate::err)?;
+        crate::ufuncs::report_fpe(py, "divmod")?;
+        let q = PyNdArray::into_py_any(q, py)?;
+        let r = PyNdArray::into_py_any(r, py)?;
+        Ok(PyTuple::new(py, [q.into_any(), r.into_any()])?.into_any())
+    }
+
+    /// `a op= b`, writing the result back into `a`'s own buffer with numpy's
+    /// same-kind cast.
+    fn inplace(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>, op: BinOp) -> PyResult<()> {
+        let py = slf.py();
+        let me = slf.borrow().arr.clone();
+        if !me.flags.writeable {
+            return Err(PyValueError::new_err(
+                "output array is read-only",
+            ));
+        }
+        let rhs = operand_for(other, me.dtype, false)?
+            .ok_or_else(|| PyTypeError::new_err("unsupported operand for in-place op"))?;
+        rnp_core::fpe::clear();
+        let res = binary(&me, &rhs, op).map_err(crate::err)?;
+        crate::ufuncs::report_fpe(py, op.name())?;
+        if res.shape != me.shape {
+            return Err(PyValueError::new_err(format!(
+                "non-broadcastable output operand with shape {} doesn't match                  the broadcast shape {}",
+                fmt_shape(&me.shape),
+                fmt_shape(&res.shape)
+            )));
+        }
+        let src: Vec<isize> =
+            rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset).collect();
+        let dst: Vec<isize> =
+            rnp_core::iter::offsets(&me.shape, &me.strides, me.byte_offset).collect();
+        for (&s, &d) in src.iter().zip(dst.iter()) {
+            me.write_at(d, res.read_at(s));
+        }
+        Ok(())
     }
 }
 
@@ -1696,12 +1991,12 @@ pub fn ufunc2(
     let b_is_arr = b.cast::<PyNdArray>().is_ok();
     let (lhs, rhs) = if a_is_arr && !b_is_arr {
         let lhs = array_from_any(a, None, false)?;
-        let rhs = operand(b, lhs.dtype)?
+        let rhs = operand_for(b, lhs.dtype, op.is_comparison())?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for ufunc"))?;
         (lhs, rhs)
     } else if b_is_arr && !a_is_arr {
         let rhs = array_from_any(b, None, false)?;
-        let lhs = operand(a, rhs.dtype)?
+        let lhs = operand_for(a, rhs.dtype, op.is_comparison())?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for ufunc"))?;
         (lhs, rhs)
     } else {

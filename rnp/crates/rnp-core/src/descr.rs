@@ -307,6 +307,15 @@ impl Descr {
             // numpy prints the object dtype as `|O`, with no size.
             return "|O".to_string();
         }
+        if let DType::DateTime(u) | DType::TimeDelta(u) = self.dt {
+            let unit = crate::dtype::DATETIME_UNITS[u as usize];
+            let suffix = if unit.is_empty() {
+                String::new()
+            } else {
+                format!("[{unit}]")
+            };
+            return format!("{}{}8{}", prefix, self.dt.kind(), suffix);
+        }
         format!("{}{}{}", prefix, self.dt.str_kind(), self.dt.str_size())
     }
 
@@ -428,6 +437,17 @@ impl Descr {
                 } else {
                     format!("'V{n}'")
                 }
+            }
+            // numpy always reprs a datetime dtype in its `<M8[unit]` form,
+            // never as `datetime64[unit]`.
+            DType::DateTime(u) | DType::TimeDelta(u) => {
+                let unit = crate::dtype::DATETIME_UNITS[u as usize];
+                let suffix = if unit.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{unit}]")
+                };
+                format!("'{}{}8{}'", bo, self.dt.kind(), suffix)
             }
             d => {
                 if short || !matches!(self.bo, ByteOrder::Native | ByteOrder::NotApplicable) {
@@ -751,6 +771,10 @@ fn parse_scalar_spec(s: &str) -> Option<Descr> {
         };
         return Some(Descr::new(dt, bo));
     }
+    // datetime64 / timedelta64, with an optional `[unit]`.
+    if let Some(d) = parse_datetime(rest, bo) {
+        return Some(d);
+    }
     if matches!(rest, "q" | "longlong") {
         return Some(Descr::with_alias(DType::I64, bo, Alias::LongLong));
     }
@@ -766,6 +790,38 @@ fn parse_scalar_spec(s: &str) -> Option<Descr> {
         return Some(Descr::with_alias(DType::C128, bo, Alias::CLongDouble));
     }
     let dt = DType::from_plain_name(rest)?;
+    Some(Descr::new(dt, bo))
+}
+
+/// `M`, `M8`, `M8[ns]`, `datetime64`, `datetime64[us]` and the `m` forms.
+fn parse_datetime(rest: &str, bo: ByteOrder) -> Option<Descr> {
+    let (head, tail) = if let Some(t) = rest.strip_prefix("datetime64") {
+        ('M', t)
+    } else if let Some(t) = rest.strip_prefix("timedelta64") {
+        ('m', t)
+    } else {
+        let mut c = rest.chars();
+        let first = c.next()?;
+        if first != 'M' && first != 'm' {
+            return None;
+        }
+        let t = &rest[first.len_utf8()..];
+        // `M8[...]` and `M[...]` are both accepted; `M4` is not a dtype.
+        let t = t.strip_prefix('8').unwrap_or(t);
+        (first, t)
+    };
+    let tail = tail.strip_prefix('8').unwrap_or(tail);
+    let unit = if tail.is_empty() {
+        0
+    } else {
+        let inner = tail.strip_prefix('[')?.strip_suffix(']')?;
+        crate::dtype::datetime_unit_index(inner)?
+    };
+    let dt = if head == 'M' {
+        DType::DateTime(unit)
+    } else {
+        DType::TimeDelta(unit)
+    };
     Some(Descr::new(dt, bo))
 }
 

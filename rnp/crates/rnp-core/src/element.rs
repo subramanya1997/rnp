@@ -180,9 +180,9 @@ pub fn f32_to_f16_bits(value: f32) -> u16 {
     let exp = (x >> 23) & 0xFF;
     let man = x & 0x007F_FFFF;
     if exp == 0xFF {
-        // inf keeps its sign; any NaN becomes the canonical quiet NaN, which
-        // is what numpy's conversion produces for the payloads we can make.
-        return if man == 0 { sign | 0x7C00 } else { sign | 0x7E00 };
+        // numpy's `npy_float_to_halfbits` keeps the top 10 mantissa bits, so
+        // a NaN payload survives the round trip through binary16.
+        return sign | 0x7C00 | ((man >> 13) as u16);
     }
     if exp == 0 {
         // f32 subnormals are far below the half subnormal range.
@@ -222,7 +222,8 @@ pub fn f64_to_f16_bits(value: f64) -> u16 {
     let exp = (x >> 52) & 0x7FF;
     let man = x & 0x000F_FFFF_FFFF_FFFF;
     if exp == 0x7FF {
-        return if man == 0 { sign | 0x7C00 } else { sign | 0x7E00 };
+        // As the f32 path: `npy_double_to_halfbits` keeps the top 10 bits.
+        return sign | 0x7C00 | ((man >> 42) as u16);
     }
     if exp == 0 {
         return sign;
@@ -265,8 +266,10 @@ pub fn f16_bits_to_f32(i: u16) -> f32 {
         if man == 0 {
             return f32::from_bits(sign);
         }
-        // Subnormal: renormalise.
-        let mut m = man;
+        // Subnormal: renormalise. numpy's `npy_halfbits_to_floatbits`
+        // shifts once *before* the loop, which is what makes half bits `1`
+        // come out as 2^-24 rather than 2^-25.
+        let mut m = man << 1;
         let mut e = 0u32;
         while m & 0x0400 == 0 {
             m <<= 1;
@@ -575,5 +578,33 @@ mod tests {
     #[test]
     fn float_downcast_overflows_to_infinity() {
         assert_eq!(f32::from_scalar(Scalar::Float(1e300)), f32::INFINITY);
+    }
+}
+
+#[cfg(test)]
+mod half_tests {
+    use super::*;
+
+    /// Every one of the 65536 half bit patterns must survive a round trip
+    /// through `f32` and through `f64` -- numpy's `test_half_conversions`.
+    #[test]
+    fn every_half_round_trips_through_f32_and_f64() {
+        for bits in 0u16..=0xFFFF {
+            let h = F16(bits);
+            let f = h.to_f32();
+            if f.is_nan() {
+                continue; // the NaN payload comparison is what numpy skips
+            }
+            assert_eq!(F16::from_f32(f).0, bits, "f32 round trip of {bits:#06x}");
+            assert_eq!(F16::from_f64(f as f64).0, bits, "f64 round trip of {bits:#06x}");
+        }
+    }
+
+    #[test]
+    fn half_subnormals_have_the_right_magnitude() {
+        // np.uint16(1).view(np.float16) == 5.960464477539063e-08 == 2**-24
+        assert_eq!(F16(1).to_f64(), 2.0f64.powi(-24));
+        assert_eq!(F16(0x03FF).to_f64(), 1023.0 * 2.0f64.powi(-24));
+        assert_eq!(F16(0x0400).to_f64(), 2.0f64.powi(-14));
     }
 }

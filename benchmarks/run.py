@@ -81,6 +81,29 @@ def cases(np_mod, size):
     yield "bool_setitem", lambda: b.__setitem__(mask, 2.0)
     yield "take_axis0", lambda: m.take(row_idx, axis=0)
 
+    # ---- M3: ufuncs ------------------------------------------------------
+    # Scaled into each function's ordinary range: `exp(arange(1e6))` would
+    # overflow on almost every element, which measures the special-value path
+    # rather than the loop.
+    small = np_mod.multiply(a, 1e-5)
+    f32 = small.astype(np_mod.float32)
+    pos = np_mod.add(small, 1.0)
+    yield "exp_f64", lambda: np_mod.exp(small)
+    yield "exp_f32", lambda: np_mod.exp(f32)
+    yield "sin_f64", lambda: np_mod.sin(small)
+    yield "sqrt_f64", lambda: np_mod.sqrt(a)  # arange is non-negative
+    yield "log_f64", lambda: np_mod.log(pos)
+    yield "power_f64", lambda: np_mod.power(pos, 2.5)
+    yield "abs_f64", lambda: np_mod.absolute(a)
+    yield "negative_f64", lambda: np_mod.negative(a)
+    yield "maximum_f64", lambda: np_mod.maximum(a, b)
+    yield "floor_divide_i32", lambda: np_mod.floor_divide(i32 + 1, 7)
+    yield "bitwise_and_i32", lambda: np_mod.bitwise_and(i32, 255)
+    yield "add_reduce_f64", lambda: np_mod.add.reduce(a)
+    yield "scalar_add_f64", lambda: np_mod.float64(1.5) + np_mod.float64(2.5)
+    yield "scalar_add_i64", lambda: np_mod.int64(3) + np_mod.int64(4)
+    yield "scalar_extract", lambda: a[7]
+
 
 def main():
     ap = argparse.ArgumentParser()

@@ -12,9 +12,11 @@ mod convert;
 mod index;
 mod itemsel;
 mod pyarray;
+mod objects;
 mod pydtype;
+mod ufuncs;
 
-use convert::{array_from_any, scalar_from_py};
+use convert::{any_scalar, array_from_any, scalar_from_py};
 use pyarray::{dtype_or_default, shape_from_any, ufunc2, PyNdArray};
 use pydtype::{descr_from_any, dtype_from_any, PyDType};
 
@@ -77,12 +79,17 @@ fn full(
     fill_value: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
-    let v = scalar_from_py(fill_value)
+    let v = any_scalar(fill_value)?
         .ok_or_else(|| PyTypeError::new_err("full() fill_value must be a scalar"))?;
-    // numpy infers the dtype from the fill value when none is given.
-    let d = match dtype {
+    // numpy infers the dtype from the fill value when none is given; a numpy
+    // scalar contributes its own dtype, a Python number its natural one.
+    let inferred = match convert::np_scalar(fill_value)? {
+        Some((d, _)) => d,
         None => v.natural_dtype(),
-        Some(o) if o.is_none() => v.natural_dtype(),
+    };
+    let d = match dtype {
+        None => inferred,
+        Some(o) if o.is_none() => inferred,
         Some(o) => dtype_from_any(o)?,
     };
     wrap(py, NdArray::full(shape_from_any(shape)?, d, v).map_err(err)?)
@@ -98,7 +105,7 @@ fn arange(
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
     let to_f = |o: &Bound<'_, PyAny>| -> PyResult<(f64, bool)> {
-        let s = scalar_from_py(o)
+        let s = any_scalar(o)?
             .ok_or_else(|| PyTypeError::new_err("arange() arguments must be numbers"))?;
         let exact = matches!(s, Scalar::Int(_) | Scalar::Uint(_) | Scalar::Bool(_));
         let v = match s {
@@ -537,6 +544,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(result_type, m)?)?;
     m.add_function(wrap_pyfunction!(_dtype_table, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_types, m)?)?;
+    ufuncs::register(m)?;
 
     m.add("__version__", "0.1.0")?;
     Ok(())

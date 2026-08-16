@@ -1,53 +1,14 @@
 """`numpy._core.umath` — the ufunc namespace.
 
-The arithmetic and comparison ufuncs are real (they are `_rnp` functions);
-everything else is a loud stub until M3 lands the full ufunc machinery.
+Every name is the same `ufunc` object `numpy.<name>` is bound to; the module
+exists because upstream tests import from it directly.
 """
 
-from .. import (  # noqa: F401
-    add,
-    divide,
-    equal,
-    greater,
-    greater_equal,
-    less,
-    less_equal,
-    multiply,
-    not_equal,
-    subtract,
-    true_divide,
-)
-from .._stubs import ufunc_stub
+from .._ufunc import ALL as _ALL_UFUNCS
 
-_UNARY = [
-    "absolute", "arccos", "arccosh", "arcsin", "arcsinh", "arctan", "arctanh",
-    "cbrt", "ceil", "conj", "conjugate", "cos", "cosh", "deg2rad", "degrees",
-    "exp", "exp2", "expm1", "fabs", "floor", "invert", "isfinite", "isinf",
-    "isnan", "isnat", "log", "log10", "log1p", "log2", "logical_not",
-    "negative", "positive", "rad2deg", "radians", "reciprocal", "rint",
-    "sign", "signbit", "sin", "sinh", "spacing", "sqrt", "square", "tan",
-    "tanh", "trunc", "_ones_like", "bitwise_count",
-]
+globals().update(_ALL_UFUNCS)
 
-_BINARY = [
-    "arctan2", "bitwise_and", "bitwise_or", "bitwise_xor", "copysign",
-    "float_power", "floor_divide", "fmax", "fmin", "fmod", "gcd", "heaviside",
-    "hypot", "lcm", "ldexp", "left_shift", "logaddexp", "logaddexp2",
-    "logical_and", "logical_or", "logical_xor", "maximum", "minimum", "mod",
-    "nextafter", "power", "remainder", "right_shift", "matmul", "vecdot",
-    "matvec", "vecmat", "bitwise_left_shift", "bitwise_right_shift",
-    "bitwise_invert", "pow", "divmod",
-]
-
-_MISC = ["frexp", "modf"]
-
-for _n in _UNARY:
-    globals()[_n] = ufunc_stub(f"numpy.{_n}", nin=1)
-for _n in _BINARY:
-    globals()[_n] = ufunc_stub(f"numpy.{_n}", nin=2)
-for _n in _MISC:
-    globals()[_n] = ufunc_stub(f"numpy.{_n}", nin=1, nout=2)
-del _n
+_ALL = list(_ALL_UFUNCS)
 
 # Constants numpy exposes from the umath module.
 pi = 3.141592653589793
@@ -60,4 +21,27 @@ UFUNC_PYVALS_NAME = "UFUNC_PYVALS"
 ERR_IGNORE, ERR_WARN, ERR_RAISE, ERR_CALL, ERR_PRINT, ERR_LOG, ERR_DEFAULT = \
     0, 1, 2, 3, 4, 5, 521
 
-_ALL = _UNARY + _BINARY + _MISC
+
+def seterrobj(*a, **k):
+    from .._errstate import seterr
+    return seterr()
+
+
+def geterrobj(*a, **k):
+    return [UFUNC_BUFSIZE_DEFAULT, ERR_DEFAULT, None]
+
+
+def _get_promotion_state():
+    return "weak"
+
+
+def _set_promotion_state(state):
+    if state != "weak":
+        raise ValueError(f"unsupported promotion state {state!r}")
+
+# The float constants numpy's umath module exposes (upstream tests read them).
+PZERO = 0.0
+NZERO = -0.0
+PINF = float("inf")
+NINF = float("-inf")
+NAN = float("nan")

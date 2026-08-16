@@ -47,6 +47,92 @@ pub fn scalar_to_py<'py>(py: Python<'py>, s: Scalar) -> PyResult<Bound<'py, PyAn
     })
 }
 
+/// Any scalar the port understands: a numpy scalar keeps its own value, a
+/// Python number gives its natural one.
+pub fn any_scalar(obj: &Bound<'_, PyAny>) -> PyResult<Option<Scalar>> {
+    if let Some((_, s)) = np_scalar(obj)? {
+        return Ok(Some(s));
+    }
+    Ok(scalar_from_py(obj))
+}
+
+/// Recognise one of the shim's numpy scalar objects.
+///
+/// The protocol is deliberately narrow: a numpy scalar carries both a `_v`
+/// attribute (its Python-native payload) and a `dtype` that is one of our
+/// `dtype` objects. `ndarray` has a `dtype` but no `_v`, and Python numbers
+/// have neither, so nothing else is mistaken for one.
+pub fn np_scalar(obj: &Bound<'_, PyAny>) -> PyResult<Option<(DType, Scalar)>> {
+    let v = match obj.getattr(pyo3::intern!(obj.py(), "_v")) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let d = match obj.getattr(pyo3::intern!(obj.py(), "dtype")) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let dt = match d.cast::<crate::pydtype::PyDType>() {
+        Ok(p) => p.get().d.dt,
+        Err(_) => return Ok(None),
+    };
+    match scalar_from_py(&v) {
+        Some(s) => Ok(Some((dt, s.cast(dt)))),
+        None => Ok(None),
+    }
+}
+
+/// Read one element of any dtype back as the Python object numpy would give,
+/// *without* wrapping it in a numpy scalar type.
+pub fn element_to_py<'py>(
+    py: Python<'py>,
+    arr: &NdArray,
+    off: isize,
+) -> PyResult<Bound<'py, PyAny>> {
+    if arr.dtype.is_object() {
+        return Ok(crate::objects::read(py, arr, off));
+    }
+    if arr.dtype.is_flexible() {
+        return flexible_to_py(py, arr, off);
+    }
+    scalar_to_py(py, arr.read_at(off))
+}
+
+/// Build the numpy scalar object for one element, falling back to the plain
+/// Python value when the shim has not registered a class for that dtype.
+pub fn npscalar_to_py<'py>(
+    py: Python<'py>,
+    dt: DType,
+    s: Scalar,
+) -> PyResult<Bound<'py, PyAny>> {
+    if dt.is_object() {
+        let h = match s {
+            Scalar::Uint(u) => u,
+            _ => 0,
+        };
+        return Ok(crate::objects::resolve(py, h));
+    }
+    match crate::pydtype::scalar_class(py, dt) {
+        Some(cls) => cls.call_method1(pyo3::intern!(py, "_wrap"), (scalar_to_py(py, s)?,)),
+        None => scalar_to_py(py, s),
+    }
+}
+
+/// As [`npscalar_to_py`], for the flexible dtypes whose payload is bytes/str.
+pub fn npflexible_to_py<'py>(
+    py: Python<'py>,
+    arr: &NdArray,
+    off: isize,
+) -> PyResult<Bound<'py, PyAny>> {
+    if arr.dtype.is_object() {
+        return Ok(crate::objects::read(py, arr, off));
+    }
+    let v = flexible_to_py(py, arr, off)?;
+    match crate::pydtype::scalar_class(py, arr.dtype) {
+        Some(cls) => cls.call1((v,)),
+        None => Ok(v),
+    }
+}
+
 /// True for objects that should be treated as nested sequences by `array()`.
 fn is_sequence(obj: &Bound<'_, PyAny>) -> bool {
     if obj.is_instance_of::<PyString>() || obj.is_instance_of::<PyBool>() {
@@ -68,15 +154,25 @@ fn discover_shape(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) -> PyResult<()
     Ok(())
 }
 
-fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<Scalar>) -> PyResult<()> {
+/// One leaf of a nested sequence: its value plus, for a numpy scalar, the
+/// dtype it contributes *strongly* to the inferred result.
+type Leaf = (Option<DType>, Scalar);
+
+fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<Leaf>) -> PyResult<()> {
     if depth == shape.len() {
+        // A numpy scalar keeps its own dtype: `np.array([np.int8(1)])` is
+        // int8, not int64.
+        if let Some((d, v)) = np_scalar(obj)? {
+            out.push((Some(d), v));
+            return Ok(());
+        }
         let s = scalar_from_py(obj).ok_or_else(|| {
             PyTypeError::new_err(format!(
                 "unsupported element type in array(): {}",
                 obj.get_type().name().map(|n| n.to_string()).unwrap_or_default()
             ))
         })?;
-        out.push(s);
+        out.push((None, s));
         return Ok(());
     }
     if !is_sequence(obj) {
@@ -99,14 +195,20 @@ fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<
     Ok(())
 }
 
-/// numpy's dtype discovery over a flat list of Python scalars.
-fn infer_dtype(values: &[Scalar]) -> DType {
+/// numpy's dtype discovery over a flat list of leaves.
+///
+/// Array *coercion* is not NEP 50 promotion: a bare Python number contributes
+/// its default dtype (int64 / float64 / complex128), not a weak one. Probed
+/// against numpy 2.5.2: `np.array([np.float32(1), 2])` is float64, while
+/// `np.float32(1) + 2` is float32.
+fn infer_dtype(values: &[Leaf]) -> DType {
     if values.is_empty() {
         return DType::F64;
     }
-    let mut d = values[0].natural_dtype();
+    let dt = |l: &Leaf| l.0.unwrap_or_else(|| l.1.natural_dtype());
+    let mut d = dt(&values[0]);
     for v in &values[1..] {
-        d = promote(d, v.natural_dtype());
+        d = promote(d, dt(v));
     }
     d
 }
@@ -280,6 +382,17 @@ pub fn array_from_any(
             _ => inner,
         });
     }
+    // Object arrays store handles into the interning slab.
+    if dtype == Some(DType::Object) {
+        return crate::objects::array_from_objects(obj);
+    }
+    // A numpy scalar is a strong 0-d operand.
+    if let Some((sd, sv)) = np_scalar(obj)? {
+        let d = dtype.unwrap_or(sd);
+        let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
+        a.set(&[], sv.cast(d)).map_err(crate::err)?;
+        return Ok(a);
+    }
     // Structured dtypes: the "scalar" of the array is a Python tuple, one
     // entry per field.
     if let Some(DType::Struct(id)) = dtype {
@@ -304,7 +417,8 @@ pub fn array_from_any(
         let mut values = Vec::new();
         flatten(obj, 0, &shape, &mut values)?;
         let d = dtype.unwrap_or_else(|| infer_dtype(&values));
-        let flat = NdArray::from_scalars(&values, d).map_err(crate::err)?;
+        let plain: Vec<Scalar> = values.iter().map(|(_, v)| *v).collect();
+        let flat = NdArray::from_scalars(&plain, d).map_err(crate::err)?;
         return flat.reshape(&shape).map_err(crate::err);
     }
     // Anything else exposing __iter__ / __len__: go through list().
@@ -423,14 +537,68 @@ pub fn weak_promote(arr: DType, s: Scalar) -> DType {
     }
 }
 
+/// The dtype a weak Python scalar adopts, or numpy's OverflowError when the
+/// value does not fit.
+///
+/// NEP 50: `np.uint8(1) + 300` is an OverflowError, while `np.uint8(200) < -1`
+/// still answers correctly -- so a comparison widens the *weak* operand to its
+/// own natural dtype instead of raising.
+pub fn weak_dtype(arr: DType, s: Scalar, comparison: bool) -> PyResult<DType> {
+    let d = weak_promote(arr, s);
+    let v: i128 = match s {
+        Scalar::Int(i) => i as i128,
+        Scalar::Uint(u) => u as i128,
+        _ => return Ok(d),
+    };
+    if !d.is_integer() {
+        return Ok(d);
+    }
+    let (lo, hi): (i128, i128) = match d {
+        DType::I8 => (i8::MIN as i128, i8::MAX as i128),
+        DType::I16 => (i16::MIN as i128, i16::MAX as i128),
+        DType::I32 => (i32::MIN as i128, i32::MAX as i128),
+        DType::I64 => (i64::MIN as i128, i64::MAX as i128),
+        DType::U8 => (0, u8::MAX as i128),
+        DType::U16 => (0, u16::MAX as i128),
+        DType::U32 => (0, u32::MAX as i128),
+        DType::U64 => (0, u64::MAX as i128),
+        _ => return Ok(d),
+    };
+    if v >= lo && v <= hi {
+        return Ok(d);
+    }
+    if comparison {
+        return Ok(s.natural_dtype());
+    }
+    Err(pyo3::exceptions::PyOverflowError::new_err(format!(
+        "Python integer {v} out of bounds for {d}"
+    )))
+}
+
 /// Coerce the right-hand operand of a binary op into an array, applying weak
 /// scalar promotion against `self_dtype`.
 pub fn operand(obj: &Bound<'_, PyAny>, self_dtype: DType) -> PyResult<Option<NdArray>> {
+    operand_for(obj, self_dtype, false)
+}
+
+/// As [`operand`], telling the weak-scalar rule whether the op is a
+/// comparison.
+pub fn operand_for(
+    obj: &Bound<'_, PyAny>,
+    self_dtype: DType,
+    comparison: bool,
+) -> PyResult<Option<NdArray>> {
     if let Ok(a) = obj.cast::<PyNdArray>() {
         return Ok(Some(a.borrow().arr.clone()));
     }
+    // numpy scalars are *strong* under NEP 50: they keep their own dtype.
+    if let Some((d, s)) = np_scalar(obj)? {
+        let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
+        a.set(&[], s).map_err(crate::err)?;
+        return Ok(Some(a));
+    }
     if let Some(s) = scalar_from_py(obj) {
-        let d = weak_promote(self_dtype, s);
+        let d = weak_dtype(self_dtype, s, comparison)?;
         let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
         a.set(&[], s).map_err(crate::err)?;
         return Ok(Some(a));

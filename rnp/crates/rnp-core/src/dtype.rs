@@ -44,9 +44,13 @@ pub enum DType {
     Struct(u32),
     /// A subarray dtype (`('f4', (2, 2))`); indexes the subarray registry.
     SubArray(u32),
-    /// `object` — a descriptor only. The port has no Python-object storage,
-    /// so creating an array of it raises NotImplementedError; the descriptor
-    /// exists because upstream test modules build one at import time.
+    /// `M8[unit]` — a descriptor only so far. The payload indexes
+    /// [`DATETIME_UNITS`]; `0` is the unit-less `M8`.
+    DateTime(u8),
+    /// `m8[unit]`; see [`DType::DateTime`].
+    TimeDelta(u8),
+    /// `object` — arrays of it store 8-byte handles into the interning slab
+    /// on the Python side (see `rnp-python/src/objects.rs`).
     Object,
 }
 
@@ -64,8 +68,23 @@ pub enum Kind {
     Str,
     /// `V`, including structured and subarray dtypes.
     Void,
+    /// `M`
+    DateTime,
+    /// `m`
+    TimeDelta,
     /// `O`
     Object,
+}
+
+/// numpy's datetime unit codes, in its own order. Index 0 is the unit-less
+/// `M8`/`m8`; the rest are what appears in `dtype('M8[ns]')`.
+pub const DATETIME_UNITS: [&str; 14] = [
+    "", "Y", "M", "W", "D", "h", "m", "s", "ms", "us", "ns", "ps", "fs", "as",
+];
+
+/// The index of a unit string, or `None` when it is not one of numpy's.
+pub fn datetime_unit_index(u: &str) -> Option<u8> {
+    DATETIME_UNITS.iter().position(|&x| x == u).map(|i| i as u8)
 }
 
 /// The numeric dtypes, in numpy's own ordering.
@@ -97,6 +116,7 @@ impl DType {
             DType::C128 => 16,
             DType::Bytes(n) | DType::Void(n) => n as usize,
             DType::Str(n) => 4 * n as usize,
+            DType::DateTime(_) | DType::TimeDelta(_) => 8,
             DType::Struct(id) => registry::struct_def(id).itemsize,
             DType::SubArray(id) => {
                 let d = registry::subarray_def(id);
@@ -115,7 +135,7 @@ impl DType {
             DType::Str(_) => 4,
             DType::Struct(id) => registry::struct_def(id).alignment,
             DType::SubArray(id) => registry::subarray_def(id).base.alignment(),
-            DType::Object => 8,
+            DType::Object | DType::DateTime(_) | DType::TimeDelta(_) => 8,
             other => other.itemsize(),
         }
     }
@@ -130,6 +150,8 @@ impl DType {
             DType::Bytes(_) => Kind::Bytes,
             DType::Str(_) => Kind::Str,
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => Kind::Void,
+            DType::DateTime(_) => Kind::DateTime,
+            DType::TimeDelta(_) => Kind::TimeDelta,
             DType::Object => Kind::Object,
         }
     }
@@ -145,6 +167,8 @@ impl DType {
             Kind::Bytes => 'S',
             Kind::Str => 'U',
             Kind::Void => 'V',
+            Kind::DateTime => 'M',
+            Kind::TimeDelta => 'm',
             Kind::Object => 'O',
         }
     }
@@ -169,6 +193,8 @@ impl DType {
             DType::Bytes(_) => 'S',
             DType::Str(_) => 'U',
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 'V',
+            DType::DateTime(_) => 'M',
+            DType::TimeDelta(_) => 'm',
             DType::Object => 'O',
         }
     }
@@ -203,6 +229,19 @@ impl DType {
         if self == DType::Object {
             return "object".to_string();
         }
+        if let DType::DateTime(u) | DType::TimeDelta(u) = self {
+            let stem = if matches!(self, DType::DateTime(_)) {
+                "datetime64"
+            } else {
+                "timedelta64"
+            };
+            let unit = DATETIME_UNITS[u as usize];
+            return if unit.is_empty() {
+                stem.to_string()
+            } else {
+                format!("{stem}[{unit}]")
+            };
+        }
         let stem = match self.category() {
             Kind::Bytes => "bytes",
             Kind::Str => "str",
@@ -236,6 +275,8 @@ impl DType {
             DType::Bytes(_) => 18,
             DType::Str(_) => 19,
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 20,
+            DType::DateTime(_) => 21,
+            DType::TimeDelta(_) => 22,
             DType::Object => 17,
         }
     }
@@ -252,6 +293,7 @@ impl DType {
             DType::Str(_) => true,
             DType::Bytes(_) | DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => false,
             DType::Object => false,
+            DType::DateTime(_) | DType::TimeDelta(_) => true,
             other => other.itemsize() > 1,
         }
     }

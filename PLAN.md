@@ -252,3 +252,185 @@ benchmark run, Fable review, git commit.
     with isolated repeat measurements before being recorded here.
   * Small-array (1e3) rows still carry 0.2-0.5us of PyO3 boundary cost per
     call, which is most of the ratio on `slice_view`.
+
+- 2026-08-16: M3 started (Opus). Scope: real numpy scalar types, the ufunc
+  object model, ufunc breadth with numpy-exact special values and error
+  flags, and `np.errstate`.
+- 2026-08-16: M3 complete (Opus build). cargo test 86/86; dev_check
+  **22089 comparisons / 119 divergences** (up from 11215/0 — the M3 sections
+  are ~10900 new comparisons and every remaining divergence is listed below);
+  crosscheck green. Full suite **8343/10493 (79.5%)**, up from the M2
+  baseline of 1462/3565. The collected total grew because five large files
+  (`test_scalarmath`, `test_umath`'s parametrised bulk, `test_regression`,
+  `test_dtype`'s pickling block, `test_half`) only collect once scalars
+  exist.
+
+  Scoreboard deltas (passed/collected):
+  * test_umath          81/801  -> **4881/5209** (93.7%)
+  * test_scalarmath      0/0    -> **1463/1583** (92.4%)
+  * test_dtype         711/940  -> **952/1160**  (82.1%)
+  * test_regression      0/0    -> **221/419**
+  * test_item_selection 204/254 -> 250/294
+  * test_finfo           0/30   -> **30/30**
+  * test_print           8/22   -> **22/22**
+  * test_numerictypes   77/138  -> 96/138
+  * test_scalar_methods 97/215  -> 115/227
+  * test_longdouble      0/0    -> 11/33
+  * test_half            0/39   -> 8/39
+  * test_scalarprint     3/29   -> 10/29
+  * test_errstate        0/6    -> 3/6
+  * test_indexerrors     5/8    -> 7/8
+  * regressed: test_scalar_ctors 142/197 -> 138/197 (see gaps)
+  * still not collecting: test_multiarray, test_numeric,
+    test_nep50_promotions, test_ufunc, test_datetime
+
+  What landed:
+  * `shim/rnp_numpy/_scalars.py` — the real scalar hierarchy, as *Python*
+    classes so the MRO can be numpy's exactly. Probed and reproduced: only
+    four concrete types inherit a builtin (`float64(floating, float)`,
+    `complex128(complexfloating, complex)`, `bytes_(bytes, character)`,
+    `str_(str, character)`) — `int64` does **not** inherit `int` in numpy
+    2.x; `np.bool_.__name__` is `"bool"`; `True_`/`False_` are singletons;
+    `longlong`/`ulonglong`/`longdouble`/`clongdouble` are distinct classes.
+    Every scalar carries `.dtype`, `.itemsize`, `.shape`, `.ndim`, `.size`,
+    `.real`/`.imag`, `.item()`, `x[()]`, `__array__`, `__index__`, hashes
+    equal to the Python equivalent, and numpy's repr/str. The float
+    formatting is numpy's own rule, derived by probing: the digits are the
+    shortest decimal that round-trips through *that* float type, and the
+    positional/scientific switch is made on the decimal exponent of the
+    *stored* value (which is why `str(np.float32(1e-4))` is `1e-04`).
+  * `shim/rnp_numpy/_ufunc.py` + `_ufunc_table.py` — one `ufunc` object per
+    name, with `nin/nout/nargs/identity/ntypes/types` generated from real
+    numpy so introspection matches even where the port has no loop. numpy's
+    aliasing is reproduced (`np.acos is np.arccos`, `np.abs is np.absolute`,
+    ...). `__call__(out=, where=, casting=, dtype=, order=)`, `.reduce`,
+    `.accumulate`, `.reduceat`, `.outer`, `.at` all work.
+  * `rnp-core/src/ufunc.rs` + an extended `ops::BinOp` — Rust inner loops for
+    the whole M3 list: the transcendental family, `power`/`float_power`,
+    `floor_divide`/`remainder`/`fmod`/`divmod`, `minimum`/`maximum`/`fmin`/
+    `fmax`, `arctan2`/`hypot`/`copysign`/`nextafter`/`spacing`/`logaddexp`/
+    `logaddexp2`/`heaviside`/`ldexp`, the bitwise and shift ops, `gcd`/`lcm`,
+    the logical ops, `isnan`/`isinf`/`isfinite`/`signbit`, `frexp`/`modf`,
+    `conjugate`, `real`/`imag`, and the sign/round family. Type resolution
+    follows numpy's own loop tables: the float-only ufuncs pick the
+    *smallest* loop that fits (`np.exp(np.uint8(1))` is float16), `rint` has
+    no integer loop while `floor`/`ceil`/`trunc` do, `absolute` on complex
+    drops to the real component type.
+  * `rnp-core/src/fpe.rs` + `shim/rnp_numpy/_errstate.py` — the
+    divide/over/under/invalid model. The Rust loops accumulate a 4-bit mask
+    and the shim turns it into numpy's `RuntimeWarning` /
+    `FloatingPointError` under the current `np.seterr` state, with numpy's
+    exact wording (`"divide by zero encountered in log"`, and the
+    `"... in scalar multiply"` form for scalar ops). Array operators report
+    through the same path, so `np.errstate` works on `a / b` as well as on
+    `np.divide(a, b)`.
+  * NEP 50 completed for the scalar/array boundary: numpy scalars are strong
+    operands, Python numbers weak, an out-of-range Python integer is an
+    `OverflowError` in arithmetic but answers *correctly* in a comparison,
+    and `uint64` vs signed comparisons go through an exact 128-bit loop
+    rather than the float64 the two would otherwise promote to.
+  * Object arrays: `np.array([...], dtype=object)` stores 8-byte handles into
+    an append-only slab of `Py<PyAny>` on the Python side (handle 0 is
+    `None`, so `np.empty(3, object)` reads back as numpy's does). Indexing,
+    assignment, `tolist`, `item` and `repr` all work. The slab never frees,
+    which is a bounded leak traded for the guarantee that no handle dangles.
+  * datetime64 / timedelta64 as *descriptors*: `np.dtype('M8[ns]')`,
+    `'m8[D]'`, `'datetime64[us]'`, the byte-order forms and all of
+    `np.typecodes['All']` now construct, with numpy's `num`/`char`/`name`/
+    `str`/`repr`. There is no datetime storage or arithmetic yet.
+  * Half-precision conversion bugs found by `test_half`: `f16 -> f32` was
+    off by a factor of two for subnormals (numpy's
+    `npy_halfbits_to_floatbits` shifts once *before* the renormalising loop),
+    and `f32/f64 -> f16` discarded NaN payloads instead of keeping the top
+    ten mantissa bits. A new cargo test round-trips all 65536 half patterns
+    through both float types.
+  * Allocation guard: `np.zeros([975] * 7, np.int8)` used to overflow the
+    element-count product, hand a wrapped length to the allocator and
+    **abort the process**; it now raises numpy's ValueError. This was a
+    latent M0 bug that only became visible once `test_regression` collected.
+
+  ULP accuracy vs real numpy (max over 200k random values in-domain plus a
+  dense edge-case list, per `harness/dev_check.py`; policy is <= 4 ULP):
+
+    function                                       f64   f32
+    exp exp2 expm1 log log2 log10 log1p              0     0
+    sin cos                                          0     1
+    tan arcsin arccos arctan                         0     0
+    sinh cosh                                        0     0
+    tanh                                             1     1
+    arcsinh                                          1     1
+    arccosh                                          1     1
+    arctanh                                          2     1
+    cbrt sqrt hypot arctan2 power float_power        0     0
+
+  `arcsinh`/`arccosh`/`arctanh` needed numpy's own formulations: the library
+  forms overflow for huge arguments and cancel catastrophically at the edges
+  of their domains (they measured 2.5e7 and 9.8e13 ULP before).
+
+  Performance (ratio port/numpy, lower is better). The FP-error flags are
+  *not* computed per element: each loop OR-folds a one-compare watch
+  predicate, and only if that fires does a second pass attribute the exact
+  mask. Computing the flags inline cost 3-4x on `add_f64`. Underflow
+  detection additionally has to treat every zero result as a candidate, so
+  it is gated on `np.seterr(under=...)` being something other than the
+  default 'ignore'.
+
+  (The host is noisy: `mul_f64` and `max_f64` at 1e6 moved between 1.15x and
+  2.15x across back-to-back runs, and numpy's own timings moved +-20%.)
+
+    case                 1e3      1e6
+    add_f64             2.82x    1.18x
+    mul_f64             4.08x    2.15x
+    add_i32             3.45x    1.39x
+    sum_f64             0.78x    1.02x
+    max_f64             0.97x    2.08x
+    exp_f64             1.38x    0.59x
+    exp_f32             1.26x    0.61x
+    sin_f64             1.23x    0.47x
+    log_f64             1.34x    0.32x
+    power_f64           1.20x    0.27x
+    sqrt_f64            2.24x    1.05x
+    abs_f64             3.05x    0.77x
+    negative_f64        2.68x    0.74x
+    maximum_f64         3.86x    1.15x
+    floor_divide_i32    2.33x    3.35x
+    bitwise_and_i32     3.19x    3.80x
+    add_reduce_f64      2.60x    0.63x
+    scalar_add_f64     17.69x   12.20x
+    scalar_add_i64      8.73x    6.32x
+    scalar_extract     12.46x    5.18x
+
+  Known gaps carried into M4:
+  * **Scalar-op overhead**: a scalar binary op is ~2.4us against numpy's
+    0.15us. Every one crosses the PyO3 boundary and builds two 0-d arrays;
+    the fix is a dedicated scalar path in Rust that never allocates.
+  * `bitwise_and_i32` and `floor_divide_i32` at 1e6 are 3.3-3.8x: the
+    broadcast-scalar operand takes the stepped-pointer loop, which does not
+    vectorise even after the scalar load was hoisted out of it. `maximum` is
+    ~1.2x because the signed-zero tie-break costs several selects.
+  * Every 1e3 row carries the same 0.5-0.8us of PyO3 + `ufunc.__call__`
+    dispatch cost, which is most of the small-array ratios.
+  * **119 dev_check divergences remain**, all enumerated by
+    `harness/dev_check.py`: complex functions at infinite arguments (numpy
+    follows C99 Annex G, `num_complex` does not) — about 30; last-bit
+    ordering differences in `add.reduce`/`multiply.reduce` with `axis=None`
+    or `where=` (the fold order is not numpy's pairwise tree) — about 20;
+    a handful of 1-ULP float32 transcendental bit differences (inside the
+    ULP policy but flagged by the bit-exact table); `lcm` at the signed
+    boundary; `gcd`/`lcm` raising `TypeError` where numpy raises
+    `UFuncTypeError`; and `np.record` missing.
+  * **`test_scalar_ctors` lost 4 tests**, and honestly so: `longlong` and
+    `int64` used to be the *same* class, which made
+    `np.array(np.longlong(2)).dtype.type is np.longlong` trivially true.
+    They are now distinct, and `NdArray` carries a `DType` rather than a
+    `Descr`, so an array loses the C-type alias. Threading `Descr` through
+    the array header is M4 work.
+  * **Byte-swapped arrays** still raise, so `test_nep50_promotions` does not
+    collect. **Object-array ufuncs** are not implemented (the storage is),
+    so `test_multiarray` still does not collect. **datetime storage** does
+    not exist, so `test_numeric` does not collect. All three are storage-model
+    milestones.
+  * `matmul`/`vecdot`/`matvec`/`vecmat`/`isnat` are the five ufuncs with no
+    loop at all (M6 for the matmul family).
+  * Underflow is only detected under a non-default `errstate(under=...)`,
+    and float16 `str`/`repr` still differs from numpy on a few values.

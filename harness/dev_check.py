@@ -13,13 +13,50 @@ Usage: .venv/bin/python harness/dev_check.py [--seed N]
 """
 import argparse
 import itertools
+import math
+import os
 import random
 import sys
 import traceback
+import warnings
 
 import numpy as np
 
 import _rnp
+
+# The M3 surface -- scalar types, ufunc objects, errstate -- lives in the pure
+# Python shim package `rnp_numpy`, not in the `_rnp` extension. It is a normal
+# package named `rnp_numpy`, so it can be imported alongside real numpy in this
+# same process; no import redirection is involved.
+#
+# The import is deliberately *lazy* (see load_shim(), called from
+# run_m3_sections() after every M0-M2 section has finished). Importing the shim
+# registers the scalar types with the extension, which changes what `_rnp`
+# reductions and element access hand back -- Python floats become numpy-style
+# scalars. The M0-M2 sections above were written against the pre-M3 behaviour
+# and must keep testing exactly what they tested before, so the shim is not
+# allowed to exist until they are done.
+_SHIM_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shim")
+if _SHIM_DIR not in sys.path:
+    sys.path.insert(0, _SHIM_DIR)
+
+rnp = None
+SHIM_IMPORT_ERROR = None
+
+
+def load_shim():
+    """Import the shim, once, returning True on success."""
+    global rnp, SHIM_IMPORT_ERROR
+    if rnp is not None:
+        return True
+    try:
+        import rnp_numpy
+    except Exception:  # noqa: BLE001
+        SHIM_IMPORT_ERROR = traceback.format_exc().strip().splitlines()[-1]
+        return False
+    rnp = rnp_numpy
+    return True
 
 DTYPES = [
     "bool", "int8", "int16", "int32", "int64",
@@ -476,6 +513,944 @@ def check_indexing(rng, n_cases=400):
               _rnp.where_(to_port(mask), 1, 2))
 
 
+# ==========================================================================
+# M3: numpy scalar types + ufunc machinery
+#
+# Everything below talks to the shim (`rnp`) rather than to `_rnp` directly,
+# because scalar types, ufunc objects and errstate are implemented in Python
+# on top of the Rust engine. Real numpy is always the oracle: every expected
+# value is read out of numpy at run time, never written down by hand.
+# ==========================================================================
+
+#: Ufuncs (and other entry points) the port has not implemented yet. These are
+#: reported separately from FAILURES so the scoreboard stays honest: a missing
+#: feature is a "not yet", not a wrong answer.
+NOT_YET = []
+
+#: (function, dtype, sample-kind, max ULP) rows produced by check_ulp().
+ULP_ROWS = []
+
+#: Concrete scalar types, in numpy's own hierarchy order.
+CONCRETE_SCALARS = [
+    "bool_", "int8", "int16", "int32", "int64", "longlong",
+    "uint8", "uint16", "uint32", "uint64", "ulonglong",
+    "float16", "float32", "float64", "longdouble",
+    "complex64", "complex128", "clongdouble",
+    "bytes_", "str_", "void", "object_", "datetime64", "timedelta64",
+]
+
+#: Abstract bases. issubclass() over these is where most of the hierarchy
+#: information lives, so they are exercised in the same cross product.
+ABSTRACT_SCALARS = [
+    "generic", "number", "integer", "signedinteger", "unsignedinteger",
+    "inexact", "floating", "complexfloating", "flexible", "character",
+]
+
+ALL_SCALARS = CONCRETE_SCALARS + ABSTRACT_SCALARS
+
+#: The numeric scalar types whose *values* are compared in check_scalar_values.
+VALUE_SCALARS = [
+    "bool_", "int8", "int16", "int32", "int64", "longlong",
+    "uint8", "uint16", "uint32", "uint64", "ulonglong",
+    "float16", "float32", "float64", "complex64", "complex128",
+]
+
+#: Values fed to every scalar constructor. Real numpy decides which of these
+#: are legal; where it raises, the port must raise the same exception type.
+SCALAR_VALUES = [
+    0, 1, -1, 2, 127, 128, 255, 256, -128,
+    2 ** 31 - 1, 2 ** 31, 2 ** 63 - 1, 2 ** 63,
+    0.5, -0.5, 0.1, 1e300, 1e-300,
+    float("inf"), float("-inf"), float("nan"), 1 + 2j,
+]
+
+#: The dtypes the ufunc special-value tables are evaluated in.
+UFUNC_DTYPES = ["float64", "float32", "float16", "int32", "int64", "uint8",
+                "complex128", "bool"]
+
+#: Transcendental ufuncs: the ones for which a NaN result only has to *be* a
+#: NaN, not carry the same payload bits. Everything else is compared bit for
+#: bit including the NaN payload.
+TRANSCENDENTAL = {
+    "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
+    "sin", "cos", "tan", "arcsin", "arccos", "arctan", "arctan2",
+    "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh",
+    "cbrt", "sqrt", "square", "reciprocal", "hypot", "power", "float_power",
+    "rint", "logaddexp", "logaddexp2", "spacing", "nextafter", "ldexp",
+    "frexp", "modf", "divide", "true_divide", "floor_divide", "remainder",
+    "mod", "fmod", "divmod", "absolute", "positive", "negative",
+    "deg2rad", "rad2deg", "degrees", "radians", "conjugate", "sign",
+    # numpy 2's C99 spellings are aliases of the same objects.
+    "acos", "asin", "atan", "atan2", "acosh", "asinh", "atanh", "pow",
+}
+
+
+def eq(name, want, got):
+    """One comparison of two directly comparable Python values."""
+    global CHECKS
+    CHECKS += 1
+    if want != got:
+        FAILURES.append((name, f"port {got!r} != numpy {want!r}"))
+        return False
+    return True
+
+
+def attempt(fn):
+    """Run `fn`, returning ("ok", value), ("exc", name) or ("notyet", name)."""
+    try:
+        return ("ok", fn())
+    except NotImplementedError as exc:  # noqa: BLE001
+        return ("notyet", f"{type(exc).__name__}: {exc}"[:120])
+    except Exception as exc:  # noqa: BLE001
+        return ("exc", type(exc).__name__)
+
+
+def raw(x):
+    """(dtype, shape, bytes) for anything either library hands back.
+
+    numpy scalars, port scalars and both libraries' arrays all expose
+    `.dtype`/`.tobytes()`, so the *bytes the engine actually produced* are what
+    gets compared -- no float() round trip that could hide a payload or a
+    low-bit difference.
+    """
+    if hasattr(x, "tobytes") and hasattr(x, "dtype"):
+        return (str(x.dtype), tuple(np.shape(x)), x.tobytes())
+    a = np.asarray(x)
+    return (str(a.dtype), a.shape, a.tobytes())
+
+
+def _tobytes(x):
+    """Raw bytes of a scalar or array from either library.
+
+    The port's arrays expose the buffer protocol but not `.tobytes()`, and its
+    scalars expose `.tobytes()` but not a working `__array__`, so both routes
+    are needed.
+    """
+    if hasattr(x, "tobytes"):
+        return x.tobytes()
+    return np.asarray(x).tobytes()
+
+
+def _nan_tolerant_equal(want, got):
+    """True when two same-dtype byte-identical-modulo-NaN-payload results agree."""
+    w = np.asarray(want)
+    g = np.frombuffer(_tobytes(got), dtype=w.dtype).reshape(w.shape)
+    if w.dtype.kind not in "fc":
+        return bool(np.array_equal(w, g))
+    both_nan = np.isnan(w) & np.isnan(g)
+    same_bits = (w.tobytes() == g.tobytes())
+    if same_bits:
+        return True
+    # Bits differ: allow it only where both sides are NaN.
+    wv = w.view(_int_view(w.dtype)) if w.dtype.kind == "f" else None
+    if wv is None:
+        # complex: compare real/imag halves separately
+        w2 = w.view(np.float64 if w.dtype.itemsize == 16 else np.float32)
+        g2 = g.view(w2.dtype)
+        ok = (w2.view(_int_view(w2.dtype)) == g2.view(_int_view(w2.dtype)))
+        return bool(np.all(ok | (np.isnan(w2) & np.isnan(g2))))
+    ok = (wv == g.view(_int_view(g.dtype)))
+    return bool(np.all(ok | both_nan))
+
+
+def _int_view(dt):
+    return {2: np.int16, 4: np.int32, 8: np.int64}[np.dtype(dt).itemsize]
+
+
+def _record_warnings(caught):
+    """Warnings in a comparable, order-independent form."""
+    return sorted((w.category.__name__, str(w.message)) for w in caught)
+
+
+# --------------------------------------------------------------------------
+# 1. Scalar type identity, MRO and hierarchy
+# --------------------------------------------------------------------------
+
+def check_scalar_types():
+    """Names, MROs, issubclass cross product, aliases, dtypes, registries."""
+    global CHECKS
+
+    present = []
+    for name in ALL_SCALARS:
+        if not hasattr(np, name):
+            continue
+        CHECKS += 1
+        if not hasattr(rnp, name):
+            FAILURES.append((f"scalar type {name}", "missing from the shim"))
+            continue
+        present.append(name)
+        t, s = getattr(np, name), getattr(rnp, name)
+        eq(f"{name}.__name__", t.__name__, getattr(s, "__name__", None))
+        eq(f"{name}.__mro__",
+           tuple(c.__name__ for c in t.__mro__),
+           tuple(c.__name__ for c in getattr(s, "__mro__", ())))
+
+    # The full cross product of issubclass. This is where the hierarchy is
+    # actually pinned down -- names and MRO order alone would not catch, say,
+    # a missing `bool_ is not integer` relation.
+    for a in present:
+        for b in present:
+            eq(f"issubclass({a}, {b})",
+               issubclass(getattr(np, a), getattr(np, b)),
+               issubclass(getattr(rnp, a), getattr(rnp, b)))
+
+    # Every alias numpy exposes at the top level that is a scalar type.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        aliases = []
+        for name in dir(np):
+            try:
+                obj = getattr(np, name)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(obj, type) and issubclass(obj, np.generic):
+                aliases.append(name)
+    for name in sorted(aliases):
+        CHECKS += 1
+        got = getattr(rnp, name, None)
+        if not isinstance(got, type):
+            FAILURES.append((f"alias np.{name}",
+                             f"shim has {got!r}, numpy has a scalar type"))
+            continue
+        eq(f"alias np.{name}.__name__", getattr(np, name).__name__, got.__name__)
+
+    # np.dtype(scalar_type) parity.
+    for name in CONCRETE_SCALARS:
+        if name not in present:
+            continue
+        want = np.dtype(getattr(np, name))
+        kind, got = attempt(lambda: rnp.dtype(getattr(rnp, name)))
+        CHECKS += 1
+        if kind != "ok":
+            # Recorded as a divergence on purpose: numpy answers, the port
+            # does not, and that is visible work remaining.
+            FAILURES.append((f"dtype({name})", f"port raised {got}"))
+            continue
+        for attr in ["num", "char", "kind", "itemsize", "name"]:
+            eq(f"dtype({name}).{attr}", getattr(want, attr),
+               getattr(got, attr, None))
+        eq(f"str(dtype({name}))", str(want), str(got))
+
+    # sctypeDict: same keys, same class per key.
+    CHECKS += 1
+    want_keys = set(np.sctypeDict)
+    got_keys = set(getattr(rnp, "sctypeDict", {}))
+    if want_keys != got_keys:
+        FAILURES.append((
+            "sctypeDict keys",
+            f"port has {len(got_keys)} keys, numpy {len(want_keys)}; "
+            f"extra={sorted(got_keys - want_keys)[:12]} "
+            f"missing={sorted(want_keys - got_keys)[:12]}"))
+    for key in sorted(want_keys & got_keys, key=str):
+        eq(f"sctypeDict[{key!r}]", np.sctypeDict[key].__name__,
+           getattr(rnp.sctypeDict[key], "__name__", None))
+
+    eq("typecodes", dict(np.typecodes), dict(getattr(rnp, "typecodes", {})))
+
+    want_st = [t.__name__ for t in np.ScalarType]
+    got_st = [getattr(t, "__name__", None) for t in getattr(rnp, "ScalarType", ())]
+    eq("len(ScalarType)", len(want_st), len(got_st))
+    eq("ScalarType", want_st, got_st)
+
+
+# --------------------------------------------------------------------------
+# 2. Scalar value parity
+# --------------------------------------------------------------------------
+
+def check_scalar_values():
+    """repr/str/hash/item/dtype/... for every (type, value) numpy accepts."""
+    global CHECKS
+
+    for name in VALUE_SCALARS:
+        if not hasattr(np, name) or not hasattr(rnp, name):
+            continue
+        nt, st = getattr(np, name), getattr(rnp, name)
+        for v in SCALAR_VALUES:
+            label = f"{name}({v!r})"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with np.errstate(all="ignore"):
+                    wkind, want = attempt(lambda: nt(v))
+                    gkind, got = attempt(lambda: st(v))
+            CHECKS += 1
+            if wkind != "ok":
+                # numpy refuses the value: the port must refuse it identically.
+                if gkind == "notyet":
+                    NOT_YET.append((label, got))
+                elif gkind != "exc" or want != got:
+                    FAILURES.append((label,
+                                     f"port {gkind}:{got!r}, numpy raised {want}"))
+                continue
+            if gkind == "notyet":
+                NOT_YET.append((label, got))
+                continue
+            if gkind != "ok":
+                FAILURES.append((label, f"port raised {got}, numpy returned "
+                                        f"{want!r}"))
+                continue
+
+            eq(f"repr({label})", repr(want), repr(got))
+            eq(f"str({label})", str(want), str(got))
+            # CPython hashes NaN by object identity (3.10+), so a NaN hash is
+            # address-dependent and says nothing about the port.
+            if not _is_nan(want):
+                eq(f"hash({label})", _safe(lambda: hash(want)),
+                   _safe(lambda: hash(got)))
+            # Compared through repr so NaN == NaN and -0.0 != 0.0.
+            eq(f"{label}.item()", _safe(lambda: repr(want.item())),
+               _safe(lambda: repr(got.item())))
+            eq(f"type({label}.item())",
+               _safe(lambda: type(want.item()).__name__),
+               _safe(lambda: type(got.item()).__name__))
+            eq(f"{label}.dtype", str(want.dtype), str(getattr(got, "dtype", None)))
+            eq(f"{label}.itemsize", want.itemsize, getattr(got, "itemsize", None))
+            eq(f"{label}.ndim", want.ndim, getattr(got, "ndim", None))
+            eq(f"{label}.shape", want.shape, getattr(got, "shape", None))
+            eq(f"bool({label})", _safe(lambda: bool(want)), _safe(lambda: bool(got)))
+            eq(f"type({label}[()])", _safe(lambda: type(want[()]).__name__),
+               _safe(lambda: type(got[()]).__name__))
+            # The stored bits themselves.
+            eq(f"bits({label})", raw(want), _safe(lambda: raw(got)))
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return f"<{type(exc).__name__}>"
+
+
+def _is_nan(x):
+    try:
+        return bool(np.isnan(x))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# --------------------------------------------------------------------------
+# 3. 0-d and element extraction rules
+# --------------------------------------------------------------------------
+
+def check_element_extraction():
+    """What *type* comes out of indexing, iteration and whole-array reductions."""
+    global CHECKS
+
+    dtypes = ["bool", "int8", "int32", "int64", "uint8", "uint32", "uint64",
+              "float16", "float32", "float64", "complex64", "complex128"]
+    rng = random.Random(4242)
+    for dt in dtypes:
+        base2 = sample(rng, dt, 12).reshape(3, 4)
+        cases = [
+            ("0d", np.array(base2[0, 0]), to_port(base2.ravel()[:1]).reshape(())),
+            ("1d", base2[0].copy(), to_port(base2[0].copy())),
+            ("2d", base2, to_port(base2.ravel()).reshape(3, 4)),
+        ]
+        for shape_name, w, g in cases:
+            probes = [
+                ("a[0]", lambda a: type(a[0]).__name__),
+                ("a[0,0]", lambda a: type(a[0, 0]).__name__),
+                ("a[()]", lambda a: type(a[()]).__name__),
+                ("a.item()", lambda a: type(a.item()).__name__),
+                ("a.sum()", lambda a: type(a.sum()).__name__),
+                ("a.max()", lambda a: type(a.max()).__name__),
+                ("a.all()", lambda a: type(a.all()).__name__),
+                ("a.argmax()", lambda a: type(a.argmax()).__name__),
+                ("iter(a)", lambda a: type(next(iter(a))).__name__),
+            ]
+            for pname, fn in probes:
+                label = f"type of {pname} on {dt} {shape_name}"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with np.errstate(all="ignore"):
+                        wk, wv = attempt(lambda: fn(w))
+                        gk, gv = attempt(lambda: fn(g))
+                CHECKS += 1
+                if gk == "notyet":
+                    NOT_YET.append((label, gv))
+                    continue
+                if (wk, wv) != (gk, gv):
+                    FAILURES.append((label, f"port {gk}:{gv!r}, numpy {wk}:{wv!r}"))
+
+
+# --------------------------------------------------------------------------
+# 4. ufunc special-value tables
+# --------------------------------------------------------------------------
+
+def _specials(dt):
+    """The special-value vector for a dtype, built once in numpy.
+
+    Both libraries are then handed the *same* cast result, so a divergence in
+    the float->int cast cannot be mistaken for a divergence in the ufunc.
+    """
+    d = np.dtype(dt)
+    if d.kind == "f":
+        fi = np.finfo(d)
+        tiny, huge = float(fi.tiny), float(fi.max)
+    elif d.kind == "c":
+        fi = np.finfo(np.dtype(f"f{d.itemsize // 2}"))
+        tiny, huge = float(fi.tiny), float(fi.max)
+    elif d.kind in "iu":
+        ii = np.iinfo(d)
+        tiny, huge = 1.0, float(min(ii.max, 2 ** 53))
+    else:
+        tiny, huge = 1.0, 1.0
+    base = [float("nan"), float("inf"), float("-inf"), 0.0, -0.0,
+            1.0, -1.0, tiny, huge, 2.0, -2.0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with np.errstate(all="ignore"):
+            return np.array(base, dtype=np.float64).astype(d)
+
+
+def check_ufunc_tables():
+    """Every ufunc, every dtype, the full special-value cross product."""
+    global CHECKS
+
+    names = sorted(n for n in dir(np) if isinstance(getattr(np, n, None), np.ufunc))
+    for name in names:
+        nf = getattr(np, name)
+        gf = getattr(rnp, name, None)
+        CHECKS += 1
+        if gf is None:
+            FAILURES.append((f"ufunc {name}", "missing from the shim"))
+            continue
+        for dt in UFUNC_DTYPES:
+            vals = _specials(dt)
+            pvals = to_port(vals)
+            label = f"{name}({dt})"
+            if nf.nin == 1:
+                np_args = (vals,)
+                rp_args = (pvals,)
+            else:
+                # The full 11x11 cross product in one broadcast call.
+                np_args = (vals[:, None], vals[None, :])
+                rp_args = (pvals[:, None], pvals[None, :])
+                if nf.nin > 2:
+                    np_args = np_args + (vals[None, :],)
+                    rp_args = rp_args + (pvals[None, :],)
+
+            with warnings.catch_warnings(record=True) as wlog:
+                warnings.simplefilter("always")
+                wkind, want = attempt(lambda: nf(*np_args))
+            want_warn = _record_warnings(wlog)
+
+            with warnings.catch_warnings(record=True) as glog:
+                warnings.simplefilter("always")
+                gkind, got = attempt(lambda: gf(*rp_args))
+            got_warn = _record_warnings(glog)
+
+            if gkind == "notyet":
+                NOT_YET.append((f"ufunc {name}", got))
+                break  # the whole ufunc is missing; no point going per-dtype
+
+            CHECKS += 1
+            if wkind != gkind:
+                FAILURES.append((label,
+                                 f"port {gkind}:{got!r}, numpy {wkind}:{want!r}"))
+                continue
+            if wkind == "exc":
+                eq(f"{label} raises", want, got)
+                continue
+
+            wouts = want if nf.nout > 1 else (want,)
+            gouts = tuple(got) if nf.nout > 1 else (got,)
+            if len(wouts) != len(gouts):
+                FAILURES.append((label, f"port returned {len(gouts)} outputs, "
+                                        f"numpy {len(wouts)}"))
+                continue
+            for k, (w, g) in enumerate(zip(wouts, gouts)):
+                suffix = f"[out{k}]" if nf.nout > 1 else ""
+                wr, gr = raw(w), _safe(lambda: raw(g))
+                if not isinstance(gr, tuple):
+                    FAILURES.append((label + suffix, f"result unreadable: {gr}"))
+                    continue
+                if wr[:2] != gr[:2]:
+                    FAILURES.append((
+                        label + suffix,
+                        f"dtype/shape {gr[:2]} != numpy's {wr[:2]}"))
+                    continue
+                if wr[2] == gr[2]:
+                    continue
+                nan_ok = name in TRANSCENDENTAL
+                if not nan_ok or not _nan_tolerant_equal(w, g):
+                    FAILURES.append((label + suffix,
+                                     _bit_diff(w, g, vals, nf.nin, nan_ok)))
+
+            # Emitted warnings must match exactly, message text included.
+            CHECKS += 1
+            if want_warn != got_warn:
+                FAILURES.append((f"{label} warnings",
+                                 f"port {got_warn} != numpy {want_warn}"))
+
+
+def _bit_diff(want, got, vals, nin, nan_ok=False):
+    """Point at the first differing element, with the inputs that produced it.
+
+    With `nan_ok`, positions where both sides are NaN are skipped, so the
+    message points at a real numeric divergence rather than a payload bit.
+    """
+    w = np.asarray(want)
+    g = np.frombuffer(_tobytes(got), dtype=w.dtype).reshape(w.shape)
+    flat_w, flat_g = w.ravel(), g.ravel()
+    both_nan = (np.isnan(flat_w) & np.isnan(flat_g)) if w.dtype.kind in "fc" \
+        else np.zeros(flat_w.shape, bool)
+    for i in range(flat_w.size):
+        if nan_ok and both_nan[i]:
+            continue
+        if flat_w[i:i + 1].tobytes() != flat_g[i:i + 1].tobytes():
+            idx = np.unravel_index(i, w.shape)
+            if nin == 1:
+                args = f"x={vals[idx[0]]!r}"
+            else:
+                args = f"x={vals[idx[0]]!r}, y={vals[idx[1]]!r}"
+            return (f"{args}: port {flat_g[i]!r} "
+                    f"(0x{flat_g[i:i + 1].tobytes().hex()}) != numpy "
+                    f"{flat_w[i]!r} (0x{flat_w[i:i + 1].tobytes().hex()})")
+    return "bytes differ"
+
+
+# --------------------------------------------------------------------------
+# 5. ULP measurement for the transcendentals
+# --------------------------------------------------------------------------
+
+#: (function, (lo, hi) domain per argument). Binary functions get two ranges.
+ULP_FUNCS = [
+    ("exp", [(-700.0, 700.0)]),
+    ("exp2", [(-1000.0, 1000.0)]),
+    ("expm1", [(-30.0, 30.0)]),
+    ("log", [(1e-300, 1e300)]),
+    ("log2", [(1e-300, 1e300)]),
+    ("log10", [(1e-300, 1e300)]),
+    ("log1p", [(-0.999, 1e6)]),
+    ("sin", [(-100.0, 100.0)]),
+    ("cos", [(-100.0, 100.0)]),
+    ("tan", [(-100.0, 100.0)]),
+    ("arcsin", [(-1.0, 1.0)]),
+    ("arccos", [(-1.0, 1.0)]),
+    ("arctan", [(-1e6, 1e6)]),
+    ("sinh", [(-700.0, 700.0)]),
+    ("cosh", [(-700.0, 700.0)]),
+    ("tanh", [(-20.0, 20.0)]),
+    ("arcsinh", [(-1e6, 1e6)]),
+    ("arccosh", [(1.0, 1e6)]),
+    ("arctanh", [(-1.0, 1.0)]),
+    ("cbrt", [(-1e6, 1e6)]),
+    ("sqrt", [(0.0, 1e300)]),
+    ("hypot", [(-1e150, 1e150), (-1e150, 1e150)]),
+    ("arctan2", [(-1e6, 1e6), (-1e6, 1e6)]),
+    ("power", [(0.0, 100.0), (-20.0, 20.0)]),
+    ("float_power", [(0.0, 100.0), (-20.0, 20.0)]),
+]
+
+
+def _ordered_bits(a):
+    """Map IEEE floats to a monotonically increasing unsigned integer.
+
+    Adjacent representable floats map to adjacent integers, so |difference| is
+    the ULP distance. -0.0 and +0.0 map to the same integer, as they should.
+    """
+    n = a.dtype.itemsize * 8
+    ut = {16: np.uint16, 32: np.uint32, 64: np.uint64}[n]
+    u = a.view(ut).astype(np.uint64)
+    sign = np.uint64(1) << np.uint64(n - 1)
+    mag = u & (sign - np.uint64(1))
+    neg = (u & sign) != 0
+    return np.where(neg, sign - mag, sign + mag)
+
+
+def _ulp_distance(want, got):
+    """Elementwise ULP distance, with NaN/inf mismatches flagged separately."""
+    w = np.asarray(want)
+    g = np.frombuffer(_tobytes(got), dtype=w.dtype).reshape(w.shape)
+    nan_w, nan_g = np.isnan(w), np.isnan(g)
+    mismatched_nan = nan_w != nan_g
+    ow, og = _ordered_bits(w), _ordered_bits(g)
+    d = np.where(ow > og, ow - og, og - ow)
+    d = np.where(nan_w & nan_g, np.uint64(0), d)
+    return d, mismatched_nan, w, g
+
+
+def _edge_values(lo, hi, dtype):
+    """A dense edge-case vector inside [lo, hi] for a dtype."""
+    fi = np.finfo(dtype)
+    lo = max(lo, -float(fi.max))
+    hi = min(hi, float(fi.max))
+    cand = [lo, hi, 0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0,
+            float(fi.tiny), -float(fi.tiny), float(fi.eps), -float(fi.eps),
+            1.0 + float(fi.eps), 1.0 - float(fi.eps),
+            math.pi, -math.pi, math.pi / 2, -math.pi / 2, math.pi / 4,
+            2 * math.pi, 3 * math.pi / 2, math.e, 1 / math.e,
+            1e-6, 1e-3, 10.0, 100.0, 1e3, 1e6]
+    # A dense sweep of the domain, plus the two representable neighbours of
+    # each endpoint (where the last bit of the implementation usually shows).
+    for k in range(257):
+        cand.append(lo + (hi - lo) * k / 256.0)
+    for k in range(-30, 31):
+        cand.append(math.ldexp(1.0, k))
+        cand.append(-math.ldexp(1.0, k))
+    vals = sorted({float(v) for v in cand
+                   if lo <= v <= hi and math.isfinite(v)})
+    a = np.array(vals, dtype=dtype)
+    extra = np.array([np.nextafter(a.dtype.type(lo), a.dtype.type(hi)),
+                      np.nextafter(a.dtype.type(hi), a.dtype.type(lo))],
+                     dtype=dtype)
+    return np.unique(np.concatenate([a, extra]))
+
+
+def check_ulp(n_random=200_000):
+    """Max ULP difference vs real numpy over random and edge-case inputs."""
+    global CHECKS
+
+    for dtype_name in ["float64", "float32"]:
+        dt = np.dtype(dtype_name)
+        rng = np.random.default_rng(20260816)
+        for fname, domains in ULP_FUNCS:
+            nf, gf = getattr(np, fname, None), getattr(rnp, fname, None)
+            if nf is None or gf is None:
+                continue
+            worst = 0
+            worst_at = None
+            bad_nan = 0
+            skipped = False
+            for kind in ("random", "edge"):
+                if kind == "random":
+                    args = []
+                    # Clamp to the dtype's own range so float32 sampling does
+                    # not simply saturate to inf and stop measuring anything.
+                    fmax = float(np.finfo(dt).max)
+                    for lo, hi in domains:
+                        lo, hi = max(lo, -fmax), min(hi, fmax)
+                        # Log-uniform where the domain spans many decades, so
+                        # the small end is not swamped by the large end.
+                        if hi > 0 and lo >= 0 and hi / max(lo, 1e-320) > 1e6:
+                            u = rng.uniform(math.log(max(lo, 1e-300)),
+                                            math.log(hi), n_random)
+                            v = np.exp(u)
+                        elif lo < 0 < hi and hi > 1e6:
+                            u = rng.uniform(0.0, math.log(hi), n_random)
+                            v = np.exp(u) * rng.choice([-1.0, 1.0], n_random)
+                        else:
+                            v = rng.uniform(lo, hi, n_random)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            with np.errstate(all="ignore"):
+                                args.append(v.astype(dt))
+                else:
+                    edges = [_edge_values(lo, hi, dt) for lo, hi in domains]
+                    if len(edges) == 1:
+                        args = edges
+                    else:
+                        # Cross product, trimmed so the table stays small.
+                        a = edges[0][::max(1, len(edges[0]) // 64)]
+                        b = edges[1][::max(1, len(edges[1]) // 64)]
+                        args = [np.repeat(a, len(b)),
+                                np.tile(b, len(a))]
+                port_args = [to_port(a) for a in args]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with np.errstate(all="ignore"):
+                        want = nf(*args)
+                        gkind, got = attempt(lambda: gf(*port_args))
+                if gkind == "notyet":
+                    NOT_YET.append((f"ulp {fname}", got))
+                    skipped = True
+                    break
+                if gkind != "ok":
+                    FAILURES.append((f"ulp {fname} {dtype_name} ({kind})",
+                                     f"port raised {got}"))
+                    skipped = True
+                    break
+                d, mismatched_nan, w, g = _ulp_distance(want, got)
+                bad_nan += int(mismatched_nan.sum())
+                if mismatched_nan.any():
+                    i = int(np.argmax(mismatched_nan))
+                    FAILURES.append((
+                        f"ulp {fname} {dtype_name} ({kind}) NaN",
+                        f"x={args[0].ravel()[i]!r}: port {g.ravel()[i]!r} != "
+                        f"numpy {w.ravel()[i]!r}"))
+                if d.size:
+                    i = int(np.argmax(d))
+                    if int(d.ravel()[i]) > worst:
+                        worst = int(d.ravel()[i])
+                        worst_at = (kind, [float(a.ravel()[i]) for a in args],
+                                    float(g.ravel()[i]), float(w.ravel()[i]))
+            if skipped:
+                continue
+            ULP_ROWS.append((fname, dtype_name, worst, worst_at))
+            CHECKS += 1
+            if worst > 4:
+                at = ""
+                if worst_at:
+                    at = (f" at {worst_at[0]} x={worst_at[1]}: port "
+                          f"{worst_at[2]!r} != numpy {worst_at[3]!r}")
+                FAILURES.append((f"ulp {fname} {dtype_name}",
+                                 f"max ULP {worst} > 4{at}"))
+
+
+# --------------------------------------------------------------------------
+# 6. ufunc method parity
+# --------------------------------------------------------------------------
+
+METHOD_UFUNCS = ["add", "multiply", "minimum", "maximum",
+                 "logical_and", "logical_or", "bitwise_and", "bitwise_or"]
+
+
+def check_ufunc_methods():
+    """reduce/accumulate/outer/reduceat, plus every ufunc's introspection."""
+    global CHECKS
+
+    # ---- introspection attributes, for every ufunc numpy has ------------
+    for name in sorted(n for n in dir(np)
+                       if isinstance(getattr(np, n, None), np.ufunc)):
+        nf = getattr(np, name)
+        gf = getattr(rnp, name, None)
+        if gf is None:
+            continue
+        # numpy's C99 spellings (acos, pow, ...) are aliases of the same ufunc
+        # object, so `np.acos.__name__` is "arccos"; the port must agree.
+        eq(f"np.{name}.__name__", nf.__name__, getattr(gf, "__name__", "<missing>"))
+        for attr in ["nin", "nout", "nargs", "identity", "ntypes"]:
+            eq(f"{name}.{attr}", getattr(nf, attr), getattr(gf, attr, "<missing>"))
+        eq(f"{name}.types", list(nf.types), list(getattr(gf, "types", [])))
+
+    rng = random.Random(97531)
+    shapes = [(12,), (4, 5), (3, 4, 2), (1, 7), (6, 1)]
+    dtypes = ["int32", "int64", "float64", "float32", "bool"]
+
+    for name in METHOD_UFUNCS:
+        nf, gf = getattr(np, name), getattr(rnp, name, None)
+        CHECKS += 1
+        if gf is None:
+            FAILURES.append((f"ufunc {name}", "missing from the shim"))
+            continue
+        for dt in dtypes:
+            if name.startswith("bitwise") and dt.startswith("float"):
+                continue  # numpy has no float loop; covered by the table above
+            for shape in shapes:
+                base = sample(rng, dt, int(np.prod(shape))).reshape(shape)
+                port = to_port(base.ravel()).reshape(shape)
+                other = sample(rng, dt, 5)
+                p_other = to_port(other)
+
+                axes = [None] + list(range(len(shape)))
+                for axis in axes:
+                    for keepdims in (False, True):
+                        kws = [{}]
+                        if name in ("add", "multiply", "minimum", "maximum") \
+                                and dt != "bool":
+                            kws.append({"initial": 1})
+                        for extra in kws:
+                            kw = dict(axis=axis, keepdims=keepdims, **extra)
+                            _cmp_method(f"{name}.reduce({dt}{shape}, {kw})",
+                                        lambda k=kw: nf.reduce(base, **k),
+                                        lambda k=kw: gf.reduce(port, **k))
+                    # `where` needs an identity or an explicit initial.
+                    mask = np.array(
+                        [rng.random() < 0.6 for _ in range(base.size)]
+                    ).reshape(shape)
+                    kw = dict(axis=axis, where=mask)
+                    if nf.identity is None:
+                        kw["initial"] = 0 if dt != "bool" else False
+                    _cmp_method(
+                        f"{name}.reduce({dt}{shape}, axis={axis}, where=...)",
+                        lambda k=kw, m=mask: nf.reduce(base, **k),
+                        lambda k=kw, m=mask: gf.reduce(
+                            port, **{**k, "where": to_port(m)}))
+
+                for axis in range(len(shape)):
+                    _cmp_method(f"{name}.accumulate({dt}{shape}, axis={axis})",
+                                lambda a=axis: nf.accumulate(base, axis=a),
+                                lambda a=axis: gf.accumulate(port, axis=a))
+
+                flat = base.ravel()
+                p_flat = to_port(flat)
+                _cmp_method(f"{name}.outer({dt}{shape})",
+                            lambda: nf.outer(flat, other),
+                            lambda: gf.outer(p_flat, p_other))
+
+                n = shape[0]
+                idx = np.array(sorted({rng.randrange(0, n) for _ in range(3)}),
+                               dtype=np.intp)
+                _cmp_method(f"{name}.reduceat({dt}{shape}, {idx.tolist()})",
+                            lambda i=idx: nf.reduceat(base, i),
+                            lambda i=idx: gf.reduceat(port, to_port(i)))
+
+
+def _cmp_method(label, want_fn, got_fn):
+    """Run a ufunc method on both sides and compare value, dtype and shape."""
+    global CHECKS
+    CHECKS += 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with np.errstate(all="ignore"):
+            wkind, want = attempt(want_fn)
+            gkind, got = attempt(got_fn)
+    if gkind == "notyet":
+        NOT_YET.append((label, got))
+        return
+    if wkind != gkind:
+        FAILURES.append((label, f"port {gkind}:{got!r}, numpy {wkind}:{want!r}"))
+        return
+    if wkind == "exc":
+        eq(f"{label} raises", want, got)
+        return
+    wr, gr = raw(want), _safe(lambda: raw(got))
+    if not isinstance(gr, tuple):
+        FAILURES.append((label, f"result unreadable: {gr}"))
+        return
+    if wr[:2] != gr[:2]:
+        FAILURES.append((label, f"dtype/shape {gr[:2]} != numpy's {wr[:2]}"))
+        return
+    if wr[2] != gr[2] and not _nan_tolerant_equal(want, got):
+        # Decode the port's bytes through numpy so the message is readable even
+        # when the port object itself does not support the array protocol.
+        gv = np.frombuffer(gr[2], dtype=wr[0]).reshape(wr[1])
+        FAILURES.append((label, f"values differ: port {gv.ravel()[:6]} "
+                                f"vs numpy {np.asarray(want).ravel()[:6]}"))
+
+
+# --------------------------------------------------------------------------
+# 7. errstate parity
+# --------------------------------------------------------------------------
+
+#: (label, category, expression). Each expression is built separately for each
+#: library so no array is ever shared between them.
+ERRSTATE_CASES = [
+    ("1/0 float64", "divide",
+     lambda m, mk: m.divide(mk([1.0]), mk([0.0]))),
+    ("-1/0 float64", "divide",
+     lambda m, mk: m.divide(mk([-1.0]), mk([0.0]))),
+    ("1//0 int64", "divide",
+     lambda m, mk: m.floor_divide(mk([1], "int64"), mk([0], "int64"))),
+    ("1%0 int64", "divide",
+     lambda m, mk: m.remainder(mk([1], "int64"), mk([0], "int64"))),
+    ("log(0)", "divide", lambda m, mk: m.log(mk([0.0]))),
+    ("exp(1000)", "over", lambda m, mk: m.exp(mk([1000.0]))),
+    ("3e38*3e38 f32", "over",
+     lambda m, mk: m.multiply(mk([3e38], "float32"), mk([3e38], "float32"))),
+    ("1e308+1e308", "over", lambda m, mk: m.add(mk([1e308]), mk([1e308]))),
+    ("sqrt(-1)", "invalid", lambda m, mk: m.sqrt(mk([-1.0]))),
+    ("0/0", "invalid", lambda m, mk: m.divide(mk([0.0]), mk([0.0]))),
+    ("inf-inf", "invalid",
+     lambda m, mk: m.subtract(mk([float("inf")]), mk([float("inf")]))),
+    ("log(-1)", "invalid", lambda m, mk: m.log(mk([-1.0]))),
+    ("arcsin(2)", "invalid", lambda m, mk: m.arcsin(mk([2.0]))),
+    ("inf*0", "invalid",
+     lambda m, mk: m.multiply(mk([float("inf")]), mk([0.0]))),
+    ("1e-320*1e-10", "under",
+     lambda m, mk: m.multiply(mk([1e-320]), mk([1e-10]))),
+]
+
+
+def check_errstate():
+    """Warn / raise / ignore behaviour and the exact message text."""
+    global CHECKS
+
+    def run(mod, mk, expr, category, setting):
+        with warnings.catch_warnings(record=True) as log:
+            warnings.simplefilter("always")
+            try:
+                with mod.errstate(**{category: setting}):
+                    value = expr(mod, mk)
+                outcome = ("value", raw(value))
+            except NotImplementedError as exc:  # noqa: BLE001
+                return ("notyet", f"{exc}"[:120]), []
+            except Exception as exc:  # noqa: BLE001
+                outcome = ("raised", type(exc).__name__, str(exc))
+        return outcome, _record_warnings(log)
+
+    def np_mk(values, dt="float64"):
+        return np.array(values, dtype=dt)
+
+    def rp_mk(values, dt="float64"):
+        return to_port(np.array(values, dtype=dt))
+
+    for label, category, expr in ERRSTATE_CASES:
+        for setting in ["warn", "raise", "ignore"]:
+            name = f"errstate({category}={setting!r}) {label}"
+            want, want_warn = run(np, np_mk, expr, category, setting)
+            got, got_warn = run(rnp, rp_mk, expr, category, setting)
+            CHECKS += 1
+            if got[0] == "notyet":
+                NOT_YET.append((name, got[1]))
+                continue
+            if want[0] != got[0]:
+                FAILURES.append((name, f"port {got[0]}, numpy {want[0]}"))
+                continue
+            if want[0] == "raised":
+                eq(f"{name} exception", want[1:], got[1:])
+            else:
+                eq(f"{name} result", want[1], got[1])
+            eq(f"{name} warnings", want_warn, got_warn)
+
+    # The aggregate settings (all=..., seterr/geterr round trip) too.
+    for setting in ["warn", "raise", "ignore", "print"]:
+        CHECKS += 1
+        try:
+            with np.errstate(all=setting):
+                want = dict(np.geterr())
+        except Exception as exc:  # noqa: BLE001
+            want = type(exc).__name__
+        try:
+            with rnp.errstate(all=setting):
+                got = dict(rnp.geterr())
+        except Exception as exc:  # noqa: BLE001
+            got = type(exc).__name__
+        if want != got:
+            FAILURES.append((f"errstate(all={setting!r}) geterr",
+                             f"port {got!r} != numpy {want!r}"))
+
+
+def run_m3_sections():
+    """All the M3 sections, each isolated so one crash cannot hide the rest."""
+    if not load_shim():
+        FAILURES.append(("M3 shim import", SHIM_IMPORT_ERROR or "unavailable"))
+        return
+    sections = [
+        ("scalar types", check_scalar_types),
+        ("scalar values", check_scalar_values),
+        ("element extraction", check_element_extraction),
+        ("ufunc tables", check_ufunc_tables),
+        ("ufunc methods", check_ufunc_methods),
+        ("errstate", check_errstate),
+        ("ulp", check_ulp),
+    ]
+    for name, fn in sections:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            FAILURES.append((f"M3 section {name}",
+                             "crashed: " + traceback.format_exc()
+                             .strip().splitlines()[-1]))
+
+
+def print_m3_report():
+    """The ULP table and the not-yet-implemented list, ready for PLAN.md."""
+    if ULP_ROWS:
+        print()
+        print("ULP table (port vs numpy 2.5.2; max over 200k random + dense edges)")
+        print("| function    | dtype   |        max_ulp |")
+        print("|-------------|---------|----------------|")
+        for fname, dtype_name, worst, _at in ULP_ROWS:
+            print(f"| {fname:<11} | {dtype_name:<7} | {worst:>14} |")
+        worst_rows = [r for r in ULP_ROWS if r[2] > 4]
+        if worst_rows:
+            print()
+            print("ULP outliers (> 4 ULP):")
+            for fname, dtype_name, worst, at in worst_rows:
+                loc = "" if at is None else (f" worst at {at[0]} x={at[1]}: "
+                                             f"port {at[2]!r} vs numpy {at[3]!r}")
+                print(f"  {fname} {dtype_name}: {worst} ULP{loc}")
+    if NOT_YET:
+        print()
+        seen = {}
+        for label, reason in NOT_YET:
+            seen.setdefault(label, reason)
+        print(f"not-yet-implemented in the port ({len(seen)}):")
+        for label in sorted(seen):
+            print(f"  SKIP {label}: {seen[label]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=20260816)
@@ -884,9 +1859,13 @@ def main():
             FAILURES.append((f"error {label}",
                              f"port raised {port_exc}, numpy raised {np_exc}"))
 
+    # ---- scalar types and ufunc machinery (M3) ---------------------------
+    run_m3_sections()
+
     print(f"{CHECKS} comparisons, {len(FAILURES)} divergences")
     for name, msg in FAILURES:
         print(f"  FAIL {name}: {msg}")
+    print_m3_report()
     return 1 if FAILURES else 0
 
 

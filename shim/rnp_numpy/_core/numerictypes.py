@@ -31,6 +31,7 @@ from rnp_numpy import (  # noqa: F401
     integer,
     intp,
     long,
+    longdouble,
     longlong,
     number,
     short,
@@ -47,21 +48,20 @@ from rnp_numpy import (  # noqa: F401
     uintp,
     ulong,
     ulonglong,
+    clongdouble,
     unsignedinteger,
     ushort,
     void,
+    typecodes,
+    datetime64,
+    timedelta64,
+    object_,
 )
 
 sctypeDict = _np.sctypeDict
 
 #: numpy's grouping of the concrete scalar types by category.
-sctypes = {
-    'int': [int8, int16, int32, int64],
-    'uint': [uint8, uint16, uint32, uint64],
-    'float': [float16, float32, float64],
-    'complex': [complex64, complex128],
-    'others': [_np.bool_, object, bytes, str, _np.void],
-}
+sctypes = _np.sctypes
 
 ScalarType = _np.ScalarType
 

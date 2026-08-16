@@ -22,6 +22,20 @@ pub fn register_scalar_types(d: Bound<'_, PyDict>) {
     let _ = SCALAR_TYPES.set(d.unbind());
 }
 
+/// The Python scalar class the shim registered for a storage dtype, if any.
+pub fn scalar_class<'py>(py: Python<'py>, dt: DType) -> Option<Bound<'py, PyAny>> {
+    let key: String = match dt {
+        DType::Bytes(_) => "bytes_".into(),
+        DType::Str(_) => "str_".into(),
+        DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => "void".into(),
+        DType::Object => "object_".into(),
+        d => d.name(),
+    };
+    SCALAR_TYPES
+        .get()
+        .and_then(|m| m.bind(py).get_item(key).ok().flatten())
+}
+
 #[pyclass(name = "dtype", module = "_rnp", frozen, from_py_object)]
 #[derive(Clone, Copy)]
 pub struct PyDType {
@@ -354,6 +368,23 @@ impl PyDType {
     /// `dtype.type`: the scalar class, looked up in the shim's registry.
     #[getter]
     fn r#type<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        // The C-type aliases keep their own scalar class: `np.dtype('q').type`
+        // is `np.longlong`, not `np.int64`, even though the two dtypes compare
+        // equal.
+        let alias_key = match self.d.alias {
+            rnp_core::descr::Alias::LongLong => Some("longlong"),
+            rnp_core::descr::Alias::ULongLong => Some("ulonglong"),
+            rnp_core::descr::Alias::LongDouble => Some("longdouble"),
+            rnp_core::descr::Alias::CLongDouble => Some("clongdouble"),
+            _ => None,
+        };
+        if let Some(k) = alias_key {
+            if let Some(map) = SCALAR_TYPES.get() {
+                if let Some(t) = map.bind(py).get_item(k)? {
+                    return Ok(Some(t));
+                }
+            }
+        }
         let key: String = match self.d.dt {
             DType::Bytes(_) => "bytes_".into(),
             DType::Str(_) => "str_".into(),

@@ -68,6 +68,24 @@ pub fn shape_size(shape: &[isize]) -> usize {
     shape.iter().map(|&d| d.max(0) as usize).product()
 }
 
+/// The element count, or `None` when the product overflows.
+///
+/// The unchecked [`shape_size`] is what every in-bounds walk uses; this one
+/// guards *allocation*, where `np.zeros([975] * 7)` would otherwise wrap to a
+/// small number, hand a bogus length to the allocator and abort the process.
+pub fn checked_shape_size(shape: &[isize]) -> Option<usize> {
+    let mut n: usize = 1;
+    for &d in shape {
+        n = n.checked_mul(d.max(0) as usize)?;
+    }
+    Some(n)
+}
+
+/// numpy's message when a requested array cannot be represented.
+fn too_big() -> Error {
+    Error::ValueError("array is too big; `arr.size * arr.dtype.itemsize` is larger than the maximum possible size.".into())
+}
+
 /// Contiguity test using numpy's rules: dimensions of length <= 1 impose no
 /// stride constraint, and a zero-sized array is both C- and F-contiguous.
 pub fn is_c_contiguous(shape: &[isize], strides: &[isize], itemsize: usize) -> bool {
@@ -102,14 +120,17 @@ pub fn is_f_contiguous(shape: &[isize], strides: &[isize], itemsize: usize) -> b
     true
 }
 
-/// The port has no Python-object storage, so `object` dtypes exist only as
-/// descriptors.
-pub fn check_storable(dtype: DType) -> Result<()> {
-    if dtype.is_object() {
-        return Err(Error::NotImplemented(
-            "rnp cannot create arrays of the object dtype".into(),
-        ));
-    }
+/// Every dtype the engine can allocate.
+///
+/// `object` arrays store an 8-byte *handle* into the interning slab that
+/// lives on the Python side (`rnp-python/src/objects.rs`); slot 0 is `None`,
+/// which is why a zeroed object array reads back as `None` just like numpy's.
+/// The largest allocation the port will attempt, mirroring numpy's own
+/// refusal to try (it raises rather than letting the allocator fail): half of
+/// the 64-bit address space is far beyond any real machine.
+const MAX_ALLOC: usize = 1usize << 47;
+
+pub fn check_storable(_dtype: DType) -> Result<()> {
     Ok(())
 }
 
@@ -158,9 +179,10 @@ impl NdArray {
                 ));
             }
         }
-        let n = shape_size(&shape)
-            .checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ValueError("array is too big".into()))?;
+        let n = checked_shape_size(&shape)
+            .and_then(|n| n.checked_mul(dtype.itemsize()))
+            .filter(|&n| n <= MAX_ALLOC)
+            .ok_or_else(too_big)?;
         let strides = c_strides(&shape, dtype.itemsize());
         let mut a = NdArray {
             buffer: Arc::new(Buffer::uninitialized(n)),
@@ -189,9 +211,10 @@ impl NdArray {
                 ));
             }
         }
-        let n = shape_size(&shape)
-            .checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ValueError("array is too big".into()))?;
+        let n = checked_shape_size(&shape)
+            .and_then(|n| n.checked_mul(dtype.itemsize()))
+            .filter(|&n| n <= MAX_ALLOC)
+            .ok_or_else(too_big)?;
         let strides = c_strides(&shape, dtype.itemsize());
         let mut a = NdArray {
             buffer: Arc::new(Buffer::zeroed(n)),
