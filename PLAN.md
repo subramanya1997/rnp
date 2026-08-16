@@ -77,3 +77,12 @@ benchmark run, Fable review, git commit.
 ## Status log
 
 - 2026-08-16: repo initialized, upstream v2.5.2 cloned, venv ready. M0 started.
+- 2026-08-16: M0 complete (Opus build, Fable verified). cargo test 46/46;
+  crosscheck 537/537 vs real numpy 2.5.2; test_shape_base 20/212; elementwise
+  benchmarks ~1.0-1.6x numpy (reductions still Python placeholders). Notable
+  fidelity work: FMA-contracted arange, Smith's algorithm for complex divide,
+  NEP 50 promotion computed from rules and tested against the generated table.
+- 2026-08-16: M1 started (Opus). Scope: dtype constructor breadth (byte order,
+  S/U/V, structured basics so test_dtype.py collects), promote_types/
+  result_type/can_cast/min_scalar_type, and native Rust full reductions
+  (sum/prod/min/max) to retire the placeholder 550x benchmark rows.
