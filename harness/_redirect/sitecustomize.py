@@ -46,3 +46,32 @@ class _NumpyRedirector(importlib.abc.MetaPathFinder):
 
 if not any(isinstance(f, _NumpyRedirector) for f in sys.meta_path):
     sys.meta_path.insert(0, _NumpyRedirector())
+
+
+# ---------------------------------------------------------------------------
+# Bind `numpy` in sys.modules eagerly.
+#
+# The meta-path finder above is enough for `_core`, whose test directory is not
+# a package: pytest imports those files under a bare module name and every
+# `import numpy` inside them goes through the finder.
+#
+# `lib/`, `ma/` and `polynomial/` tests DO have an `__init__.py`, so pytest
+# resolves e.g. `polynomial/tests/test_polyutils.py` to the dotted name
+# `numpy.polynomial.tests.test_polyutils`.  In `--import-mode=importlib`,
+# pytest materialises each *parent* of that name itself
+# (`_pytest.pathlib._import_module_using_spec`): for a parent not already in
+# `sys.modules` it builds a spec with `spec_from_file_location` against the
+# `__init__.py` it found on disk, which never consults `sys.meta_path`.  The
+# real `upstream/numpy/__init__.py` therefore gets executed, dies on its first
+# `from . import version`, and the whole file is scored zero as a collection
+# error.
+#
+# pytest checks `sys.modules.get(parent_module_name)` first, so binding the
+# alias here — before pytest starts — makes it reuse the shim instead.  This
+# has to happen at interpreter startup; doing it at the end of the shim's own
+# `__init__` is too late, because by then pytest has already begun importing
+# the upstream package.
+# ---------------------------------------------------------------------------
+
+if _PREFIX not in sys.modules:
+    sys.modules[_PREFIX] = importlib.import_module(_TARGET)
