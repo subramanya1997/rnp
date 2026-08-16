@@ -20,12 +20,47 @@ use convert::{any_scalar, array_from_any, scalar_from_py};
 use pyarray::{dtype_or_default, shape_from_any, ufunc2, PyNdArray};
 use pydtype::{descr_from_any, dtype_from_any, PyDType};
 
+/// Python exception constructors the shim installs at import time, keyed by
+/// the engine error they build. The engine only knows names and dtypes; the
+/// shim owns the classes (`numpy._core._exceptions`) and the ufunc objects.
+static ERROR_FACTORIES: std::sync::OnceLock<Py<PyDict>> = std::sync::OnceLock::new();
+
+/// Install the shim's exception factories. Called once from
+/// `rnp_numpy._core._exceptions`.
+#[pyfunction]
+fn _set_error_factories(d: Py<PyDict>) {
+    let _ = ERROR_FACTORIES.set(d);
+}
+
+/// Build numpy's `_UFuncNoLoopError` through the shim's factory, falling back
+/// to the engine's own message when the shim has not registered one (which
+/// happens only if `_rnp` is used without the shim).
+fn ufunc_no_loop_err(ufunc: String, dtypes: Vec<String>, fallback: String) -> PyErr {
+    Python::attach(|py| {
+        let Some(d) = ERROR_FACTORIES.get() else {
+            return PyTypeError::new_err(fallback);
+        };
+        match d.bind(py).get_item("ufunc_no_loop") {
+            Ok(Some(f)) => match f.call1((ufunc, dtypes)) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(e) => e,
+            },
+            _ => PyTypeError::new_err(fallback),
+        }
+    })
+}
+
 /// Map a core error onto the Python exception numpy would raise.
 pub(crate) fn err(e: rnp_core::Error) -> PyErr {
     match e {
         rnp_core::Error::ValueError(m) => PyValueError::new_err(m),
         rnp_core::Error::TypeError(m) => PyTypeError::new_err(m),
         rnp_core::Error::IndexError(m) => PyIndexError::new_err(m),
+        rnp_core::Error::UFuncNoLoop {
+            ufunc,
+            dtypes,
+            message,
+        } => ufunc_no_loop_err(ufunc, dtypes, message),
         // The shim re-raises these as np.exceptions.AxisError /
         // DTypePromotionError, both of which numpy derives from ValueError.
         rnp_core::Error::AxisError(m) => PyValueError::new_err(m),
@@ -473,6 +508,12 @@ fn mean<'py>(
     arr.bind(py).call_method("mean", (), Some(&kwargs))
 }
 
+/// Install the shim's per-dtype `_wrap` callables for the scalar fast path.
+#[pyfunction]
+fn _register_scalar_wraps(wraps: Vec<Py<PyAny>>) {
+    pydtype::register_scalar_wraps(wraps);
+}
+
 /// Install the shim's `name -> scalar class` map behind `dtype.type`.
 #[pyfunction]
 fn _register_scalar_types(types: &Bound<'_, PyDict>) {
@@ -507,6 +548,8 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(itemsel::where_, m)?)?;
     m.add_function(wrap_pyfunction!(itemsel::broadcast_to, m)?)?;
     m.add_function(wrap_pyfunction!(itemsel::_as_strided, m)?)?;
+
+    m.add_function(wrap_pyfunction!(_set_error_factories, m)?)?;
 
     m.add_function(wrap_pyfunction!(zeros, m)?)?;
     m.add_function(wrap_pyfunction!(ones, m)?)?;
@@ -544,6 +587,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(result_type, m)?)?;
     m.add_function(wrap_pyfunction!(_dtype_table, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_types, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_scalar_wraps, m)?)?;
     ufuncs::register(m)?;
 
     m.add("__version__", "0.1.0")?;

@@ -111,6 +111,9 @@ pub fn npscalar_to_py<'py>(
         };
         return Ok(crate::objects::resolve(py, h));
     }
+    if let Some(w) = crate::pydtype::scalar_wrap(py, dt) {
+        return w.call1((scalar_to_py(py, s)?,));
+    }
     match crate::pydtype::scalar_class(py, dt) {
         Some(cls) => cls.call_method1(pyo3::intern!(py, "_wrap"), (scalar_to_py(py, s)?,)),
         None => scalar_to_py(py, s),

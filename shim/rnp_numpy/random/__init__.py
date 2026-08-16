@@ -16,6 +16,22 @@ def seed(s=None):
     _rng.seed(s)
 
 
+def get_state(legacy=True):
+    """Snapshot the global generator.
+
+    numpy hands back the MT19937 key tuple; this port's generator is the
+    stdlib Mersenne Twister rather than numpy's own stream (see the module
+    docstring), so its state is what gets returned.  Callers -- hypothesis's
+    `deterministic_PRNG` among them -- only ever round-trip the value through
+    `set_state`, which is what makes the substitution safe.
+    """
+    return _rng.getstate()
+
+
+def set_state(state):
+    _rng.setstate(state)
+
+
 def _shape(size):
     if size is None:
         return ()

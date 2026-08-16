@@ -305,6 +305,42 @@ impl Acc {
         }
     }
 
+    /// The accumulator numpy starts a reduction from: the identity, or the
+    /// caller's `initial=` when there is one.
+    fn seeded(dt: DType, seed: Option<Scalar>) -> Acc {
+        let Some(s) = seed else { return Acc::zero(dt) };
+        match Acc::zero(dt) {
+            Acc::Int(_) => Acc::Int(match s.cast(DType::I64) {
+                Scalar::Int(v) => v,
+                _ => 0,
+            }),
+            Acc::Uint(_) => Acc::Uint(match s.cast(DType::U64) {
+                Scalar::Uint(v) => v,
+                _ => 0,
+            }),
+            Acc::F16(_) => Acc::F16(match s.cast(DType::F16) {
+                Scalar::Float(v) => v as f32,
+                _ => 0.0,
+            }),
+            Acc::F32(_) => Acc::F32(match s.cast(DType::F32) {
+                Scalar::Float(v) => v as f32,
+                _ => 0.0,
+            }),
+            Acc::F64(_) => Acc::F64(match s.cast(DType::F64) {
+                Scalar::Float(v) => v,
+                _ => 0.0,
+            }),
+            Acc::C64(_) => Acc::C64(match s.cast(DType::C64) {
+                Scalar::Complex(c) => C32::new(c.re as f32, c.im as f32),
+                _ => C32::new(0.0, 0.0),
+            }),
+            Acc::C128(_) => Acc::C128(match s.cast(DType::C128) {
+                Scalar::Complex(c) => c,
+                _ => C64v::new(0.0, 0.0),
+            }),
+        }
+    }
+
     fn add(self, o: Acc) -> Acc {
         match (self, o) {
             (Acc::Int(a), Acc::Int(b)) => Acc::Int(a.wrapping_add(b)),
@@ -663,6 +699,57 @@ where
     total
 }
 
+/// Sum one strided run under numpy's `where=` mask.
+///
+/// numpy does *not* reduce a masked operand by substituting the identity into
+/// the pairwise tree, and it does not compress-then-reduce either. Its masked
+/// strided loop (`generic_masked_strided_loop`, `array_method.c`) walks the
+/// mask with `npy_memchr` and hands the *unmasked* inner loop each maximal
+/// contiguous run of set mask values in turn. So the pairwise tree is rebuilt
+/// per run and the run totals are folded into the accumulator sequentially,
+/// which is exactly why a masked sum differs from either of the two obvious
+/// models in the last bits.
+///
+/// `m` holds the mask value of each of the `n` elements, in run order.
+///
+/// # Safety
+/// As `sum_run`.
+unsafe fn sum_run_masked(
+    arr: &NdArray,
+    off: isize,
+    n: usize,
+    stride: isize,
+    start: Acc,
+    m: &[bool],
+) -> Acc {
+    let mut acc = start;
+    let mut i = 0usize;
+    while i < n {
+        if !m[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && m[i] {
+            i += 1;
+        }
+        // SAFETY: a sub-range of the caller's run, so still in bounds.
+        acc = acc.add(unsafe {
+            sum_run(arr, off + start as isize * stride, i - start, stride)
+        });
+    }
+    acc
+}
+
+/// The mask values of `mask`, in C order. `mask` must already be broadcast to
+/// the shape of the array being reduced, so this visits its elements in the
+/// same order `runs` visits the data's.
+fn mask_bits(mask: &NdArray) -> Vec<bool> {
+    crate::iter::offsets(&mask.shape, &mask.strides, mask.byte_offset)
+        .map(|o| !matches!(mask.read_at(o), Scalar::Bool(false) | Scalar::Int(0)))
+        .collect()
+}
+
 /// Reduce one strided run with min/max/argmin/argmax.
 ///
 /// Returns the extreme value and the index at which it was found.
@@ -776,8 +863,33 @@ fn runs(arr: &NdArray) -> Vec<(isize, usize, isize)> {
         .collect()
 }
 
+/// The extras numpy's `reduce` carries besides the operand and the axis.
+#[derive(Copy, Clone, Default)]
+pub struct ReduceOpts<'a> {
+    /// numpy's `where=`, already broadcast to the operand's shape.
+    ///
+    /// Only the float sum path consults it: for every other op numpy's inner
+    /// loop is a plain sequential fold, so skipping a masked element and
+    /// folding in the identity the caller substituted for it give
+    /// bit-identical results.
+    pub mask: Option<&'a NdArray>,
+    /// numpy's `initial=`.
+    ///
+    /// It *seeds the accumulator* before the first element is folded in; it
+    /// is not combined with the finished result. For a reduction over a
+    /// non-innermost axis, where the fold is strictly sequential, the two
+    /// differ in the last bits.
+    pub seed: Option<Scalar>,
+}
+
 /// Reduce the whole array (`axis=None`).
 pub fn reduce_all(arr: &NdArray, op: ReduceOp) -> Result<Scalar> {
+    reduce_all_with(arr, op, ReduceOpts::default())
+}
+
+/// Reduce the whole array, honouring `where=` and `initial=`.
+pub fn reduce_all_with(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Result<Scalar> {
+    let ReduceOpts { mask, seed } = opts;
     check_numeric(arr, op)?;
     let n = arr.size();
     if n == 0 {
@@ -787,23 +899,36 @@ pub fn reduce_all(arr: &NdArray, op: ReduceOp) -> Result<Scalar> {
                 op.name()
             )));
         }
-        return Ok(identity_scalar(op, reduce_dtype(op, arr.dtype)));
+        let dt = reduce_dtype(op, arr.dtype);
+        return Ok(seed.map_or_else(|| identity_scalar(op, dt), |s| s.cast(dt)));
     }
     match op {
         ReduceOp::Sum => {
-            let mut acc = Acc::zero(reduce_dtype(op, arr.dtype));
+            let acc_dt = reduce_dtype(op, arr.dtype);
+            let mut acc = Acc::seeded(acc_dt, seed);
+            // `runs` and `mask_bits` both walk the array in C order, so the
+            // mask can be consumed run by run.
+            let bits = mask.map(mask_bits);
+            let mut seen = 0usize;
             for (off, len, stride) in runs(arr) {
                 if len == 0 {
                     continue;
                 }
-                // SAFETY: `runs` only yields in-bounds runs of this array.
-                acc = acc.add(unsafe { sum_run(arr, off, len, stride) });
+                acc = match &bits {
+                    // SAFETY: `runs` only yields in-bounds runs of this array.
+                    None => acc.add(unsafe { sum_run(arr, off, len, stride) }),
+                    // SAFETY: as above; the mask slice covers exactly this run.
+                    Some(b) => unsafe {
+                        sum_run_masked(arr, off, len, stride, acc, &b[seen..seen + len])
+                    },
+                };
+                seen += len;
             }
             Ok(acc.to_scalar())
         }
         ReduceOp::Prod => {
             let out_dt = reduce_dtype(op, arr.dtype);
-            let mut acc = Scalar::Int(1).cast(out_dt);
+            let mut acc = seed.unwrap_or(Scalar::Int(1)).cast(out_dt);
             crate::dispatch_dtype!(out_dt, A, {
                 let mut a = A::from_scalar(acc);
                 for off in crate::iter::offsets(&arr.shape, &arr.strides, arr.byte_offset) {
@@ -814,7 +939,11 @@ pub fn reduce_all(arr: &NdArray, op: ReduceOp) -> Result<Scalar> {
             Ok(acc)
         }
         ReduceOp::Min | ReduceOp::Max | ReduceOp::ArgMin | ReduceOp::ArgMax => {
-            let mut best: Option<(Scalar, usize)> = None;
+            // `initial=` seeds the accumulator; the index that rides along is
+            // never read, because `arg*` has no `initial`.
+            let mut best: Option<(Scalar, usize)> = seed
+                .filter(|_| !op.is_arg())
+                .map(|s| (s.cast(arr.dtype), usize::MAX));
             let mut base = 0usize;
             for (off, len, stride) in runs(arr) {
                 if len == 0 {
@@ -890,6 +1019,18 @@ fn identity_scalar(op: ReduceOp, dt: DType) -> Scalar {
 
 /// Reduce along a single axis.
 pub fn reduce_axis(arr: &NdArray, axis: usize, op: ReduceOp, keepdims: bool) -> Result<NdArray> {
+    reduce_axis_with(arr, axis, op, keepdims, ReduceOpts::default())
+}
+
+/// Reduce along a single axis, honouring `where=` and `initial=`.
+pub fn reduce_axis_with(
+    arr: &NdArray,
+    axis: usize,
+    op: ReduceOp,
+    keepdims: bool,
+    opts: ReduceOpts<'_>,
+) -> Result<NdArray> {
+    let ReduceOpts { mask, seed } = opts;
     check_numeric(arr, op)?;
     if axis >= arr.ndim() {
         return Err(Error::AxisError(format!(
@@ -933,15 +1074,44 @@ pub fn reduce_axis(arr: &NdArray, axis: usize, op: ReduceOp, keepdims: bool) -> 
     let src_offsets: Vec<isize> =
         crate::iter::offsets(&rest_shape, &rest_strides, arr.byte_offset).collect();
 
+    // The mask, walked with the same index arithmetic but its own strides.
+    // Only the innermost (pairwise) sum consults it -- for an outer axis
+    // numpy's inner loop is elementwise `out[j] += in[j]`, a sequential fold
+    // in which skipping a masked element and adding the identity the caller
+    // substituted for it agree bit-for-bit.
+    let mask_walk = mask.filter(|_| op == ReduceOp::Sum && innermost).map(|m| {
+        let mut m_rest: Vec<isize> = m.strides.clone();
+        let m_axis = m.strides[axis];
+        m_rest.remove(axis);
+        let offs: Vec<isize> =
+            crate::iter::offsets(&rest_shape, &m_rest, m.byte_offset).collect();
+        (m, offs, m_axis)
+    });
+
     for (k, &src_off) in src_offsets.iter().enumerate() {
         let dst = out_offsets[k];
         let value = match op {
             ReduceOp::Sum if innermost || n == 0 => {
                 if n == 0 {
-                    identity_scalar(op, out_dt)
+                    seed.map_or_else(|| identity_scalar(op, out_dt), |s| s.cast(out_dt))
+                } else if let Some((m, offs, m_axis)) = &mask_walk {
+                    let bits: Vec<bool> = (0..n)
+                        .map(|i| {
+                            let o = offs[k] + i as isize * m_axis;
+                            !matches!(m.read_at(o), Scalar::Bool(false) | Scalar::Int(0))
+                        })
+                        .collect();
+                    // SAFETY: the run lies inside `arr`.
+                    unsafe {
+                        sum_run_masked(
+                            arr, src_off, n, axis_stride,
+                            Acc::seeded(out_dt, seed), &bits,
+                        )
+                    }
+                    .to_scalar()
                 } else {
                     // SAFETY: the run lies inside `arr`.
-                    Acc::zero(out_dt)
+                    Acc::seeded(out_dt, seed)
                         .add(unsafe { sum_run(arr, src_off, n, axis_stride) })
                         .to_scalar()
                 }
@@ -949,7 +1119,7 @@ pub fn reduce_axis(arr: &NdArray, axis: usize, op: ReduceOp, keepdims: bool) -> 
             ReduceOp::Sum => {
                 // An outer axis: numpy accumulates whole slices in order, so
                 // the grouping is strictly sequential.
-                let mut acc = Acc::zero(out_dt);
+                let mut acc = Acc::seeded(out_dt, seed);
                 for i in 0..n {
                     let off = src_off + i as isize * axis_stride;
                     // SAFETY: single in-bounds element.
@@ -958,7 +1128,7 @@ pub fn reduce_axis(arr: &NdArray, axis: usize, op: ReduceOp, keepdims: bool) -> 
                 acc.to_scalar()
             }
             ReduceOp::Prod => {
-                let mut acc = Scalar::Int(1).cast(out_dt);
+                let mut acc = seed.unwrap_or(Scalar::Int(1)).cast(out_dt);
                 crate::dispatch_dtype!(out_dt, A, {
                     let mut a = A::from_scalar(acc);
                     for i in 0..n {
@@ -970,8 +1140,12 @@ pub fn reduce_axis(arr: &NdArray, axis: usize, op: ReduceOp, keepdims: bool) -> 
                 acc
             }
             _ => {
+                // `initial=` seeds the accumulator, as it does for sum/prod.
+                let start = seed
+                    .filter(|_| !op.is_arg())
+                    .map(|s| (s.cast(arr.dtype), usize::MAX));
                 // SAFETY: the run lies inside `arr`.
-                let (v, i) = unsafe { extreme_run(arr, src_off, n, axis_stride, op, None) };
+                let (v, i) = unsafe { extreme_run(arr, src_off, n, axis_stride, op, start) };
                 if op.is_arg() {
                     Scalar::Int(i as i64)
                 } else {
@@ -1103,6 +1277,73 @@ mod tests {
         let am = reduce_axis(&a, 0, ReduceOp::ArgMax, false).unwrap();
         assert_eq!(am.dtype, DType::I64);
         assert_eq!(am.to_vec(), vec![Scalar::Int(1); 3]);
+    }
+
+    #[test]
+    fn a_masked_sum_rebuilds_the_tree_per_run() {
+        // numpy's masked strided loop calls the unmasked inner loop once per
+        // maximal run of set mask values, so a masked sum is
+        // `((0 + pw(run0)) + pw(run1)) + ...` -- *not* one pairwise tree over
+        // the whole operand with the identity substituted, which is what a
+        // naive implementation produces and which differs in the last bits.
+        let v: Vec<f64> = (0..12).map(|i| (i as f64 + 1.0) / 7.0).collect();
+        let a = arr(&v, DType::F64);
+        let keep = [
+            true, true, true, false, true, true, true, true, true, true, false, true,
+        ];
+        let mask = NdArray::from_scalars(
+            &keep.iter().map(|&b| Scalar::Bool(b)).collect::<Vec<_>>(),
+            DType::Bool,
+        )
+        .unwrap();
+        // Runs are [0,3), [4,10), [11,12); each is shorter than 8, so each
+        // pairwise call is `-0.0` plus a sequential add.
+        let pw = |lo: usize, hi: usize| v[lo..hi].iter().fold(-0.0f64, |r, &x| r + x);
+        let want = ((0.0f64 + pw(0, 3)) + pw(4, 10)) + pw(11, 12);
+        let opts = ReduceOpts {
+            mask: Some(&mask),
+            seed: None,
+        };
+        match reduce_all_with(&a, ReduceOp::Sum, opts).unwrap() {
+            Scalar::Float(f) => assert_eq!(f.to_bits(), want.to_bits()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn initial_seeds_the_accumulator() {
+        // numpy pre-fills the output with `initial=` and then folds, so an
+        // outer-axis sum is `((init + a0) + a1) + ...`. Combining `init` with
+        // the finished result instead rounds differently.
+        let a = NdArray::from_scalars(
+            &(0..8)
+                .map(|i| Scalar::Float(1.0 / (3.0 + i as f64)))
+                .collect::<Vec<_>>(),
+            DType::F64,
+        )
+        .unwrap()
+        .reshape(&[4, 2])
+        .unwrap();
+        let init = 1e16f64;
+        let opts = ReduceOpts {
+            mask: None,
+            seed: Some(Scalar::Float(init)),
+        };
+        // axis 0 is the outer axis, so numpy's fold is strictly sequential.
+        let got = reduce_axis_with(&a, 0, ReduceOp::Sum, false, opts).unwrap();
+        for col in 0..2 {
+            let want = (0..4).fold(init, |acc, r| acc + 1.0 / (3.0 + (2 * r + col) as f64));
+            match got.to_vec()[col] {
+                Scalar::Float(f) => assert_eq!(f.to_bits(), want.to_bits()),
+                other => panic!("{other:?}"),
+            }
+        }
+        // The seed is also what an all-empty reduction returns.
+        let e = NdArray::zeros(vec![0], DType::F64).unwrap();
+        assert_eq!(
+            reduce_all_with(&e, ReduceOp::Sum, opts).unwrap(),
+            Scalar::Float(init)
+        );
     }
 
     #[test]

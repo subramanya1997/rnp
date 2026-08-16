@@ -53,12 +53,20 @@ def check_support_sve(__cache=[]):
 # --------------------------------------------------------------------------
 
 def _is_array(x):
-    return isinstance(x, np.ndarray)
+    if isinstance(x, np.ndarray):
+        return True
+    # Upstream these are `ndarray` subclasses (e.g. `numpy.memmap`); the port
+    # cannot subclass `ndarray`, so they are array-likes exposing `__array__`.
+    # Scalars also expose `__array__` and must keep comparing as scalars.
+    return (hasattr(type(x), '__array__')
+            and not isinstance(x, np.generic))
 
 
 def _flat(x):
     """Elements of `x` in C order as Python scalars, plus its shape."""
     if _is_array(x):
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x.__array__())
         return np._flat_values(x), tuple(x.shape)
     if isinstance(x, (list, tuple)):
         a = np.asarray(x)

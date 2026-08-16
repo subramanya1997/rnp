@@ -37,6 +37,136 @@ frexp modf _ones_like
 """.split())
 
 
+#: Ufuncs numpy gives string loops that the engine has no loop for.  Each
+#: maps to the equivalent `numpy.strings` implementation, which is where the
+#: real work (and numpy's itemsize arithmetic) already lives.
+_STRING_LOOPS = {"add": "add", "multiply": "multiply"}
+
+
+def _string_kinds(args):
+    """Dtype kinds of `args`, or None if any operand is not array-like."""
+    kinds = []
+    for a in args:
+        dt = getattr(a, "dtype", None)
+        if dt is None:
+            try:
+                dt = _rnp.asarray(a).dtype
+            except Exception:
+                return None
+        kinds.append(dt.kind)
+    return kinds
+
+
+#: Comparisons numpy gives `SS->?` and `UU->?` loops, but no mixed loop.
+_STRING_COMPARISONS = frozenset(
+    "equal not_equal less less_equal greater greater_equal".split())
+
+
+def _mixed_string_comparison(name, args, signature, casting):
+    """Comparison of a bytes array against a str array.
+
+    numpy has no mixed loop, so an unqualified call is a "did not contain a
+    loop" TypeError.  An explicit `signature` plus a permissive `casting`
+    is the documented way to ask for one side to be cast, and that does
+    work — so honour it rather than reporting no loop.
+    """
+    if name not in _STRING_COMPARISONS:
+        return None
+    kinds = _string_kinds(args)
+    if kinds is None or sorted(kinds) != ["S", "U"]:
+        return None
+
+    target = None
+    if isinstance(signature, str) and "->" in signature:
+        target = signature.split("->")[0].strip()[:1]
+    elif isinstance(signature, (tuple, list)) and signature:
+        first = signature[0]
+        target = getattr(first, "kind", None) or str(first)[:1]
+    if target in ("S", "U") and casting in ("unsafe", "same_kind"):
+        cast = [_rnp.asarray(a).astype(target) for a in args]
+        return _rnp._ufunc_call(name, tuple(cast), out=None, where_=True,
+                                casting=casting, dtype=None)
+
+    from ._core._exceptions import _UFuncNoLoopError
+    from . import dtypes as _dtypes
+    classes = tuple(
+        _dtypes.BytesDType if k == "S" else _dtypes.StrDType for k in kinds)
+    from . import _ufunc as _self
+    raise _UFuncNoLoopError(getattr(_self, "ALL")[name], classes + (None,))
+
+
+def _string_loop_fallback(name, args):
+    """Evaluate a string ufunc through `numpy.strings`, or return None.
+
+    Returning None means "no string loop applies" and the caller re-raises
+    the engine's error — which is what keeps genuinely absent loops (notably
+    `S` against `U`, which numpy also refuses) reporting as errors rather
+    than being silently coerced.
+    """
+    fn = _STRING_LOOPS.get(name)
+    if fn is None:
+        return None
+    kinds = _string_kinds(args)
+    if kinds is None or not any(k in "SU" for k in kinds):
+        return None
+    if name == "add":
+        # numpy has S+S and U+U loops but deliberately no mixed S/U loop.
+        if len(kinds) != 2 or set(kinds) not in ({"S"}, {"U"}):
+            return None
+    elif name == "multiply":
+        # One string operand repeated an integer number of times.
+        if len(kinds) != 2 or sorted(
+            "s" if k in "SU" else "i" if k in "iub" else "?" for k in kinds
+        ) != ["i", "s"]:
+            return None
+        if kinds[0] not in "SU":  # numpy accepts either order
+            args = (args[1], args[0])
+    from . import strings as _strings
+    return getattr(_strings, fn)(*args)
+
+
+def _broadcast_against_out(args, oshape):
+    """numpy broadcasts the *output* together with the inputs, so an input of
+    shape (1,) against ``out`` of shape (1000,) is legal.  The engine expects
+    the inputs to already match, so widen them here."""
+    shapes = [a.shape for a in args if isinstance(a, ndarray)]
+    if not shapes or _builtins.all(s == oshape for s in shapes):
+        return args
+    try:
+        target = _rnp.broadcast_shapes(*shapes, oshape)
+    except Exception:  # noqa: BLE001 - let the engine report the real error
+        return args
+    if target != oshape:
+        return args
+    return tuple(
+        _rnp.broadcast_to(a, target)
+        if isinstance(a, ndarray) and a.shape != target else a
+        for a in args)
+
+
+def _single_axis(array, axis, what):
+    """``axis=None`` means "every axis", which `accumulate`/`reduceat` only
+    accept when there is at most one."""
+    if axis is not None:
+        return axis
+    ndim = array.ndim if isinstance(array, ndarray) else _rnp.asarray(array).ndim
+    if ndim > 1:
+        raise ValueError(f"{what} does not allow multiple axes")
+    return 0
+
+
+def _detached(x, target):
+    """`x`, guaranteed not to alias `target`."""
+    if not isinstance(x, ndarray) or not isinstance(target, ndarray):
+        return x
+    if not x.size or not target.size:
+        return x
+    import importlib
+    mod = importlib.import_module(__name__.rsplit(".", 1)[0]
+                                  + "._core._memoverlap")
+    return x.copy() if mod.may_share_memory(x, target) else x
+
+
 def _is_scalarish(x):
     """True for the inputs that make a ufunc return a scalar rather than a
     0-d array (numpy's rule: every input is a scalar or a 0-d array)."""
@@ -100,8 +230,20 @@ class ufunc:
             out = out[0] if len(out) == 1 else out
         scalar_out = out is None and _builtins.all(
             _is_scalarish(a) for a in args)
-        res = _rnp._ufunc_call(self.__name__, args, out=out, where_=where,
-                               casting=casting, dtype=dtype)
+        if isinstance(out, ndarray):
+            args = _broadcast_against_out(args, out.shape)
+        try:
+            res = _rnp._ufunc_call(self.__name__, args, out=out, where_=where,
+                                   casting=casting, dtype=dtype)
+        except NotImplementedError:
+            res = None
+            if out is None and dtype is None:
+                res = _mixed_string_comparison(
+                    self.__name__, args, signature, casting)
+                if res is None and signature is None:
+                    res = _string_loop_fallback(self.__name__, args)
+            if res is None:
+                raise
         _errstate.drain(self.__name__)
         if isinstance(res, tuple):
             return tuple(_maybe_scalar(r, scalar_out) for r in res)
@@ -126,6 +268,7 @@ class ufunc:
             self._nope("accumulate")
         if isinstance(out, tuple):
             out = out[0]
+        axis = _single_axis(array, axis, "accumulate")
         res = _rnp._ufunc_accumulate(self.__name__, array, axis=axis,
                                      dtype=dtype, out=out)
         _errstate.drain(self.__name__)
@@ -134,10 +277,13 @@ class ufunc:
     def reduceat(self, array, indices, axis=0, dtype=None, out=None):
         if not self._ok or self.nin != 2:
             self._nope("reduceat")
+        axis = _single_axis(array, axis, "reduceat")
         a = _rnp.asarray(array)
         idx = [_builtins.int(i) for i in _rnp.asarray(indices).tolist()] \
             if not isinstance(indices, int) else [indices]
         n = a.shape[axis]
+        # See the comment on the branch below.
+        _split_head = self.__name__ == "add"
         pieces = []
         for k, start in enumerate(idx):
             if start < 0:
@@ -148,11 +294,32 @@ class ufunc:
             nxt = idx[k + 1] if k + 1 < len(idx) else n
             if nxt < 0:
                 nxt += n
-            stop = nxt if nxt > start else start + 1
+            stop = _builtins.min(nxt if nxt > start else start + 1, n)
             sl = [slice(None)] * a.ndim
-            sl[axis] = slice(start, min(stop, n))
-            piece = a[tuple(sl)]
-            red = self.reduce(piece, axis=axis, dtype=dtype)
+            if _split_head:
+                # numpy's `PyUFunc_Reduceat` copies `a[start]` into the output
+                # and then runs the inner loop over the *remaining* count - 1
+                # elements, so the segment fold is
+                # `a[start] + pairwise(a[start+1:stop])`. Only `add` reduces
+                # with the pairwise tree (`PW = 1, 0, 0, 0` in
+                # `loops_arithm_fp.dispatch.c.src`); for every other ufunc the
+                # inner loop is a sequential accumulator, where seeding it
+                # with `a[start]` and seeding it with the identity give
+                # bit-identical results, so the plain segment reduce below is
+                # already right. For `add` they disagree from segment length
+                # 3 upwards.
+                sl[axis] = slice(start, start + 1)
+                head = _rnp.asarray(self.reduce(a[tuple(sl)], axis=axis,
+                                                dtype=dtype))
+                if stop - start > 1:
+                    sl[axis] = slice(start + 1, stop)
+                    tail = self.reduce(a[tuple(sl)], axis=axis, dtype=dtype)
+                    red = self(head, _rnp.asarray(tail))
+                else:
+                    red = head
+            else:
+                sl[axis] = slice(start, stop)
+                red = self.reduce(a[tuple(sl)], axis=axis, dtype=dtype)
             pieces.append(_rnp.asarray(red))
         from ._core.shape_base import stack
         res = stack(pieces, axis=axis)
@@ -172,6 +339,11 @@ class ufunc:
     def at(self, a, indices, b=None):
         if not self._ok:
             self._nope("at")
+        # The *operand* is unbuffered, but the index array and the second
+        # operand are read in full before the updates start; when either
+        # aliases `a` they have to be materialised first (gh-6272).
+        indices = _detached(indices, a)
+        b = _detached(b, a)
         if self.nin == 1:
             a[indices] = self(a[indices])
             return None

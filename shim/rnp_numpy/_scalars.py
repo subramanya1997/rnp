@@ -22,8 +22,11 @@ into numpy's RuntimeWarnings.
 """
 
 import builtins as _builtins
+import inspect as _inspect
 import math as _math
-import struct as _struct
+import numbers as _numbers
+import types as _types
+import warnings as _warnings
 from decimal import Decimal as _Decimal
 
 import _rnp
@@ -40,8 +43,6 @@ _SCALAR_BY_NAME = {}
 # repr helpers
 # ---------------------------------------------------------------------------
 
-_PACK = {"float16": "e", "float32": "f", "float64": "d"}
-
 #: The decimal exponent at (or above) which numpy switches a float scalar's
 #: str/repr from positional to scientific. Probed from numpy 2.5.2: the
 #: positional window is `-4 <= exp10 <= {2, 5, 15}` for half/single/double.
@@ -49,23 +50,26 @@ _SCI_AT = {"float16": 3, "float32": 6, "float64": 16}
 
 
 def _shortest(v, name):
-    """`(value, significant digits)` of the shortest decimal that round-trips.
+    """`(digits, exp10)` of the shortest decimal that round-trips.
 
     ``repr(np.float32(0.1))`` is ``np.float32(0.1)``, not the float64 spelling
     of the same bits, so the search runs against the *narrow* type's bytes.
     """
-    if not _math.isfinite(v):
-        return v, 1
-    code = _PACK[name]
-    target = _struct.pack(code, v)
-    for prec in range(1, 18):
-        cand = _builtins.float("%.*e" % (prec - 1, v))
-        try:
-            if _struct.pack(code, cand) == target:
-                return cand, prec
-        except (OverflowError, ValueError):
-            continue
-    return v, 17
+    from ._printing import _unique_digits
+    return _unique_digits(_builtins.abs(v), name)
+
+
+def _sci_at(name):
+    """Where a scalar's str/repr switches to scientific notation.
+
+    numpy 2.3 gave float16/float32 their own (much lower) cutoffs; under
+    ``printoptions(legacy='2.2')`` and older they keep float64's, which is why
+    `str(np.half(65504))` is `65500.0` in legacy mode but `6.55e+04` now.
+    """
+    from ._printing import _legacy_level
+    if name != "float64" and _legacy_level() <= 202:
+        return _SCI_AT["float64"]
+    return _SCI_AT[name]
 
 
 def _float_str(v, name):
@@ -85,12 +89,19 @@ def _float_str(v, name):
         return "-inf"
     if v == 0.0:
         return "-0.0" if _math.copysign(1.0, v) < 0 else "0.0"
-    short, nd = _shortest(v, name)
-    if _Decimal(v).adjusted() < -4 or _Decimal(v).adjusted() >= _SCI_AT[name]:
-        return "%.*e" % (nd - 1, short)
-    # The digit count is measured against the *rounded* value: float16 0.1 is
-    # stored as 0.09997..., whose exponent is -2, but it prints as `0.1`.
-    return "%.*f" % (max(1, nd - 1 - _Decimal(short).adjusted()), short)
+    from ._printing import _split
+    digits, exp = _shortest(v, name)
+    sign = "-" if _math.copysign(1.0, v) < 0 else ""
+    # The positional/scientific choice is made on the *stored* value's
+    # exponent, but the digits printed are the shortest form's -- which is why
+    # `str(np.float32(1e-4))` is `1e-04` even though 9.9999997e-05 is stored.
+    adjusted = _Decimal(v).adjusted()
+    if adjusted < -4 or adjusted >= _sci_at(name):
+        mant = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+        return "%s%se%s%02d" % (sign, mant, "+" if exp >= 0 else "-",
+                                _builtins.abs(exp))
+    intstr, fracstr = _split(digits, exp - len(digits) + 1)
+    return "%s%s.%s" % (sign, intstr, fracstr or "0")
 
 
 def _strip_parens(s):
@@ -138,6 +149,13 @@ class generic(metaclass=_ScalarMeta):
             raise TypeError(
                 f"cannot create 'numpy.{cls.__name__}' instances")
         return super().__new__(cls)
+
+    def __radd__(self, other):
+        # numpy fills `generic`'s nb_add slot, so every scalar type -- even the
+        # character ones, which have no arithmetic -- exposes `__radd__`. It
+        # yields NotImplemented (gh-9620) so that `b'def' + np.bytes_('abc')`
+        # falls back to `bytes.__add__` instead of raising.
+        return NotImplemented
 
     # -- array-like surface ------------------------------------------------
 
@@ -247,8 +265,13 @@ class generic(metaclass=_ScalarMeta):
         return self.__array__().tobytes() if hasattr(
             self.__array__(), "tobytes") else bytes(memoryview(self.__array__()))
 
-    def __array_wrap__(self, arr, context=None, return_scalar=False):
-        return arr
+    def __array_wrap__(self, arr, context=None, return_scalar=True):
+        # Probed: with the third argument omitted, None or True a 0-d result
+        # "decays" back to a scalar; only an explicit False (or a result that
+        # is not 0-d) keeps the array.
+        if return_scalar is False or getattr(arr, "ndim", 1) != 0:
+            return arr
+        return arr[()]
 
     def __copy__(self):
         return self
@@ -264,6 +287,50 @@ class generic(metaclass=_ScalarMeta):
             return str(self)
         return format(self._v, spec)
 
+    # -- array-API surface -------------------------------------------------
+
+    @property
+    def device(self):
+        return "cpu"
+
+    def to_device(self, device, /, *, stream=None):
+        if device != "cpu":
+            raise ValueError(f"Unsupported device: {device!r}.")
+        if stream is not None:
+            raise ValueError("The stream argument in to_device() is not "
+                             "supported")
+        return self
+
+    def __array_namespace__(self, /, *, api_version=None):
+        import rnp_numpy
+        if api_version is not None and api_version not in (
+                "2021.12", "2022.12", "2023.12", "2024.12"):
+            raise ValueError(f"Version {api_version!r} of the Array API "
+                             "Standard is not supported.")
+        return rnp_numpy
+
+    # -- PEP 585 subscription ----------------------------------------------
+
+    def __class_getitem__(cls, item):
+        """numpy's abstract numeric scalar types are subscriptable.
+
+        Probed against numpy 2.5.2: the ``number`` tower takes exactly one
+        argument, ``complexfloating`` takes one or two, ``bool``/``datetime64``
+        are unrestricted, and everything else (``generic``, ``flexible``,
+        ``character`` and every other concrete type) raises ``TypeError``.
+        """
+        arity = _GENERIC_ALIAS_ARITY.get(cls)
+        if arity is None:
+            raise TypeError(
+                f"type 'numpy.{cls.__name__}' is not subscriptable")
+        if arity is not True:
+            n = len(item) if isinstance(item, tuple) else 1
+            if n < arity[0]:
+                raise TypeError(f"Too few arguments for numpy.{cls.__name__}")
+            if n > arity[1]:
+                raise TypeError(f"Too many arguments for numpy.{cls.__name__}")
+        return _types.GenericAlias(cls, item)
+
 
 class number(generic):
     __slots__ = ()
@@ -271,6 +338,9 @@ class number(generic):
 
 class integer(number):
     __slots__ = ()
+
+    def is_integer(self, /):
+        return True
 
 
 class signedinteger(integer):
@@ -288,6 +358,12 @@ class inexact(number):
 class floating(inexact):
     __slots__ = ()
 
+    def is_integer(self, /):
+        return _builtins.float(self._v).is_integer()
+
+    def as_integer_ratio(self, /):
+        return _builtins.float(self._v).as_integer_ratio()
+
 
 class complexfloating(inexact):
     __slots__ = ()
@@ -299,6 +375,139 @@ class flexible(generic):
 
 class character(flexible):
     __slots__ = ()
+
+
+#: Which scalar classes accept ``cls[...]``, and with how many arguments.
+#: ``True`` means "any number" (that is what ``np.bool`` and ``np.datetime64``
+#: do); a ``(min, max)`` pair is the ``number`` tower's restriction.
+_GENERIC_ALIAS_ARITY = {
+    number: (1, 1),
+    integer: (1, 1),
+    signedinteger: (1, 1),
+    unsignedinteger: (1, 1),
+    inexact: (1, 1),
+    floating: (1, 1),
+    complexfloating: (1, 2),
+}
+
+
+# ---------------------------------------------------------------------------
+# ndarray-compatible methods on ``generic``
+# ---------------------------------------------------------------------------
+
+#: Every method numpy's scalars share with ``ndarray``.  Each one has to
+#: report *the same* signature as the ``ndarray`` method of the same name, so
+#: rather than duplicating the parameter lists they are generated from
+#: ``ndarray``'s own introspected signature.
+_ARRAY_METHOD_NAMES = (
+    "__array_namespace__", "__copy__", "__deepcopy__", "all", "any", "argmax",
+    "argmin", "argsort", "astype", "byteswap", "choose", "clip", "compress",
+    "conj", "conjugate", "copy", "cumprod", "cumsum", "diagonal", "dump",
+    "dumps", "fill", "flatten", "getfield", "item", "max", "mean", "min",
+    "nonzero", "prod", "put", "ravel", "repeat", "reshape", "resize", "round",
+    "searchsorted", "setfield", "setflags", "sort", "squeeze", "std", "sum",
+    "swapaxes", "take", "to_device", "tobytes", "tofile", "tolist", "trace",
+    "transpose", "var", "view",
+)
+
+
+def _array_forwarder(name):
+    """Fallback body: run the method on the equivalent 0-d array."""
+    def f(self, *a, **k):
+        return getattr(self.__array__(), name)(*a, **k)
+    f.__name__ = name
+    return f
+
+
+def _mirror_ndarray_signature(name, impl):
+    """Re-declare `impl` with the parameter list `ndarray.<name>` reports.
+
+    ``inspect.signature(np.generic.take) == inspect.signature(np.ndarray.take)``
+    is part of numpy's documented scalar/array parity, so the source of truth
+    is the array method itself; if the port's ``ndarray`` has no such method
+    (or no introspectable signature) the scalar method is left alone.
+    """
+    target = getattr(ndarray, name, None)
+    if target is None:
+        return None
+    try:
+        sig = _inspect.signature(target)
+    except (TypeError, ValueError):
+        return None
+
+    P = _inspect.Parameter
+    params = list(sig.parameters.values())
+    ns = {"_impl": impl}
+    decl, call = [], []
+    pos_only, star_seen = [], False
+    for i, p in enumerate(params):
+        if p.default is not p.empty:
+            ns[f"_d{i}"] = p.default
+            spelling = f"{p.name}=_d{i}"
+        else:
+            spelling = p.name
+        if p.kind is P.POSITIONAL_ONLY:
+            pos_only.append(spelling)
+            if i:  # `self` is bound by the descriptor, never forwarded
+                call.append(p.name)
+            continue
+        if pos_only:
+            decl.extend(pos_only + ["/"])
+            pos_only = []
+        if p.kind is P.POSITIONAL_OR_KEYWORD:
+            decl.append(spelling)
+            call.append(p.name)
+        elif p.kind is P.VAR_POSITIONAL:
+            decl.append("*" + p.name)
+            call.append("*" + p.name)
+            star_seen = True
+        elif p.kind is P.KEYWORD_ONLY:
+            if not star_seen:
+                decl.append("*")
+                star_seen = True
+            decl.append(spelling)
+            call.append(f"{p.name}={p.name}")
+        else:  # VAR_KEYWORD
+            decl.append("**" + p.name)
+            call.append("**" + p.name)
+    if pos_only:
+        decl.extend(pos_only + ["/"])
+
+    src = (f"def {name}({', '.join(decl)}):\n"
+           f"    return _impl({', '.join(['self'] + call)})\n")
+    exec(compile(src, "<rnp scalar methods>", "exec"), ns)
+    fn = ns[name]
+    fn.__qualname__ = f"generic.{name}"
+    fn.__module__ = "numpy"
+    return fn
+
+
+def _install_array_methods():
+    for name in _ARRAY_METHOD_NAMES:
+        impl = getattr(generic, name, None)
+        fn = _mirror_ndarray_signature(
+            name, impl if impl is not None else _array_forwarder(name))
+        if fn is not None:
+            setattr(generic, name, fn)
+        # If the port's ndarray has no such method there is nothing to mirror
+        # and nothing to delegate to, so `generic` keeps whatever it had.
+
+
+_install_array_methods()
+
+
+# numpy registers its abstract numeric tower with the `numbers` ABCs, so
+# `issubclass(np.floating, numbers.Real)` and friends hold (test_abc.py).
+# Only the abstract bases are registered: registration is inherited by the
+# concrete types, and nothing is registered with `numbers.Rational`, which is
+# what makes `issubclass(np.float64, numbers.Rational)` correctly False.
+_numbers.Number.register(number)
+_numbers.Complex.register(inexact)
+_numbers.Complex.register(complexfloating)
+_numbers.Real.register(floating)
+_numbers.Integral.register(integer)
+_numbers.Integral.register(signedinteger)
+_numbers.Integral.register(unsignedinteger)
 
 
 # ---------------------------------------------------------------------------
@@ -360,15 +569,58 @@ def _unary(opname, a):
     return _wrap_result(_rnp._scalar_unop(opname, a), opname)
 
 
+#: `dtype code -> the `_wrap` of the scalar class for it`, in the order
+#: `_rnp._scalar_dtype_names()` reports. The Rust fast path hands back that
+#: code instead of building a `dtype` object, so the whole result-typing step
+#: on this side is one list index.
+_WRAPS = [None] * 14
+
+_sb2 = _rnp._scalar_binop2
+_report_fpe = _errstate.report
+
+
 def _install_operators(cls):
-    """Give one concrete scalar class its full operator surface."""
+    """Give one concrete scalar class its full operator surface.
+
+    Each method is one call into the Rust scalar path (no 0-d arrays, no
+    `dtype` object) plus one list index to find the wrapper for the result
+    dtype. `_binary` below is the fallback for the few ops the fast path has
+    no opcode for (`divmod`).
+    """
 
     def make(op, name):
-        def fwd(self, other):
-            return _binary(name, self, other)
+        code = _rnp._scalar_binop_code(name)
+        if code is None:  # pragma: no cover - every operator name has one
+            def fwd(self, other):
+                return _binary(name, self, other)
 
-        def rev(self, other):
-            return _binary(name, other, self)
+            def rev(self, other):
+                return _binary(name, other, self)
+        else:
+            where = "scalar " + name
+
+            # The defaults are keyword-only on purpose: `pow(a, b, m)` calls
+            # `__pow__` with *three* positional arguments, and a plain default
+            # would silently bind the modulus to the opcode. Keyword-only
+            # keeps numpy's TypeError while still compiling to a LOAD_FAST.
+            def fwd(self, other, *, _c=code, _w=where):
+                r = _sb2(_c, self, other)
+                if r is None:
+                    return NotImplemented
+                d, v, flags = r
+                if flags:
+                    # Frames: report, this method, the caller.
+                    _report_fpe(flags, _w, stacklevel=3)
+                return _WRAPS[d](v)
+
+            def rev(self, other, *, _c=code, _w=where):
+                r = _sb2(_c, other, self)
+                if r is None:
+                    return NotImplemented
+                d, v, flags = r
+                if flags:
+                    _report_fpe(flags, _w, stacklevel=3)
+                return _WRAPS[d](v)
 
         fwd.__name__ = f"__{op}__"
         rev.__name__ = f"__r{op}__"
@@ -385,25 +637,15 @@ def _install_operators(cls):
         setattr(cls, f"__{op}__", fwd)
         setattr(cls, f"__r{op}__", rev)
 
-    def make_cmp(name):
-        def f(self, other):
-            return _binary(name, self, other)
+    def make_cmp(op, name):
+        f = make(op, name)[0]
+        f.__name__ = f"__{op}__"
         return f
 
     for op, name in (("lt", "less"), ("le", "less_equal"),
-                     ("gt", "greater"), ("ge", "greater_equal")):
-        setattr(cls, f"__{op}__", make_cmp(name))
-
-    def __eq__(self, other):
-        r = _binary("equal", self, other)
-        return NotImplemented if r is NotImplemented else r
-
-    def __ne__(self, other):
-        r = _binary("not_equal", self, other)
-        return NotImplemented if r is NotImplemented else r
-
-    cls.__eq__ = __eq__
-    cls.__ne__ = __ne__
+                     ("gt", "greater"), ("ge", "greater_equal"),
+                     ("eq", "equal"), ("ne", "not_equal")):
+        setattr(cls, f"__{op}__", make_cmp(op, name))
     cls.__hash__ = lambda self: hash(self._v)
 
     cls.__neg__ = lambda self: _unary("negative", self)
@@ -426,18 +668,56 @@ def _make_numeric(name, spec, base, builtin=None, clsname=None):
         "__module__": "numpy",
     }
     bases = (base,) if builtin is None else (base, builtin)
+    # The type whose *exact* instances need no conversion at all: `float` for
+    # the 8-byte floats, `complex` for the 16-byte complexes, `int` for the
+    # integers (after the same range check `_check_range` would make). Values
+    # of that type take a straight-line constructor; everything else -- narrow
+    # floats, strings, arrays, out-of-range ints -- goes through `_cast`,
+    # which is where all of numpy's coercion rules live.
+    #
+    # This matters because `np.float64(1.5)` is ~1.15us of a 3.9us
+    # `np.float64(1.5) + np.float64(2.5)`, and almost all of it is the generic
+    # coercion machinery deciding it has nothing to do.
+    k, isize = d.kind, d.itemsize
+    if k == "f" and isize == 8:
+        _fast_type, _fast_range = _builtins.float, None
+    elif k == "c" and isize == 16:
+        _fast_type, _fast_range = complex, None
+    elif k in "iu":
+        _fast_type, _fast_range = int, _INT_RANGE[d.name]
+    else:
+        _fast_type, _fast_range = None, None
+
     if builtin is not None:
         # `float64(floating, float)` -- the builtin has to carry the payload,
         # so `__new__` routes through it.
         def __new__(cls, value=0, *extra, _raw=None, **kw):
             # numpy's scalar constructors take the value plus the same
             # trailing arguments the corresponding builtin accepts.
+            if _raw is None:
+                if type(value) is _fast_type and not extra and not kw:
+                    self = builtin.__new__(cls, value)
+                    self._v = value
+                    return self
+                arr = _as_array_arg(cls, value, extra, kw)
+                if arr is not None:
+                    return arr
             v = _raw if _raw is not None else _cast(cls, value, *extra, **kw)
             self = builtin.__new__(cls, v)
             self._v = v
             return self
     else:
         def __new__(cls, value=0, *extra, _raw=None, **kw):
+            if _raw is None:
+                if type(value) is _fast_type and not extra and not kw \
+                        and (_fast_range is None
+                             or _fast_range[0] <= value <= _fast_range[1]):
+                    self = object.__new__(cls)
+                    self._v = value
+                    return self
+                arr = _as_array_arg(cls, value, extra, kw)
+                if arr is not None:
+                    return arr
             v = _raw if _raw is not None else _cast(cls, value, *extra, **kw)
             self = object.__new__(cls)
             self._v = v
@@ -446,14 +726,48 @@ def _make_numeric(name, spec, base, builtin=None, clsname=None):
     ns["__new__"] = __new__
     cls = _ScalarMeta(clsname or name, bases, ns)
 
-    def _wrap(value, _cls=cls):
-        return _cls(_raw=value)
+    # `_wrap` is on the hot path of every scalar operator, so it constructs
+    # the object directly rather than going back through `__new__`'s signature
+    # machinery: the value it is handed is always already of the right type
+    # (it came out of the engine as this dtype).
+    if builtin is None:
+        def _wrap(value, _cls=cls, _new=object.__new__):
+            self = _new(_cls)
+            self._v = value
+            return self
+    else:
+        def _wrap(value, _cls=cls, _new=builtin.__new__):
+            self = _new(_cls, value)
+            self._v = value
+            return self
 
     cls._wrap = staticmethod(_wrap)
     _install_operators(cls)
     _install_numeric_extras(cls, d)
     _SCALAR_BY_NAME.setdefault(d.name, cls)
+    # Lets the Rust fast path recognise an operand by its type pointer instead
+    # of two `getattr`s and a downcast.
+    _rnp._register_scalar_class(cls, d)
     return cls
+
+
+def _as_array_arg(cls, value, extra, kw):
+    """`np.float64([1, 2])` is an *array* constructor, not a scalar one.
+
+    Probed against numpy 2.5.2: a numeric scalar type called with anything
+    that is at least 1-d -- list, tuple or ndarray -- returns
+    ``array(value, dtype=cls.dtype)``, even when it holds a single element
+    (``np.float64([1])`` is ``array([1.])``).  A 0-d array still yields a
+    scalar.  Returns `None` when the scalar path applies.
+    """
+    if extra or kw or cls.dtype.kind not in "biufc":
+        return None
+    if isinstance(value, (list, tuple)):
+        from . import array as _array
+        return _array(value, cls.dtype)
+    if isinstance(value, ndarray) and value.ndim > 0:
+        return value.astype(cls.dtype)
+    return None
 
 
 def _cast(cls, value, *extra, **kw):
@@ -478,8 +792,38 @@ def _cast(cls, value, *extra, **kw):
             raise ValueError("only length-1 arrays can be converted to "
                              "Python scalars")
         value = value.item()
+    value = _coerce_huge_int(cls, value)
     _check_range(cls.dtype, value)
     return _rnp._scalar_cast(cls.dtype, value)
+
+
+def _coerce_huge_int(cls, value):
+    """Handle a Python int too large for the target float type.
+
+    numpy splits here, and the two halves really do differ (probed on 2.5.2):
+    `np.float64(2**1024)` raises ``OverflowError: int too large to convert to
+    float``, while `np.longdouble(2**1024)` saturates to `inf` and emits a
+    ``RuntimeWarning``.  That is not an accident of precision -- the long
+    double path converts through a widening routine that saturates instead of
+    raising -- so it stays correct here even though this port aliases
+    `longdouble` to `float64`.
+
+    Anything that is not an oversized int is returned untouched.
+    """
+    if cls.dtype.kind not in "fc" or not isinstance(value, int):
+        return value
+    if isinstance(value, _builtins.bool):
+        return value
+    try:
+        return _builtins.float(value)
+    except OverflowError:
+        if cls.__name__ not in ("longdouble", "clongdouble"):
+            raise
+        _warnings.warn(
+            "overflow encountered in conversion from python long",
+            RuntimeWarning, stacklevel=2,
+        )
+        return _builtins.float("-inf" if value < 0 else "inf")
 
 
 #: (min, max) for each integer dtype, used by the constructor checks.
@@ -546,15 +890,29 @@ def _install_numeric_extras(cls, d):
         cls.bit_count = lambda self: _builtins.int(self._v).bit_count()
         cls.__lshift__ = cls.__lshift__
     if kind in "iu":
-        cls.is_integer = lambda self: True
-        cls.as_integer_ratio = lambda self: (_builtins.int(self._v), 1)
+        # numpy declares these with a positional-only `self` (they are C
+        # methods upstream), which `inspect.signature` reports and
+        # test_scalar_methods asserts.
+        def is_integer(self, /):
+            return True
+
+        def as_integer_ratio(self, /):
+            return (_builtins.int(self._v), 1)
+
+        cls.is_integer = is_integer
+        cls.as_integer_ratio = as_integer_ratio
         cls.numerator = property(lambda self: type(self)(self._v))
         cls.denominator = property(lambda self: type(self)(1))
 
     if kind == "f":
-        cls.is_integer = lambda self: _builtins.float(self._v).is_integer()
-        cls.as_integer_ratio = lambda self: _builtins.float(
-            self._v).as_integer_ratio()
+        def is_integer(self, /):
+            return _builtins.float(self._v).is_integer()
+
+        def as_integer_ratio(self, /):
+            return _builtins.float(self._v).as_integer_ratio()
+
+        cls.is_integer = is_integer
+        cls.as_integer_ratio = as_integer_ratio
         cls.hex = lambda self: _builtins.float(self._v).hex()
         cls.fromhex = classmethod(
             lambda c, s: c(_builtins.float.fromhex(s)))
@@ -588,15 +946,42 @@ def _install_numeric_extras(cls, d):
         cls.__str__ = lambda self, n=name: _complex_str(self._v, n)
     else:
         # numpy reprs a scalar by its *dtype* name, so `np.longlong(0)` shows
-        # as `np.int64(0)`.
-        cls.__repr__ = lambda self, n=name: f"np.{n}({self._v})"
+        # as `np.int64(0)`. A *subclass* is not a builtin scalar type, so
+        # `genint_type_repr` falls back to the type's own name (gh-27106).
+        cls.__repr__ = lambda self, n=name, c=cls: (
+            f"np.{n}({self._v})" if type(self) is c
+            else f"{type(self).__name__}({self._v})")
         cls.__str__ = lambda self: str(self._v)
+
+    _install_legacy_repr(cls)
 
     # reductions, for parity with 0-d arrays
     for m in ("sum", "prod", "min", "max", "mean", "all", "any", "argmin",
               "argmax", "cumsum", "cumprod", "ptp", "std", "var", "round"):
         if not hasattr(cls, m):
             setattr(cls, m, _forward(m))
+
+
+def _legacy():
+    from ._printing import _legacy_level
+    return _legacy_level()
+
+
+def _install_legacy_repr(cls):
+    """NEP 51 gave scalars their `np.<type>(value)` repr in numpy 2.0.
+
+    ``printoptions(legacy='1.25')`` and older restore the pre-NEP-51 repr,
+    which for every numeric, bool and text scalar is simply its `str`.
+    """
+    nep51_repr = cls.__repr__
+
+    def __repr__(self):
+        from ._printing import _legacy_level
+        if _legacy_level() <= 125:
+            return self.__str__()
+        return nep51_repr(self)
+
+    cls.__repr__ = __repr__
 
 
 def _forward(method):
@@ -654,6 +1039,17 @@ def _bool_singleton(value, _t=True_, _f=False_):
 
 bool_._wrap = staticmethod(_bool_singleton)
 
+# The scalar fast path returns a dtype *code*; this is the table it indexes.
+# Built after `bool_._wrap` is replaced by the singleton lookup, so that
+# `np.float64(1) < np.float64(2)` still comes back as `np.True_` itself.
+_rnp._register_generic_class(generic)
+for _i, _nm in enumerate(_rnp._scalar_dtype_names()):
+    _WRAPS[_i] = _SCALAR_BY_NAME[_nm]._wrap
+del _i, _nm
+# The engine uses the same table whenever it has to hand back a scalar --
+# `a[i]`, `a.max()`, `a.item()` -- instead of looking the class up by name.
+_rnp._register_scalar_wraps(_WRAPS)
+
 
 # ---- the flexible types ----------------------------------------------------
 
@@ -696,6 +1092,10 @@ class bytes_(_builtins.bytes, character, metaclass=_FlexMeta, char="S"):
         return dtype(f"S{len(self) or 1}")
 
     def __repr__(self):
+        # Pre-NEP-51 (`legacy='1.25'`) the text scalars simply inherited the
+        # builtin's repr.
+        if _legacy() <= 125:
+            return _builtins.bytes.__repr__(self)
         return f"np.bytes_({_builtins.bytes.__repr__(self)})"
 
     def __str__(self):
@@ -723,6 +1123,8 @@ class str_(str, character, metaclass=_FlexMeta, char="U"):
         return dtype(f"U{len(self) or 1}")
 
     def __repr__(self):
+        if _legacy() <= 125:
+            return str.__repr__(self)
         return f"np.str_({str.__repr__(self)})"
 
     def __str__(self):
@@ -821,6 +1223,12 @@ _SCALAR_BY_NAME.update({
     "bytes_": bytes_, "str_": str_, "void": void, "object_": object_,
 })
 
+# `np.bool` and `np.datetime64` are the two *concrete* types numpy makes
+# subscriptable, and unlike the `number` tower they accept any number of
+# arguments (probed: `np.bool[Any, Any, Any]` is a valid GenericAlias).
+_GENERIC_ALIAS_ARITY[bool_] = True
+_GENERIC_ALIAS_ARITY[datetime64] = True
+
 
 # ---------------------------------------------------------------------------
 # Aliases, sctypeDict and ScalarType (all probed from numpy 2.5.2)
@@ -893,12 +1301,15 @@ typecodes = {
     "All": "?bhilqnpBHILQNPefdgFDGSUVOMm",
 }
 
+#: Verbatim from numpy 2.5.2's `numpy._core.sctypes` -- including the C-type
+#: aliases (`longlong`, `ulonglong`, `clongdouble`) and the scalar (not
+#: builtin) types under "others".
 sctypes = {
-    "int": [int8, int16, int32, int64],
-    "uint": [uint8, uint16, uint32, uint64],
+    "int": [int8, int16, int32, int64, longlong],
+    "uint": [uint8, uint16, uint32, uint64, ulonglong],
     "float": [float16, float32, float64, longdouble],
-    "complex": [complex64, complex128, clongdouble],
-    "others": [_builtins.bool, object, _builtins.bytes, str, _builtins.memoryview],
+    "complex": [complex64, clongdouble, complex128],
+    "others": [bytes_, str_, void, bool_, object_],
 }
 
 
@@ -907,6 +1318,11 @@ sctypes = {
 def registry():
     d = dict(_SCALAR_BY_NAME)
     d["object_"] = object_
+    # The engine looks scalar classes up by `dtype.name`, and the object
+    # dtype's name is "object" (no trailing underscore) while the scalar class
+    # is `object_`.  Without this alias `np.dtype('O').type` comes back None,
+    # so `issubclass(arr.dtype.type, np.object_)` raises instead of answering.
+    d["object"] = object_
     # The C-type aliases are distinct classes; `np.dtype('q').type` must find
     # `np.longlong` rather than `np.int64`.
     d.update({"longlong": longlong, "ulonglong": ulonglong,

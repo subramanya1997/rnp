@@ -1224,6 +1224,29 @@ impl PyNdArray {
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
         let me = slf.borrow().arr.clone();
+        // `a[i]` on a 1-d numeric array is the single most common indexing
+        // expression there is, and going through the general machinery for it
+        // costs a `Vec<IndexItem>`, a view `NdArray` (two more `Vec`s and an
+        // `Arc` bump) and a dtype-name lookup, all to read eight bytes. A
+        // bare `int` on a 1-d simple-dtype array skips straight to the read.
+        if me.ndim() == 1
+            && !me.dtype.is_flexible()
+            && !me.dtype.is_object()
+            && key.is_exact_instance_of::<pyo3::types::PyInt>()
+        {
+            if let Ok(i) = key.extract::<isize>() {
+                let n = me.shape[0];
+                let v = if i < 0 { i + n } else { i };
+                if v < 0 || v >= n {
+                    return Err(PyIndexError::new_err(format!(
+                        "index {} is out of bounds for axis 0 with size {}",
+                        i, n
+                    )));
+                }
+                let off = me.byte_offset + v * me.strides[0];
+                return npscalar_to_py(py, me.dtype, me.read_at(off));
+            }
+        }
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: view, scalarize } => {

@@ -16,7 +16,9 @@ use crate::convert::{array_from_any, np_scalar, scalar_from_py, weak_dtype, weak
 use crate::pyarray::{store_or_wrap, PyNdArray};
 use crate::pydtype::{dtype_from_any, PyDType};
 
-static FPE_REPORTER: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+use std::sync::OnceLock;
+
+static FPE_REPORTER: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Install the shim's `_errstate` reporter, which turns the engine's flags
 /// into numpy's RuntimeWarnings (or FloatingPointErrors) under the current
@@ -99,7 +101,25 @@ fn coerce(obj: &Bound<'_, PyAny>) -> PyResult<Operand> {
 
 /// Resolve NEP 50 weak scalars against the strong operands and hand back
 /// concrete arrays.
-fn resolve_operands(objs: &[Bound<'_, PyAny>], comparison: bool) -> PyResult<Vec<NdArray>> {
+/// The dtype a *weak* Python scalar in slot `i` must resolve against, for the
+/// ufuncs whose loop table is not uniform across the operands.
+///
+/// numpy resolves a weak scalar against the slot of the loop it lands in, not
+/// against the promotion of every operand: `np.ldexp(np.float64(0.5), 2)`
+/// picks the `di->d` loop, so the exponent becomes `int32` -- not float64,
+/// which would leave no matching loop at all.
+fn weak_slot_dtype(f: Ufn, i: usize) -> Option<DType> {
+    match (f, i) {
+        (Ufn::Bin(rnp_core::BinOp::Ldexp), 1) => Some(DType::I32),
+        _ => None,
+    }
+}
+
+fn resolve_operands(
+    objs: &[Bound<'_, PyAny>],
+    comparison: bool,
+    f: Ufn,
+) -> PyResult<Vec<NdArray>> {
     let ops: Vec<Operand> = objs.iter().map(coerce).collect::<PyResult<_>>()?;
     let mut strong: Option<DType> = None;
     for o in &ops {
@@ -111,11 +131,12 @@ fn resolve_operands(objs: &[Bound<'_, PyAny>], comparison: bool) -> PyResult<Vec
         }
     }
     let mut out = Vec::with_capacity(ops.len());
-    for o in ops {
+    for (i, o) in ops.into_iter().enumerate() {
         match (o.arr, o.weak) {
             (Some(a), _) => out.push(a),
             (None, Some(s)) => {
-                let d = match strong {
+                let slot = weak_slot_dtype(f, i);
+                let d = match slot.or(strong) {
                     Some(d) => weak_dtype(d, s, comparison)?,
                     None => s.natural_dtype(),
                 };
@@ -165,7 +186,8 @@ pub fn _ufunc_call<'py>(
         PyNotImplementedErrorShim::new(format!("ufunc '{name}' is not implemented by rnp yet"))
     })?;
     let objs: Vec<Bound<'py, PyAny>> = args.iter().collect();
-    let mut inputs = resolve_operands(&objs, matches!(f, Ufn::Bin(b) if b.is_comparison()))?;
+    let mut inputs =
+        resolve_operands(&objs, matches!(f, Ufn::Bin(b) if b.is_comparison()), f)?;
     if let Some(d) = dtype {
         if !d.is_none() {
             let dt = dtype_from_any(d)?;
@@ -427,6 +449,11 @@ pub fn _ufunc_reduce<'py>(
         Some(i) if !i.is_none() => scalar_from_py(i),
         _ => None,
     };
+    // The mask, kept alongside the identity substitution below: numpy's
+    // masked inner loop reduces each contiguous run of set mask values with a
+    // fresh pairwise tree, which the engine can only reproduce if it can still
+    // see where the runs are.
+    let mut where_mask: Option<NdArray> = None;
     if let Some(w) = where_ {
         if !w.is_none() && !matches!(w.extract::<bool>(), Ok(true)) {
             let ident = init_scalar
@@ -441,6 +468,9 @@ pub fn _ufunc_reduce<'py>(
             let mask = array_from_any(w, Some(DType::Bool), false)?;
             let mut base = NdArray::zeros(arr.shape.clone(), arr.dtype).map_err(crate::err)?;
             base.fill(ident.cast(arr.dtype));
+            where_mask = Some(
+                rnp_core::iter::broadcast_to(&mask, &arr.shape).map_err(crate::err)?,
+            );
             arr = apply_where(&arr, &base, &mask)?;
         }
     }
@@ -468,20 +498,58 @@ pub fn _ufunc_reduce<'py>(
     }
     // The axes to reduce, innermost last.
     let axes = resolve_axes(&arr, axis)?;
-    let mut cur = arr;
     let mut removed: Vec<usize> = axes.clone();
     removed.sort_unstable();
-    for &ax in removed.iter().rev() {
-        cur = match native_reduce_op(op) {
-            Some(rop) if cur.dtype.is_numeric() => {
-                rnp_core::reduce_axis(&cur, ax, rop, false).map_err(crate::err)?
-            }
-            _ => reduce_along(&cur, ax, op, None)?,
-        };
-    }
-    // `initial` seeds the whole reduction once, not once per axis, so it is
-    // folded in after every axis has collapsed.
-    if let Some(s) = init {
+    let native = native_reduce_op(op).filter(|_| arr.dtype.is_numeric());
+    // numpy seeds the accumulator with `initial=` before the first element is
+    // folded in, which for a sequential fold is *not* the same as combining it
+    // with the finished result. A chain of per-axis reductions cannot express
+    // that, so the engine is only told about `initial=` when the whole
+    // reduction is one collapse; otherwise it stays a post-hoc fold.
+    let one_collapse =
+        native.is_some() && (removed.len() == 1 || removed.len() == arr.ndim());
+    let ropts = rnp_core::reduce::ReduceOpts {
+        mask: where_mask.as_ref(),
+        seed: if one_collapse { init } else { None },
+    };
+    let post_init = if one_collapse { None } else { init };
+
+    // `axis=None` is a *single* reduction over the flattened operand, not a
+    // chain of per-axis ones: numpy's iterator coalesces the axes of a
+    // contiguous operand into one run and runs one pairwise tree over it. A
+    // chain of per-axis reductions brackets the additions completely
+    // differently and diverges in the last bits.
+    let mut cur = if removed.len() == arr.ndim() && native.is_some() {
+        let rop = native.expect("checked above");
+        let v = rnp_core::reduce::reduce_all_with(&arr, rop, ropts)
+            .map_err(crate::err)?;
+        let out0 = NdArray::zeros(vec![], rnp_core::reduce::reduce_dtype(rop, arr.dtype))
+            .map_err(crate::err)?;
+        out0.write_at(out0.byte_offset, v);
+        out0
+    } else {
+        let mut cur = arr;
+        for (nth, &ax) in removed.iter().rev().enumerate() {
+            // The mask and the seed only describe the operand as it came in,
+            // so they can only steer the first collapse.
+            let o = if nth == 0 {
+                ropts
+            } else {
+                rnp_core::reduce::ReduceOpts::default()
+            };
+            cur = match native {
+                Some(rop) if cur.dtype.is_numeric() => {
+                    rnp_core::reduce::reduce_axis_with(&cur, ax, rop, false, o)
+                        .map_err(crate::err)?
+                }
+                _ => reduce_along(&cur, ax, op, None)?,
+            };
+        }
+        cur
+    };
+    // Only reached when the reduction was a chain, where the engine could not
+    // seed the accumulator itself.
+    if let Some(s) = post_init {
         let mut seed = NdArray::zeros(cur.shape.clone(), cur.dtype).map_err(crate::err)?;
         seed.fill(s.cast(cur.dtype));
         cur = rnp_core::binary(&seed, &cur, op).map_err(crate::err)?;
@@ -821,6 +889,283 @@ fn int_overflowed(op: BinOp, x: Scalar, y: Scalar, r: Scalar, dt: DType) -> bool
     exact != got
 }
 
+
+// ---------------------------------------------------------------------------
+// The allocation-free scalar fast path
+// ---------------------------------------------------------------------------
+//
+// `np.float64(1.5) + np.float64(2.5)` is ~2.4us against numpy's 0.15us, and
+// almost none of that is arithmetic: the old bridge looked the ufunc up by
+// name, probed both operands with `getattr`, built two 0-d `NdArray`s, ran the
+// array driver (which allocates a third), and handed back a freshly
+// constructed `dtype` object inside a tuple. This path does none of that.
+// `rnp_core::ops::binary_scalar` runs the same element kernels over `Scalar`
+// values, operands are classified by *type pointer* against a registry the
+// shim fills in at class-creation time, and the result is `(code, value,
+// flags)` where `code` indexes a tuple of wrapper callables on the Python
+// side -- no `dtype` object is created at all.
+
+/// The dtypes a numpy scalar can have, in the order the shim's wrapper table
+/// uses. `_scalar_dtype_names()` hands the same order to Python.
+pub const SCALAR_DTYPES: [DType; 14] = [
+    DType::Bool,
+    DType::I8,
+    DType::I16,
+    DType::I32,
+    DType::I64,
+    DType::U8,
+    DType::U16,
+    DType::U32,
+    DType::U64,
+    DType::F16,
+    DType::F32,
+    DType::F64,
+    DType::C64,
+    DType::C128,
+];
+
+#[inline]
+pub fn dtype_code(d: DType) -> Option<usize> {
+    SCALAR_DTYPES.iter().position(|&x| x == d)
+}
+
+/// The binary ops reachable from a scalar operator method, in opcode order.
+/// The shim resolves each name to its index once, when it builds the classes.
+const SCALAR_BINOPS: [BinOp; 18] = [
+    BinOp::Add,
+    BinOp::Sub,
+    BinOp::Mul,
+    BinOp::Div,
+    BinOp::FloorDiv,
+    BinOp::Mod,
+    BinOp::Pow,
+    BinOp::BitAnd,
+    BinOp::BitOr,
+    BinOp::BitXor,
+    BinOp::LShift,
+    BinOp::RShift,
+    BinOp::Lt,
+    BinOp::Le,
+    BinOp::Gt,
+    BinOp::Ge,
+    BinOp::Eq,
+    BinOp::Ne,
+];
+
+const SCALAR_BINOP_NAMES: [&str; 18] = [
+    "add",
+    "subtract",
+    "multiply",
+    "divide",
+    "floor_divide",
+    "remainder",
+    "power",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "left_shift",
+    "right_shift",
+    "less",
+    "less_equal",
+    "greater",
+    "greater_equal",
+    "equal",
+    "not_equal",
+];
+
+/// `type(scalar) -> DType`, filled in by `_register_scalar_class`. Reading it
+/// is one pointer hash, which replaces two `getattr`s plus a downcast.
+static TYPE_REG: OnceLock<std::sync::RwLock<std::collections::HashMap<usize, DType>>> =
+    OnceLock::new();
+/// The shim's `generic` base class, used only on the miss path.
+static GENERIC_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
+
+fn type_reg() -> &'static std::sync::RwLock<std::collections::HashMap<usize, DType>> {
+    TYPE_REG.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+#[pyfunction]
+pub fn _register_scalar_class(cls: &Bound<'_, PyAny>, dtype: &Bound<'_, PyAny>) -> PyResult<()> {
+    let dt = dtype_from_any(dtype)?;
+    let ptr = cls.as_ptr() as usize;
+    type_reg().write().unwrap().insert(ptr, dt);
+    Ok(())
+}
+
+#[pyfunction]
+pub fn _register_generic_class(cls: Py<PyAny>) {
+    let _ = GENERIC_CLS.set(cls);
+}
+
+/// The dtype names in wrapper-table order, so the shim can build the table.
+#[pyfunction]
+pub fn _scalar_dtype_names() -> Vec<String> {
+    SCALAR_DTYPES.iter().map(|d| d.name()).collect()
+}
+
+/// The opcode for one ufunc name, or `None` when the scalar fast path has no
+/// entry for it (the shim then keeps using the general bridge).
+#[pyfunction]
+pub fn _scalar_binop_code(name: &str) -> Option<usize> {
+    SCALAR_BINOP_NAMES.iter().position(|&n| n == name)
+}
+
+/// One classified operand.
+enum SOperand {
+    /// A numpy scalar: strong under NEP 50, keeps its own dtype.
+    Strong(DType, Scalar),
+    /// A bare Python number: weak, adopts the other operand's dtype.
+    Weak(Scalar),
+    /// Anything else.
+    Other,
+}
+
+#[inline]
+fn classify(obj: &Bound<'_, PyAny>) -> PyResult<SOperand> {
+    // Exact builtins first: a numpy scalar is never one of these *exactly*
+    // (`float64` is a subclass of `float`), so these four pointer compares
+    // cannot shadow it.
+    if obj.is_exact_instance_of::<pyo3::types::PyBool>() {
+        return Ok(SOperand::Weak(Scalar::Bool(obj.extract::<bool>()?)));
+    }
+    if obj.is_exact_instance_of::<pyo3::types::PyFloat>() {
+        return Ok(SOperand::Weak(Scalar::Float(obj.extract::<f64>()?)));
+    }
+    if obj.is_exact_instance_of::<pyo3::types::PyInt>() {
+        return Ok(match scalar_from_py(obj) {
+            Some(s) => SOperand::Weak(s),
+            // An int wider than 64 bits: no `Scalar` holds it, and the old
+            // bridge raised `TypeError` for it. Keep that.
+            None => SOperand::Other,
+        });
+    }
+    if obj.is_exact_instance_of::<pyo3::types::PyComplex>() {
+        return Ok(match scalar_from_py(obj) {
+            Some(s) => SOperand::Weak(s),
+            None => SOperand::Other,
+        });
+    }
+    let dt = {
+        let reg = type_reg().read().unwrap();
+        reg.get(&(obj.get_type().as_ptr() as usize)).copied()
+    };
+    if let Some(dt) = dt {
+        let v = obj.getattr(pyo3::intern!(obj.py(), "_v"))?;
+        if let Some(s) = scalar_from_py(&v) {
+            return Ok(SOperand::Strong(dt, s.cast(dt)));
+        }
+        // A flexible scalar (`str_`, `void`, ...) whose payload is not a
+        // number: not for this path.
+        return Ok(SOperand::Other);
+    }
+    // Unregistered: subclasses of our scalar types, other libraries' numbers.
+    if let Some((d, s)) = np_scalar(obj)? {
+        return Ok(SOperand::Strong(d, s));
+    }
+    Ok(match scalar_from_py(obj) {
+        Some(s) => SOperand::Weak(s),
+        None => SOperand::Other,
+    })
+}
+
+/// The guard that used to live in `_scalars._binary`, kept verbatim so the
+/// distinction it draws survives: `NotImplemented` (so Python tries the other
+/// operand's reflected method, which is how `np.float64(1) < np.arange(3)`
+/// reaches `ndarray.__gt__`) when either operand is an array or not a number
+/// at all, and the engine's `TypeError` for a `generic`/`int` the engine has
+/// no `Scalar` for (an `int` wider than 64 bits, a `str_`, ...).
+///
+/// Returns `Ok(None)` for the `NotImplemented` case.
+fn unusable<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    b: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if a.is_instance_of::<PyNdArray>() || b.is_instance_of::<PyNdArray>() {
+        return Ok(None);
+    }
+    let numberish = |o: &Bound<'py, PyAny>| -> bool {
+        o.is_instance_of::<pyo3::types::PyInt>()
+            || o.is_instance_of::<pyo3::types::PyFloat>()
+            || o.is_instance_of::<pyo3::types::PyComplex>()
+            || GENERIC_CLS
+                .get()
+                .is_some_and(|g| o.is_instance(g.bind(py)).unwrap_or(false))
+    };
+    if !numberish(a) || !numberish(b) {
+        return Ok(None);
+    }
+    Err(PyTypeError::new_err("unsupported operand"))
+}
+
+/// `scalar OP scalar` with no allocation: the whole point of this module.
+///
+/// Returns `(dtype_code, value, fp_flags)`, or `None` when Python should see
+/// `NotImplemented`.
+#[pyfunction]
+pub fn _scalar_binop2<'py>(
+    py: Python<'py>,
+    code: usize,
+    a: &Bound<'py, PyAny>,
+    b: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let op = SCALAR_BINOPS[code];
+    let (oa, ob) = (classify(a)?, classify(b)?);
+    let ((dta, xa), (dtb, xb)) = match (oa, ob) {
+        (SOperand::Strong(d, s), SOperand::Strong(e, t)) => ((d, s), (e, t)),
+        (SOperand::Strong(d, s), SOperand::Weak(t)) => ((d, s), (weak_promote(d, t), t)),
+        (SOperand::Weak(s), SOperand::Strong(e, t)) => ((weak_promote(e, s), s), (e, t)),
+        (SOperand::Weak(s), SOperand::Weak(t)) => ((s.natural_dtype(), s), (t.natural_dtype(), t)),
+        _ => return unusable(py, a, b),
+    };
+    fpe::clear();
+    let (out_dt, mut value) =
+        match rnp_core::ops::binary_scalar(xa.cast(dta), dta, xb.cast(dtb), dtb, op) {
+            Some(r) => r.map_err(crate::err)?,
+            // Flexible / object / datetime operands: fall back to the general
+            // array bridge so their messages stay numpy's.
+            None => {
+                let mut ya = NdArray::zeros(vec![], dta).map_err(crate::err)?;
+                ya.set(&[], xa).map_err(crate::err)?;
+                let mut yb = NdArray::zeros(vec![], dtb).map_err(crate::err)?;
+                yb.set(&[], xb).map_err(crate::err)?;
+                let r = rnp_core::binary(&ya, &yb, op).map_err(crate::err)?;
+                (r.dtype, r.get_flat(0))
+            }
+        };
+    let mut flags = fpe::take();
+    // numpy reports integer overflow for *scalar* operations only.
+    if out_dt.is_integer() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow) {
+        if int_overflowed(op, xa.cast(out_dt), xb.cast(out_dt), value, out_dt) {
+            flags |= fpe::OVER;
+        }
+    }
+    if out_dt == DType::F16 {
+        // The Python side stores float16 as a double; `Scalar::Float` already
+        // holds the widened value, so nothing to do -- kept explicit so the
+        // invariant is visible.
+        value = value.cast(DType::F64);
+    }
+    let dc = dtype_code(out_dt).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "scalar '{}' produced a {} result, which has no scalar class",
+            op.name(),
+            out_dt.name()
+        ))
+    })?;
+    Ok(Some(
+        PyTuple::new(
+            py,
+            [
+                dc.into_pyobject(py)?.into_any(),
+                crate::convert::scalar_to_py(py, value)?,
+                flags.into_pyobject(py)?.into_any(),
+            ],
+        )?
+        .into_any(),
+    ))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_ufunc_call, m)?)?;
     m.add_function(wrap_pyfunction!(_ufunc_reduce, m)?)?;
@@ -832,6 +1177,11 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_scalar_cast, m)?)?;
     m.add_function(wrap_pyfunction!(_scalar_binop, m)?)?;
     m.add_function(wrap_pyfunction!(_scalar_unop, m)?)?;
+    m.add_function(wrap_pyfunction!(_scalar_binop2, m)?)?;
+    m.add_function(wrap_pyfunction!(_scalar_binop_code, m)?)?;
+    m.add_function(wrap_pyfunction!(_scalar_dtype_names, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_scalar_class, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_generic_class, m)?)?;
     Ok(())
 }
 

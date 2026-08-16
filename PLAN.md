@@ -434,3 +434,89 @@ benchmark run, Fable review, git commit.
     loop at all (M6 for the matmul family).
   * Underflow is only detected under a non-default `errstate(under=...)`,
     and float16 `str`/`repr` still differs from numpy on a few values.
+
+- 2026-08-16: M4 started (Opus). Scope, in the priority order set by Fable:
+  (1) kill all 119 dev_check divergences; (2) storage-model completion
+  (`Descr` in the array header, byte-swapped arrays, datetime64/timedelta64,
+  object-dtype ufuncs, structured field access); (3) a collection sweep over
+  the files that still fail to import; (4) the scalar fast path and the
+  remaining benchmark debt.
+
+- 2026-08-16: M4 correctness gate met. **`harness/dev_check.py`: 22096
+  comparisons / 0 divergences** (was 22089 / 119). `cargo test --release`
+  97 passing (was 86). No check in `dev_check.py` was weakened or skipped at
+  any point; the count went to zero by fixing the port.
+
+  How the 119 fell, by cluster:
+
+  * **~45 complex-at-infinity/NaN cases.** The premise that numpy implements
+    the C99 Annex G tables in `npy_math_complex.c.src` turned out to be false
+    on this platform: every one of those bodies sits behind `#ifndef
+    HAVE_CSIN@C@`, and `numpy/_core/meson.build` defines the whole `HAVE_*`
+    C99 complex family whenever libc provides it -- which macOS does. **numpy's
+    complex ufuncs are the system libm's `csin`/`cacos`/`csqrt`/...**, which was
+    confirmed by compiling a C probe whose output matches numpy bit for bit.
+    The port now calls the same libm entry points through `extern "C"`
+    (`Complex<T>` is `#[repr(C)]`, the same parameter class as
+    `double _Complex` under AAPCS64 and x86-64 SysV), with numpy's own `nc_*`
+    wrappers from `umath/funcs.inc.src` transcribed around them:
+    `exp2 = cexp(z*ln2)`, `log10 = clog(z)*log10(e)` -- a *multiply*, which is
+    what fixed the 1-ULP `log10`/`log2` rows -- plus `expm1`/`log1p` built from
+    the real routines and `CDOUBLE_sign`/`_reciprocal` from `loops.c.src`.
+    `complex64` was silently broken along the way (23 ufuncs diverging, hidden
+    because `UFUNC_DTYPES` carries no `complex64`); it now uses the
+    single-precision libm entries as numpy does.
+  * That forced the error-flag design. Conditions like
+    `arctanh(1.8e308+0j)` -> divide-by-zero *and* invalid with a finite result
+    are artifacts of the libm's internals; no value-level rule reproduces them.
+    Since the port now calls the same libm, it reads the same source numpy
+    reads: `fpe::hw_clear`/`hw_take` mirror `npy_get_floatstatus_barrier`,
+    scoped to the complex loops only, cleared and folded per rayon chunk. The
+    consequence, recorded deliberately: rnp's complex warnings are now as
+    platform-dependent as numpy's own are.
+  * **~15 real-dtype flag mismatches.** Probing `npy_divmod` showed only two
+    of its divisions can signal and that `npy_remainder` discards the
+    quotient -- which is why `remainder(1.0, 0.0)` is silent while
+    `divmod(1.0, 0.0)` is divide-by-zero, and why float16 `remainder` reports
+    nothing at all (half computes in `float`, so its quotient never
+    overflows). `logaddexp`'s invalid comes from C's signalling `>`/`<=` on a
+    NaN. `INT_MIN // -1` overflow was added for `floor_divide`/`divmod`.
+  * **4 float16 min/max.** The half loops carry no signed-zero fixup, so the
+    *first* operand wins ties -- the opposite of float32/float64, which were
+    already right and are unchanged.
+  * **2 `lcm` signed-boundary.** numpy takes both magnitudes in the *unsigned*
+    type (`(utype)0 - (utype)a`), runs the unsigned algorithm and casts back.
+  * **2 float32 `sin`/`cos`.** Transcribed the Cody-Waite reduction plus
+    polynomial from `loops_trigonometric.dispatch.cpp` scalar-wise (hex
+    constants via `f32::from_bits`, every `MulAdd` a real FMA). The result is
+    **bit-exact, 0 ULP** -- not the "within 1 ULP" the plan allowed for -- and
+    the dev_check ULP table now reads `sin float32 0`, `cos float32 0`.
+  * **23 reduction-ordering rows.** Three distinct model errors, each pinned
+    by bit-level experiment against numpy before being implemented.
+    `axis=None` was a *chain* of per-axis reductions; numpy's iterator
+    coalesces a contiguous operand into one run and does a single pairwise
+    tree, bit-identical to `reduce(a.reshape(-1))`. `where=` is neither
+    compress-then-reduce nor identity-substitution: numpy's
+    `generic_masked_strided_loop` hands the unmasked inner loop each maximal
+    contiguous run of set mask values, so the pairwise tree is rebuilt per run
+    and the run totals fold in sequentially. `reduceat` copies `a[start]` into
+    the output and loops over the remaining `count-1`, so the fold is
+    `a[start] + pairwise(a[start+1:stop])` -- and that is keyed on `add`,
+    the only loop with `PW = 1`; a naive "always split" broke
+    `multiply.reduceat`, which is what caught it. Found in passing:
+    `initial=` *seeds the accumulator* before the fold rather than combining
+    with the finished result, which differs for an outer-axis sum.
+  * **14 type-resolution rows.** `numpy._core._exceptions` is now ported
+    faithfully (correct MRO, `_display_as_base` renaming, exact `__str__`) and
+    raised from Rust through a `_set_error_factories` hook, so
+    `pytest.raises(np._core._exceptions._UFuncNoLoopError)` works.
+    `gcd`/`lcm`/`positive`/`sign` reject their common dtype exactly where
+    numpy's `SimpleUniformOperationTypeResolver` does, including refusing bool
+    rather than lifting it to int8; `negative` on bool raises a plain
+    `TypeError` because `PyUFunc_NegativeTypeResolver` errors *before* loop
+    lookup -- the asymmetry is real. Done in Rust, so `+arr`/`-arr` are right
+    too. `ldexp` now accepts bool, and the NEP-50 weak-scalar bug
+    (`np.ldexp(np.float64(0.5), 2)` wrongly raising) is fixed with a per-slot
+    resolution table.
+  * **`np.record`** is a real `void` subclass with numpy's
+    `(record, void, flexible, generic, object)` MRO.

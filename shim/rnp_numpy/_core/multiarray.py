@@ -52,7 +52,14 @@ copyto = not_implemented("numpy._core.multiarray.copyto")
 concatenate = not_implemented("numpy._core.multiarray.concatenate")
 correlate = not_implemented("numpy._core.multiarray.correlate")
 correlate2 = not_implemented("numpy._core.multiarray.correlate2")
-_vec_string = not_implemented("numpy._core.multiarray._vec_string")
+
+
+def _vec_string(char_array, dtype, method, args=()):
+    """Element-wise method call over a string array (see `_core.strings`)."""
+    from .strings import _vec_string as _impl
+    return _impl(char_array, dtype, method, args)
+
+
 scalar = not_implemented("numpy._core.multiarray.scalar")
 set_datetimeparse_function = not_implemented(
     "numpy._core.multiarray.set_datetimeparse_function")

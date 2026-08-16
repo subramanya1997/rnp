@@ -115,7 +115,7 @@ where
     U: Copy + Send,
     F: Fn(T, T) -> U + Sync + Send,
 {
-    binary2_watch::<T, U, _, _>(a, b, o, n, f, |_| false);
+    binary2_watch::<T, U, _, _>(a, b, o, n, f, |_, _, _| false);
 }
 
 /// As [`binary2`], additionally OR-folding a cheap per-element predicate and
@@ -126,6 +126,12 @@ where
 /// loops that cannot raise. Folding it here rather than re-scanning the output
 /// afterwards matters: a separate pass over a 1e6-element `f64` result costs
 /// more than the arithmetic did.
+///
+/// The predicate is handed the operands as well as the result, because a few
+/// ops can raise while returning a perfectly ordinary number -- `remainder`
+/// reports the overflow of the quotient it computed on the way, and the complex
+/// comparisons report the NaN their signalling compare tripped over. Closures
+/// that ignore the operands compile to exactly what they did before.
 #[inline]
 pub(crate) fn binary2_watch<T, U, F, S>(
     a: &NdArray,
@@ -139,7 +145,7 @@ where
     T: Element + Sync,
     U: Copy + Send,
     F: Fn(T, T) -> U + Sync + Send,
-    S: Fn(U) -> bool + Sync + Send + Copy,
+    S: Fn(T, T, U) -> bool + Sync + Send + Copy,
 {
     let mut hit = false;
     if let (Some(pa), Some(pb)) = (flat_ptr::<T>(a), flat_ptr::<T>(b)) {
@@ -162,8 +168,9 @@ where
                     let base = c * PAR_CHUNK;
                     let mut local = false;
                     for (k, slot) in chunk.iter_mut().enumerate() {
-                        let r = f(sa[base + k], sb[base + k]);
-                        local |= watch(r);
+                        let (x, y) = (sa[base + k], sb[base + k]);
+                        let r = f(x, y);
+                        local |= watch(x, y, r);
                         *slot = r;
                     }
                     local
@@ -173,8 +180,9 @@ where
         for i in 0..n {
             // SAFETY: i < n and all three buffers hold at least n elements.
             unsafe {
-                let r = f(*pa.add(i), *pb.add(i));
-                hit |= watch(r);
+                let (x, y) = (*pa.add(i), *pb.add(i));
+                let r = f(x, y);
+                hit |= watch(x, y, r);
                 *o.add(i) = r;
             }
         }
@@ -209,7 +217,7 @@ where
                                 pb.ptr().offset(base_b + i * sb) as *const T,
                             );
                             let r = f(x, y);
-                            local |= watch(r);
+                            local |= watch(x, y, r);
                             *slot = r;
                         }
                     }
@@ -239,7 +247,56 @@ where
                 }
             };
             let other = SendPtr(if sa == 0 { pb } else { pa });
-            let apply = move |v: T| if scalar_first { f(sv, v) } else { f(v, sv) };
+            // The (x, y) pair the op sees, in operand order.
+            let pair = move |v: T| if scalar_first { (sv, v) } else { (v, sv) };
+            // The overwhelmingly common shape of `array OP python-number`:
+            // the non-scalar side is contiguous. Walking it with a byte
+            // pointer and a *runtime* step, as the general loop below does,
+            // hides that fact from LLVM and costs the vectoriser entirely --
+            // `bitwise_and(i32_array, 255)` ran 2.6x numpy purely because of
+            // the pointer shape. Forming real slices puts it back.
+            if step == std::mem::size_of::<T>() as isize
+                && base % std::mem::size_of::<T>() as isize == 0
+            {
+                // SAFETY: the operand is contiguous over the `n` elements
+                // starting at `base`, `base` is a multiple of the itemsize (so
+                // the pointer is aligned for T), and `o` owns `n` freshly
+                // allocated elements nothing else refers to.
+                let (src, dst) = unsafe {
+                    (
+                        std::slice::from_raw_parts(other.ptr().offset(base) as *const T, n),
+                        std::slice::from_raw_parts_mut(o, n),
+                    )
+                };
+                if n >= PAR_THRESHOLD {
+                    use rayon::prelude::*;
+                    return dst
+                        .par_chunks_mut(PAR_CHUNK)
+                        .zip(src.par_chunks(PAR_CHUNK))
+                        .map(|(chunk, s)| {
+                            let mut local = false;
+                            for (slot, &v) in chunk.iter_mut().zip(s) {
+                                let (x, y) = pair(v);
+                                let r = f(x, y);
+                                local |= watch(x, y, r);
+                                *slot = r;
+                            }
+                            local
+                        })
+                        .reduce(|| false, |p, q| p | q);
+                }
+                for (slot, &v) in dst.iter_mut().zip(src) {
+                    let (x, y) = pair(v);
+                    let r = f(x, y);
+                    hit |= watch(x, y, r);
+                    *slot = r;
+                }
+                return hit;
+            }
+            let apply = move |v: T| {
+                let (x, y) = pair(v);
+                f(x, y)
+            };
             if n >= PAR_THRESHOLD {
                 use rayon::prelude::*;
                 // SAFETY: `o` owns `n` freshly allocated elements nothing else
@@ -258,8 +315,9 @@ where
                                 let v = std::ptr::read_unaligned(
                                     other.ptr().offset(base + i * step) as *const T,
                                 );
+                                let (x, y) = pair(v);
                                 let r = apply(v);
-                                local |= watch(r);
+                                local |= watch(x, y, r);
                                 *slot = r;
                             }
                         }
@@ -273,8 +331,9 @@ where
                     let v = std::ptr::read_unaligned(
                         other.ptr().offset(base + i as isize * step) as *const T,
                     );
+                    let (x, y) = pair(v);
                     let r = apply(v);
-                    hit |= watch(r);
+                    hit |= watch(x, y, r);
                     *o.add(i) = r;
                 }
             }
@@ -287,7 +346,7 @@ where
                 let x = std::ptr::read_unaligned(pa.offset(base_a + i as isize * sa) as *const T);
                 let y = std::ptr::read_unaligned(pb.offset(base_b + i as isize * sb) as *const T);
                 let r = f(x, y);
-                hit |= watch(r);
+                hit |= watch(x, y, r);
                 *o.add(i) = r;
             }
         }
@@ -303,7 +362,7 @@ where
             let x = std::ptr::read_unaligned(a.buffer.as_ptr().offset(oa) as *const T);
             let y = std::ptr::read_unaligned(b.buffer.as_ptr().offset(ob) as *const T);
             let r = f(x, y);
-            hit |= watch(r);
+            hit |= watch(x, y, r);
             *o.add(i) = r;
         }
     }
@@ -332,7 +391,7 @@ pub(crate) fn binary2_flagged<T, U, F, S, G>(
     T: Element + Sync,
     U: Copy + Send,
     F: Fn(T, T) -> U + Sync + Send,
-    S: Fn(U) -> bool + Sync + Send + Copy,
+    S: Fn(T, T, U) -> bool + Sync + Send + Copy,
     G: Fn(T, T, U) -> u8 + Sync + Send,
 {
     if !binary2_watch::<T, U, _, _>(a, b, o, n, f, watch) {
@@ -348,14 +407,13 @@ pub(crate) fn binary2_flagged<T, U, F, S, G>(
     // `arange(1e6) * arange(1e6)`) cost more than the whole multiply.
     if let (Some((sa, base_a)), Some((sb, base_b))) = (linear_walk(a), linear_walk(b)) {
         for (i, &r) in out.iter().enumerate() {
-            if !watch(r) {
-                continue;
-            }
             // SAFETY: base + i*stride is in bounds for i < n.
             unsafe {
                 let x = std::ptr::read_unaligned(pa.offset(base_a + i as isize * sa) as *const T);
                 let y = std::ptr::read_unaligned(pb.offset(base_b + i as isize * sb) as *const T);
-                flags |= g(x, y, r);
+                if watch(x, y, r) {
+                    flags |= g(x, y, r);
+                }
             }
         }
         fpe::raise(flags);
@@ -364,15 +422,14 @@ pub(crate) fn binary2_flagged<T, U, F, S, G>(
     let ia = offsets(&a.shape, &a.strides, a.byte_offset);
     let ib = offsets(&b.shape, &b.strides, b.byte_offset);
     for (i, (oa, ob)) in ia.zip(ib).enumerate() {
-        if !watch(out[i]) {
-            continue;
-        }
         // SAFETY: the offsets come from in-bounds strided iteration over the
         // (already broadcast) operands.
         unsafe {
             let x = std::ptr::read_unaligned(pa.offset(oa) as *const T);
             let y = std::ptr::read_unaligned(pb.offset(ob) as *const T);
-            flags |= g(x, y, out[i]);
+            if watch(x, y, out[i]) {
+                flags |= g(x, y, out[i]);
+            }
         }
     }
     fpe::raise(flags);
@@ -389,7 +446,7 @@ where
     U: Copy + Send,
     F: Fn(T) -> U + Sync + Send,
 {
-    unary1_watch::<T, U, _, _>(a, o, n, f, |_| false);
+    unary1_watch::<T, U, _, _>(a, o, n, f, |_, _| false);
 }
 
 /// As [`unary1`], OR-folding a cheap per-element predicate.
@@ -405,7 +462,7 @@ where
     T: Element + Sync,
     U: Copy + Send,
     F: Fn(T) -> U + Sync + Send,
-    S: Fn(U) -> bool + Sync + Send + Copy,
+    S: Fn(T, U) -> bool + Sync + Send + Copy,
 {
     let mut hit = false;
     if let Some(pa) = flat_ptr::<T>(a) {
@@ -426,8 +483,9 @@ where
                     let base = c * PAR_CHUNK;
                     let mut local = false;
                     for (k, slot) in chunk.iter_mut().enumerate() {
-                        let r = f(sa[base + k]);
-                        local |= watch(r);
+                        let x = sa[base + k];
+                        let r = f(x);
+                        local |= watch(x, r);
                         *slot = r;
                     }
                     local
@@ -437,8 +495,9 @@ where
         for i in 0..n {
             // SAFETY: i < n and both buffers hold at least n elements.
             unsafe {
-                let r = f(*pa.add(i));
-                hit |= watch(r);
+                let x = *pa.add(i);
+                let r = f(x);
+                hit |= watch(x, r);
                 *o.add(i) = r;
             }
         }
@@ -451,7 +510,7 @@ where
             unsafe {
                 let x = std::ptr::read_unaligned(pa.offset(base_a + i as isize * sa) as *const T);
                 let r = f(x);
-                hit |= watch(r);
+                hit |= watch(x, r);
                 *o.add(i) = r;
             }
         }
@@ -462,11 +521,102 @@ where
         unsafe {
             let x = std::ptr::read_unaligned(a.buffer.as_ptr().offset(oa) as *const T);
             let r = f(x);
-            hit |= watch(r);
+            hit |= watch(x, r);
             *o.add(i) = r;
         }
     }
     hit
+}
+
+/// As [`binary2`], taking the error flags from the CPU's status register.
+///
+/// The binary counterpart of [`unary1_hw`]; used by complex `power`, whose
+/// conditions come partly from the platform's `cpow` and partly from the
+/// complex division `npy_cpow` performs for a negative exponent.
+#[inline]
+pub(crate) fn binary2_hw<T, F>(a: &NdArray, b: &NdArray, o: *mut T, n: usize, f: F)
+where
+    T: Element + Sync + Send,
+    F: Fn(T, T) -> T + Sync + Send,
+{
+    if n >= PAR_THRESHOLD {
+        if let (Some(pa), Some(pb)) = (flat_ptr::<T>(a), flat_ptr::<T>(b)) {
+            use rayon::prelude::*;
+            // SAFETY: `o` owns `n` freshly allocated elements that nothing else
+            // refers to; `pa`/`pb` are contiguous runs of `n` live elements.
+            let (dst, sa, sb) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(o, n),
+                    std::slice::from_raw_parts(pa, n),
+                    std::slice::from_raw_parts(pb, n),
+                )
+            };
+            let flags = dst
+                .par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .map(|(c, chunk)| {
+                    fpe::hw_clear();
+                    let base = c * PAR_CHUNK;
+                    for (k, slot) in chunk.iter_mut().enumerate() {
+                        *slot = f(sa[base + k], sb[base + k]);
+                    }
+                    fpe::hw_take()
+                })
+                .reduce(|| 0u8, |p, q| p | q);
+            fpe::raise(flags);
+            return;
+        }
+    }
+    fpe::hw_clear();
+    binary2::<T, T, _>(a, b, o, n, f);
+    fpe::raise(fpe::hw_take());
+}
+
+/// As [`unary1`], taking the error flags from the CPU's status register rather
+/// than from the values.
+///
+/// This is the driver for the complex transcendentals, which call the platform
+/// libm exactly as numpy does; see [`crate::fpe::hw_take`] for why the hardware
+/// is the only faithful source there. The register is per thread, so a loop
+/// that rayon splits has to clear and read it inside each chunk -- which is
+/// still one pair of calls per 16k elements, not per element.
+#[inline]
+pub(crate) fn unary1_hw<T, F>(a: &NdArray, o: *mut T, n: usize, f: F)
+where
+    T: Element + Sync + Send,
+    F: Fn(T) -> T + Sync + Send,
+{
+    if n >= PAR_THRESHOLD {
+        if let Some(pa) = flat_ptr::<T>(a) {
+            use rayon::prelude::*;
+            // SAFETY: `o` owns `n` freshly allocated elements that nothing else
+            // refers to, and `pa` is a contiguous run of `n` live elements.
+            let (dst, sa) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(o, n),
+                    std::slice::from_raw_parts(pa, n),
+                )
+            };
+            let flags = dst
+                .par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .map(|(c, chunk)| {
+                    fpe::hw_clear();
+                    let base = c * PAR_CHUNK;
+                    for (k, slot) in chunk.iter_mut().enumerate() {
+                        *slot = f(sa[base + k]);
+                    }
+                    fpe::hw_take()
+                })
+                .reduce(|| 0u8, |p, q| p | q);
+            fpe::raise(flags);
+            return;
+        }
+    }
+    // Every remaining path in `unary1` is serial, so one bracket covers it.
+    fpe::hw_clear();
+    unary1::<T, T, _>(a, o, n, f);
+    fpe::raise(fpe::hw_take());
 }
 
 /// As [`unary1`], with the same two-phase error-flag scheme as
@@ -483,7 +633,7 @@ pub(crate) fn unary1_flagged<T, U, F, S, G>(
     T: Element + Sync,
     U: Copy + Send,
     F: Fn(T) -> U + Sync + Send,
-    S: Fn(U) -> bool + Sync + Send + Copy,
+    S: Fn(T, U) -> bool + Sync + Send + Copy,
     G: Fn(T, U) -> u8 + Sync + Send,
 {
     if !unary1_watch::<T, U, _, _>(a, o, n, f, watch) {
@@ -495,26 +645,24 @@ pub(crate) fn unary1_flagged<T, U, F, S, G>(
     let pa = a.buffer.as_ptr();
     if let Some((sa, base_a)) = linear_walk(a) {
         for (i, &r) in out.iter().enumerate() {
-            if !watch(r) {
-                continue;
-            }
             // SAFETY: base + i*stride is in bounds for i < n.
             unsafe {
                 let x = std::ptr::read_unaligned(pa.offset(base_a + i as isize * sa) as *const T);
-                flags |= g(x, r);
+                if watch(x, r) {
+                    flags |= g(x, r);
+                }
             }
         }
         fpe::raise(flags);
         return;
     }
     for (i, oa) in offsets(&a.shape, &a.strides, a.byte_offset).enumerate() {
-        if !watch(out[i]) {
-            continue;
-        }
         // SAFETY: the offset comes from in-bounds strided iteration over `a`.
         unsafe {
             let x = std::ptr::read_unaligned(pa.offset(oa) as *const T);
-            flags |= g(x, out[i]);
+            if watch(x, out[i]) {
+                flags |= g(x, out[i]);
+            }
         }
     }
     fpe::raise(flags);

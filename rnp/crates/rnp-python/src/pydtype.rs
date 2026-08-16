@@ -22,6 +22,25 @@ pub fn register_scalar_types(d: Bound<'_, PyDict>) {
     let _ = SCALAR_TYPES.set(d.unbind());
 }
 
+/// The shim's per-dtype `_wrap` callables, in `SCALAR_DTYPES` order.
+///
+/// `scalar_class` builds a `String` key and does a dict lookup, then the
+/// caller has to look `_wrap` up on the class -- three dictionary probes and a
+/// heap allocation before anything happens. Every `a[i]` that returns a numpy
+/// scalar paid them. This table replaces all of it with one index.
+static SCALAR_WRAPS: OnceLock<Vec<Py<PyAny>>> = OnceLock::new();
+
+pub fn register_scalar_wraps(v: Vec<Py<PyAny>>) {
+    let _ = SCALAR_WRAPS.set(v);
+}
+
+/// The `_wrap` for a storage dtype, if the shim registered one.
+#[inline]
+pub fn scalar_wrap<'py>(py: Python<'py>, dt: DType) -> Option<&'py Bound<'py, PyAny>> {
+    let code = crate::ufuncs::dtype_code(dt)?;
+    SCALAR_WRAPS.get().map(|v| v[code].bind(py))
+}
+
 /// The Python scalar class the shim registered for a storage dtype, if any.
 pub fn scalar_class<'py>(py: Python<'py>, dt: DType) -> Option<Bound<'py, PyAny>> {
     let key: String = match dt {
