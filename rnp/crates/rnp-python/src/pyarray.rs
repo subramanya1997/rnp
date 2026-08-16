@@ -40,9 +40,15 @@ impl PyNdArray {
         arr: NdArray,
         parent: &Bound<'_, PyNdArray>,
     ) -> PyResult<Py<PyNdArray>> {
+        // numpy's base-collapsing rule (`PyArray_SetBaseObject`): walk up the
+        // chain only while the next link is *another ndarray of the same
+        // type*. An array that adopted foreign memory has a non-array base
+        // (`bytes`, an `mmap`, ...), and numpy stops there — `a[1:3].base` is
+        // `a`, not the bytes object.
+        let py = parent.py();
         let base = match &parent.borrow().base {
-            Some(b) => b.clone_ref(parent.py()),
-            None => parent.clone().into_any().unbind(),
+            Some(b) if b.bind(py).is_instance_of::<PyNdArray>() => b.clone_ref(py),
+            _ => parent.clone().into_any().unbind(),
         };
         Py::new(
             parent.py(),
@@ -666,6 +672,23 @@ struct BufInfo {
 
 #[pymethods]
 impl PyNdArray {
+    /// `ndarray(shape, dtype=float, buffer=None, offset=0, strides=None,
+    /// order=None)` — numpy's low-level constructor. With `buffer=` the
+    /// exporter's memory is adopted zero-copy; see `adopt.rs`.
+    #[new]
+    #[pyo3(signature = (shape, dtype = None, buffer = None, offset = 0, strides = None, order = None))]
+    fn py_new(
+        py: Python<'_>,
+        shape: &Bound<'_, PyAny>,
+        dtype: Option<&Bound<'_, PyAny>>,
+        buffer: Option<&Bound<'_, PyAny>>,
+        offset: i64,
+        strides: Option<&Bound<'_, PyAny>>,
+        order: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyNdArray> {
+        crate::adopt::ndarray_new(py, shape, dtype, buffer, offset, strides, order)
+    }
+
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, self.arr.shape.iter().map(|&d| d as usize))
@@ -723,6 +746,15 @@ impl PyNdArray {
     #[getter]
     fn base(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.base.as_ref().map(|b| b.clone_ref(py))
+    }
+
+    /// numpy's `base` is read-only; this port lets it be assigned so that
+    /// pure-Python subclasses written against the shim (`memmap`) can record
+    /// the object that owns their memory, which is what numpy's C-level
+    /// `PyArray_SetBaseObject` does for them.
+    #[setter]
+    fn set_base(&mut self, obj: Option<Py<PyAny>>) {
+        self.base = obj;
     }
 
     #[getter]
@@ -1026,22 +1058,47 @@ impl PyNdArray {
         slf: &Bound<'_, Self>,
         dtype: Option<&Bound<'_, PyAny>>,
         type_: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Py<PyNdArray>> {
-        if type_.is_some_and(|t| !t.is_none()) {
-            return Err(PyNotImplementedError::new_err(
-                "ndarray.view(type=) is not implemented yet",
-            ));
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        // `a.view(SomeSubclass)` may spell the type in either argument.
+        let mut want_type: Option<Bound<'_, PyAny>> = type_
+            .filter(|t| !t.is_none())
+            .map(|t| t.clone());
+        let mut dtype = dtype;
+        if let Some(o) = dtype {
+            if !o.is_none()
+                && o.cast::<pyo3::types::PyType>().is_ok()
+                && descr_from_any(o).is_err()
+            {
+                want_type = Some(o.clone());
+                dtype = None;
+            }
         }
+        // numpy's `a.view()` on a subclass instance keeps the subclass.
+        if want_type.is_none() && !slf.get_type().is(&py.get_type::<PyNdArray>()) {
+            want_type = Some(slf.get_type().into_any());
+        }
+        // Whatever the result's dtype, the *type* of the object is decided
+        // once, at the end: `retype` turns a plain view into an instance of
+        // the requested subclass.
+        let retype = |v: Py<PyNdArray>| -> PyResult<Py<PyAny>> {
+            let Some(t) = &want_type else {
+                return Ok(v.into_any());
+            };
+            let ty = t.cast::<pyo3::types::PyType>().map_err(|_| {
+                PyTypeError::new_err("type must be a sub-type of ndarray type")
+            })?;
+            let b = v.bind(py);
+            let (arr, base) = {
+                let me = b.borrow();
+                (me.arr.clone(), me.base.as_ref().map(|x| x.clone_ref(py)))
+            };
+            crate::adopt::new_of_type(py, ty, arr, base, Some(slf.as_any()))
+        };
         let me = slf.borrow().arr.clone();
         let d = match dtype {
-            None => return PyNdArray::view_of(me, slf),
-            Some(o) if o.is_none() => return PyNdArray::view_of(me, slf),
-            // `a.view(np.ndarray)` asks for a type, not a dtype.
-            Some(o) if o.cast::<pyo3::types::PyType>().is_ok()
-                && descr_from_any(o).is_err() =>
-            {
-                return PyNdArray::view_of(me, slf)
-            }
+            None => return retype(PyNdArray::view_of(me, slf)?),
+            Some(o) if o.is_none() => return retype(PyNdArray::view_of(me, slf)?),
             Some(o) => descr_from_any(o)?,
         };
         let old = me.itemsize();
@@ -1075,7 +1132,7 @@ impl PyNdArray {
         }
         out.flags.owndata = false;
         out.update_flags();
-        PyNdArray::view_of(out, slf)
+        retype(PyNdArray::view_of(out, slf)?)
     }
 
     #[pyo3(signature = (axis = None, out = None, keepdims = false))]

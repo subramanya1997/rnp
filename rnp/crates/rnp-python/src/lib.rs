@@ -8,6 +8,7 @@ use rnp_core::casting::{Casting, TypeArg, WeakKind};
 use rnp_core::reduce::ReduceOp;
 use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
+mod adopt;
 mod convert;
 mod index;
 mod itemsel;
@@ -197,20 +198,125 @@ fn arange(
     )
 }
 
+/// `np.frombuffer(buffer, dtype=float, count=-1, offset=0)` — zero-copy.
 #[pyfunction]
-#[pyo3(signature = (obj, dtype = None, *, copy = true))]
-fn array(
+#[pyo3(signature = (buffer, dtype = None, count = -1, offset = 0))]
+fn frombuffer(
+    py: Python<'_>,
+    buffer: &Bound<'_, PyAny>,
+    dtype: Option<&Bound<'_, PyAny>>,
+    count: i64,
+    offset: i64,
+) -> PyResult<Py<PyNdArray>> {
+    Py::new(py, adopt::frombuffer(py, buffer, dtype, count, offset)?)
+}
+
+/// The `np.array`/`np.asarray` front door, shared by both.
+///
+/// Two things happen here that the generic `array_from_any` cannot do because
+/// it deals in bare `NdArray`s rather than Python objects: an *existing*
+/// array is handed back (or re-typed as a plain `ndarray` view of a subclass,
+/// the way numpy's `subok=False` does), and foreign objects get a chance to
+/// convert themselves through the array protocol.
+fn array_front(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
-    copy: bool,
+    copy: Option<bool>,
 ) -> PyResult<Py<PyNdArray>> {
     let d = match dtype {
         None => None,
         Some(o) if o.is_none() => None,
         Some(o) => Some(descr_from_any(o)?),
     };
-    wrap(py, array_from_any_descr(obj, d, copy)?)
+    if let Ok(cell) = obj.cast::<PyNdArray>() {
+        let same_dtype = {
+            let me = cell.borrow();
+            d.is_none_or(|want| want == me.arr.descr)
+        };
+        if copy != Some(true) && same_dtype {
+            let is_exact = obj.get_type().is(&py.get_type::<PyNdArray>());
+            if is_exact {
+                // numpy returns the very same object.
+                return Ok(cell.clone().unbind());
+            }
+            // A subclass instance: `asarray` yields a base-class *view* whose
+            // base is the subclass instance (`np.asarray(memmap).base is fp`).
+            let arr = cell.borrow().arr.clone();
+            return Py::new(
+                py,
+                PyNdArray { arr, base: Some(obj.clone().unbind()) },
+            );
+        }
+        return wrap(py, array_from_any_descr(obj, d, copy == Some(true))?);
+    }
+    if let Some(res) = protocol_array(py, obj, d, copy)? {
+        return Ok(res);
+    }
+    if copy == Some(false) {
+        // Nothing below this point can be done without allocating.
+        return Err(pyo3::exceptions::PyValueError::new_err(adopt::NO_COPY_MSG));
+    }
+    wrap(py, array_from_any_descr(obj, d, copy == Some(true))?)
+}
+
+/// Try the array protocol (`__array__`, then `__array_interface__`) on a
+/// foreign object. `Ok(None)` means "not an array-protocol object".
+fn protocol_array(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    d: Option<Descr>,
+    copy: Option<bool>,
+) -> PyResult<Option<Py<PyNdArray>>> {
+    if obj.get_type().hasattr("__array__")? {
+        if let Some(res) = adopt::call_array_protocol(py, obj, d, copy)? {
+            let cell = res.cast::<PyNdArray>().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "object __array__ method not producing an array",
+                )
+            })?;
+            let arr = cell.borrow().arr.clone();
+            let arr = match d {
+                Some(want) if want != arr.descr => {
+                    if copy == Some(false) {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            adopt::NO_COPY_MSG,
+                        ));
+                    }
+                    arr.astype_descr(want)
+                }
+                _ if copy == Some(true) => arr.copy(),
+                _ => return Ok(Some(cell.clone().unbind())),
+            };
+            return Ok(Some(wrap(py, arr)?));
+        }
+    }
+    if obj.hasattr("__array_interface__")? {
+        if let Some(built) = adopt::from_array_interface(py, obj)? {
+            let arr = built.arr.clone();
+            let base = built.base;
+            let out = match d {
+                Some(want) if want != arr.descr => PyNdArray { arr: arr.astype_descr(want), base: None },
+                _ if copy == Some(true) => PyNdArray { arr: arr.copy(), base: None },
+                _ => PyNdArray { arr, base },
+            };
+            return Ok(Some(Py::new(py, out)?));
+        }
+    }
+    Ok(None)
+}
+
+/// `copy` is numpy 2.x's tri-state: `True` always copies, `False` refuses to,
+/// and `None` copies only when it must.
+#[pyfunction]
+#[pyo3(signature = (obj, dtype = None, *, copy = Some(true)))]
+fn array(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    dtype: Option<&Bound<'_, PyAny>>,
+    copy: Option<bool>,
+) -> PyResult<Py<PyNdArray>> {
+    array_front(py, obj, dtype, copy)
 }
 
 #[pyfunction]
@@ -220,12 +326,7 @@ fn asarray(
     obj: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
-    let d = match dtype {
-        None => None,
-        Some(o) if o.is_none() => None,
-        Some(o) => Some(descr_from_any(o)?),
-    };
-    wrap(py, array_from_any_descr(obj, d, false)?)
+    array_front(py, obj, dtype, None)
 }
 
 macro_rules! binary_ufunc {
@@ -543,6 +644,7 @@ fn _dtype_table(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 #[pymodule]
 fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNdArray>()?;
+    adopt::mark_ndarray_as_sequence(m.py());
     m.add_class::<PyDType>()?;
     m.add_class::<pyarray::PyFlags>()?;
     m.add_class::<pyarray::PyFlatIter>()?;
@@ -567,6 +669,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arange, m)?)?;
     m.add_function(wrap_pyfunction!(array, m)?)?;
     m.add_function(wrap_pyfunction!(asarray, m)?)?;
+    m.add_function(wrap_pyfunction!(frombuffer, m)?)?;
 
     m.add_function(wrap_pyfunction!(add, m)?)?;
     m.add_function(wrap_pyfunction!(subtract, m)?)?;
