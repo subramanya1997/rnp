@@ -151,22 +151,14 @@ pub fn descr_from_any_aligned(obj: &Bound<'_, PyAny>, align: bool) -> PyResult<D
     )))
 }
 
-/// The storage dtype, rejecting the byte-swapped descriptors the engine
-/// cannot compute on yet.
+/// Just the storage dtype.
+///
+/// Byte order is dropped here, which is right for every caller that is about
+/// to *compute* (the engine computes in the host order and stores the result
+/// natively, as numpy's own ufuncs do); callers that build or relabel storage
+/// use [`descr_from_any`] instead.
 pub fn dtype_from_any(obj: &Bound<'_, PyAny>) -> PyResult<DType> {
-    let d = descr_from_any(obj)?;
-    require_native(d)?;
-    Ok(d.dt)
-}
-
-pub fn require_native(d: Descr) -> PyResult<()> {
-    if !d.isnative() {
-        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
-            "rnp cannot yet create or compute on byte-swapped arrays ({})",
-            d.str_code()
-        )));
-    }
-    Ok(())
+    Ok(descr_from_any(obj)?.dt)
 }
 
 /// A shape argument inside a dtype spec: an int or a tuple of ints.
@@ -487,7 +479,7 @@ impl PyDType {
 
     /// `dtype.descr`: the `__array_interface__` description list.
     #[getter]
-    fn descr<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    pub fn descr<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items: Vec<Bound<'py, PyAny>> = match self.d.struct_def() {
             Some(def) => {
                 let mut out = Vec::new();

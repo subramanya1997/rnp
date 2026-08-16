@@ -30,7 +30,7 @@ impl Scalar {
         }
     }
 
-    fn as_f64(&self) -> f64 {
+    pub fn as_f64(&self) -> f64 {
         match *self {
             Scalar::Bool(b) => b as u8 as f64,
             Scalar::Int(i) => i as f64,

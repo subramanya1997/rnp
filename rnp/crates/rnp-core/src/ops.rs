@@ -1379,14 +1379,14 @@ pub fn binary_flexible(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
         return Err(Error::NotImplemented(format!(
             "ufunc '{}' is not supported for dtypes ({}, {})",
             op.name(),
-            a.dtype,
-            b.dtype
+            a.dtype(),
+            b.dtype()
         )));
     }
-    if a.dtype.category() != b.dtype.category() {
+    if a.dtype().category() != b.dtype().category() {
         return Err(Error::NotImplemented(format!(
             "comparing {} with {} is not implemented yet",
-            a.dtype, b.dtype
+            a.dtype(), b.dtype()
         )));
     }
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
@@ -1419,9 +1419,10 @@ pub fn binary_flexible(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
 /// that `S3` `b"ab\0"` equals `S5` `b"ab\0\0\0"`. `U` elements are decoded
 /// from UCS4 so that ordering compares code points, not their little-endian
 /// bytes.
-fn logical_bytes(arr: &NdArray, off: isize) -> Vec<u32> {
-    let raw = arr.raw_bytes_at(off);
-    let mut v: Vec<u32> = match arr.dtype {
+pub(crate) fn logical_bytes(arr: &NdArray, off: isize) -> Vec<u32> {
+    let raw = arr.element_bytes_at(off);
+    let raw: &[u8] = &raw;
+    let mut v: Vec<u32> = match arr.dtype() {
         DType::Str(_) => raw
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1569,37 +1570,63 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
 
 /// As [`binary`], but `divmod` also yields the remainder.
 pub fn binary_multi(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<NdArray>)> {
+    // Byte-swapped storage is normalised to the host order *here*, once per
+    // operand, and never inside a loop: everything below sees native bytes.
+    // The conversion lives in a cold, never-inlined function so that the
+    // kernel-carrying `binary_multi_native` stays non-recursive and keeps
+    // vectorising.
+    if !a.is_native() || !b.is_native() {
+        return binary_multi_swapped(a, b, op);
+    }
+    binary_multi_native(a, b, op)
+}
+
+#[cold]
+#[inline(never)]
+fn binary_multi_swapped(
+    a: &NdArray,
+    b: &NdArray,
+    op: BinOp,
+) -> Result<(NdArray, Option<NdArray>)> {
+    binary_multi_native(&a.to_native(), &b.to_native(), op)
+}
+
+fn binary_multi_native(
+    a: &NdArray,
+    b: &NdArray,
+    op: BinOp,
+) -> Result<(NdArray, Option<NdArray>)> {
     // numpy has dedicated `qQ->?` / `Qq->?` comparison loops so that
     // `uint64(2**64-1) < int64(-1)` is answered exactly rather than through
     // the float64 both types would otherwise promote to.
     if op.is_comparison()
-        && ((a.dtype == DType::U64 && b.dtype.is_signed())
-            || (b.dtype == DType::U64 && a.dtype.is_signed()))
+        && ((a.dtype() == DType::U64 && b.dtype().is_signed())
+            || (b.dtype() == DType::U64 && a.dtype().is_signed()))
     {
         return Ok((compare_mixed_64(a, b, op)?, None));
     }
-    if a.dtype.is_flexible() || b.dtype.is_flexible() {
+    if a.dtype().is_flexible() || b.dtype().is_flexible() {
         return Ok((binary_flexible(a, b, op)?, None));
     }
-    if a.dtype.is_object() || b.dtype.is_object() {
+    if a.dtype().is_object() || b.dtype().is_object() {
         return Err(Error::NotImplemented(format!(
             "ufunc '{}' on object arrays is not implemented",
             op.name()
         )));
     }
-    let (compute, out_dtype) = result_dtypes(a.dtype, b.dtype, op)?;
+    let (compute, out_dtype) = result_dtypes(a.dtype(), b.dtype(), op)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
 
     // Cast before broadcasting so the (cheap) cast copy stays small.
     let a_cast;
-    let a_ref = if a.dtype == compute {
+    let a_ref = if a.dtype() == compute {
         a
     } else {
         a_cast = a.astype(compute);
         &a_cast
     };
     let b_cast;
-    let b_ref = if b.dtype == compute {
+    let b_ref = if b.dtype() == compute {
         b
     } else {
         b_cast = b.astype(compute);
@@ -1630,8 +1657,8 @@ pub fn binary_multi(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Opt
 /// 128 bits so no value is rounded on its way through a common type.
 fn compare_mixed_64(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
-    let av = broadcast_to(&a.astype(a.dtype), &out_shape)?;
-    let bv = broadcast_to(&b.astype(b.dtype), &out_shape)?;
+    let av = broadcast_to(&a.astype(a.dtype()), &out_shape)?;
+    let bv = broadcast_to(&b.astype(b.dtype()), &out_shape)?;
     let out = NdArray::empty(out_shape, DType::Bool)?;
     let ao: Vec<isize> = offsets(&av.shape, &av.strides, av.byte_offset).collect();
     let bo: Vec<isize> = offsets(&bv.shape, &bv.strides, bv.byte_offset).collect();
@@ -1654,7 +1681,7 @@ fn compare_mixed_64(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
 
 /// `np.divmod`: both outputs in one pass.
 pub fn divmod(a: &NdArray, b: &NdArray) -> Result<(NdArray, NdArray)> {
-    let (compute, _) = result_dtypes(a.dtype, b.dtype, BinOp::Mod)?;
+    let (compute, _) = result_dtypes(a.dtype(), b.dtype(), BinOp::Mod)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
     let ac = a.astype(compute);
     let bc = b.astype(compute);
@@ -2402,7 +2429,7 @@ mod tests {
         let b = arr(&[10, 20], DType::I64).reshape(&[1, 2]).unwrap();
         let c = binary(&a, &b, BinOp::Add).unwrap();
         assert_eq!(c.shape, vec![3, 2]);
-        assert_eq!(c.dtype, DType::I64);
+        assert_eq!(c.dtype(), DType::I64);
         assert_eq!(
             c.to_vec(),
             [11, 21, 12, 22, 13, 23]
@@ -2417,7 +2444,7 @@ mod tests {
         let a = arr(&[1, 0], DType::I64);
         let b = arr(&[0, 0], DType::I64);
         let c = binary(&a, &b, BinOp::Div).unwrap();
-        assert_eq!(c.dtype, DType::F64);
+        assert_eq!(c.dtype(), DType::F64);
         assert_eq!(c.get_flat(0), Scalar::Float(f64::INFINITY));
         match c.get_flat(1) {
             Scalar::Float(f) => assert!(f.is_nan()),
@@ -2430,7 +2457,7 @@ mod tests {
         // np.add(np.int8(127), np.int8(1)) == -128
         let a = arr(&[127], DType::I8);
         let c = binary(&a, &arr(&[1], DType::I8), BinOp::Add).unwrap();
-        assert_eq!(c.dtype, DType::I8);
+        assert_eq!(c.dtype(), DType::I8);
         assert_eq!(c.get_flat(0), Scalar::Int(-128));
     }
 
@@ -2439,7 +2466,7 @@ mod tests {
         let a = arr(&[1, 2, 3], DType::I32);
         let b = arr(&[3, 2, 1], DType::I32);
         let c = binary(&a, &b, BinOp::Lt).unwrap();
-        assert_eq!(c.dtype, DType::Bool);
+        assert_eq!(c.dtype(), DType::Bool);
         assert_eq!(
             c.to_vec(),
             vec![Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(false)]
@@ -2527,7 +2554,7 @@ mod tests {
         let b = NdArray::from_scalars(&[Scalar::Bool(false), Scalar::Bool(false)], DType::Bool)
             .unwrap();
         let c = binary(&a, &b, BinOp::Add).unwrap();
-        assert_eq!(c.dtype, DType::Bool);
+        assert_eq!(c.dtype(), DType::Bool);
         assert_eq!(c.to_vec(), vec![Scalar::Bool(true), Scalar::Bool(false)]);
     }
 

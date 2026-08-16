@@ -537,6 +537,27 @@ def ravel(a):
     return _asarr(a).ravel()
 
 
+def sort(a, axis=-1, kind=None, order=None, *, stable=None):
+    a = _asarr(a).copy()
+    if axis is None:
+        a = a.ravel()
+        axis = -1
+    a.sort(axis, kind, order, stable=stable)
+    return a
+
+
+def argsort(a, axis=-1, kind=None, order=None, *, stable=None):
+    return _asarr(a).argsort(axis, kind, order, stable=stable)
+
+
+def searchsorted(a, v, side="left", sorter=None):
+    return _asarr(a).searchsorted(v, side, sorter)
+
+
+def msort(a):
+    return sort(a, axis=0)
+
+
 def copy(a):
     return _asarr(a).copy()
 
@@ -889,7 +910,7 @@ del _name
 # Names the upstream tests reference at module level but that belong to later
 # milestones. Each raises NotImplementedError when used.
 for _name in (
-    "argsort", "sort", "searchsorted", "partition", "argpartition", "dot",
+    "partition", "argpartition", "dot",
     "vdot", "inner", "outer", "tensordot", "einsum", "cross", "trace",
     "diagonal", "cumsum", "cumprod", "diff", "gradient", "histogram",
     "linspace", "logspace", "geomspace", "meshgrid", "roll", "rot90", "flip",
@@ -906,6 +927,11 @@ for _name in (
     "asmatrix", "bmat", "poly1d", "recarray", "chararray",
     "vectorize", "frompyfunc", "busday_count", "busday_offset", "is_busday",
     "datetime_data", "base_repr", "binary_repr", "info", "who",
+    "busdaycalendar",
+    "from_dlpack",
+    "nested_iters",
+    "lexsort", "bincount", "ravel_multi_index", "unravel_index",
+    "datetime_as_string",
     "setdiff1d", "union1d", "intersect1d", "in1d", "isin", "genfromtxt",
     "memmap", "nditer", "broadcast", "errstate_unavailable",
 ):

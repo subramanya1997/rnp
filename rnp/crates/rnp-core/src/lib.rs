@@ -15,6 +15,7 @@ pub mod loops;
 pub mod ops;
 pub mod printing;
 pub mod reduce;
+pub mod sort;
 pub mod ufunc;
 
 pub use array::{Flags, NdArray};

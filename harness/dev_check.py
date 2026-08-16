@@ -1401,6 +1401,114 @@ def check_errstate():
                              f"port {got!r} != numpy {want!r}"))
 
 
+def check_byteorder():
+    """Byte-swapped (non-native-endian) arrays, against numpy.
+
+    The point of the section is that a `'>i4'` array must agree with numpy on
+    *both* the value level and the byte level: the raw storage really is
+    big-endian, while everything computed from it comes back native, exactly
+    as numpy does it.
+    """
+    codes = ["i2", "i4", "i8", "u2", "u4", "u8", "f4", "f8", "c8", "c16"]
+    for code in codes:
+        big, little = ">" + code, "<" + code
+        for order in (big, little):
+            n_arange = np.arange(1, 9, dtype=order)
+            p_arange = rnp.arange(1, 9, dtype=order)
+            eq(f"byteorder arange {order} dtype", str(n_arange.dtype), str(p_arange.dtype))
+            eq(f"byteorder arange {order} bytes", n_arange.tobytes(), _tobytes(p_arange))
+
+            n_ones = np.ones(5, dtype=order)
+            p_ones = rnp.ones(5, dtype=order)
+            eq(f"byteorder ones {order} bytes", n_ones.tobytes(), _tobytes(p_ones))
+            eq(f"byteorder zeros {order} bytes",
+               np.zeros(5, dtype=order).tobytes(), _tobytes(rnp.zeros(5, dtype=order)))
+
+            n_lit = np.array([1, 2, 3, 4], dtype=order)
+            p_lit = rnp.array([1, 2, 3, 4], dtype=order)
+            eq(f"byteorder array {order} bytes", n_lit.tobytes(), _tobytes(p_lit))
+            eq(f"byteorder array {order} isnative",
+               n_lit.dtype.isnative, p_lit.dtype.isnative)
+
+            # Every derived array keeps the byte order, and the bytes with it.
+            for label, nf, pf in [
+                ("copy", lambda a: a.copy(), lambda a: a.copy()),
+                ("slice", lambda a: a[::2], lambda a: a[::2]),
+                ("fancy", lambda a: a[[3, 1]], lambda a: a[[3, 1]]),
+                ("reshape", lambda a: a.reshape(2, 2), lambda a: a.reshape(2, 2)),
+                ("byteswap", lambda a: a.byteswap(), lambda a: a.byteswap()),
+            ]:
+                w, g = nf(n_lit), pf(p_lit)
+                eq(f"byteorder {label} {order} dtype", str(w.dtype), str(g.dtype))
+                eq(f"byteorder {label} {order} bytes", w.tobytes(), _tobytes(g))
+
+            # Compute lands in the host order, with identical values.
+            for label, nf, pf in [
+                ("add", lambda a: a + a, lambda a: a + a),
+                ("mul3", lambda a: a * 3, lambda a: a * 3),
+                ("neg", lambda a: -a, lambda a: -a),
+                ("astype f8", lambda a: a.astype("f8"), lambda a: a.astype("f8")),
+                ("astype swapped", lambda a: a.astype(">f8"),
+                 lambda a: a.astype(">f8")),
+            ]:
+                w, g = nf(n_lit), pf(p_lit)
+                eq(f"byteorder {label} {order} dtype", str(w.dtype), str(g.dtype))
+                eq(f"byteorder {label} {order} bytes", w.tobytes(), _tobytes(g))
+
+            eq(f"byteorder sum {order}", raw(n_lit.sum()), raw(p_lit.sum()))
+            eq(f"byteorder max {order}", raw(n_lit.max()), raw(p_lit.max()))
+            eq(f"byteorder item {order}", raw(n_lit[2]), raw(p_lit[2]))
+            eq(f"byteorder repr {order}", repr(n_lit), repr(p_lit))
+            eq(f"byteorder compare {order}", (n_lit > 2).tobytes(),
+               _tobytes(p_lit > 2))
+
+            # Assignment through a non-native destination stores swapped bytes.
+            nw, pw = n_lit.copy(), p_lit.copy()
+            nw[1] = 99
+            pw[1] = 99
+            eq(f"byteorder setitem {order} bytes", nw.tobytes(), _tobytes(pw))
+
+    # Unicode: `>U` swaps each UCS4 code point, not the element.
+    for order in (">U3", "<U3"):
+        w = np.array(["ab", "cde"], dtype=order)
+        g = rnp.array(["ab", "cde"], dtype=order)
+        eq(f"byteorder text {order} dtype", str(w.dtype), str(g.dtype))
+        eq(f"byteorder text {order} bytes", w.tobytes(), _tobytes(g))
+        eq(f"byteorder text {order} item", w[1], g[1])
+        eq(f"byteorder text {order} repr", repr(w), repr(g))
+        eq(f"byteorder text {order} eq",
+           (w == "ab").tobytes(), _tobytes(g == "ab"))
+
+    # dtype-level byte order surface.
+    for spec in ("i4", ">i4", "<i4", "u8", ">f8", "S3", ">U2"):
+        w, g = np.dtype(spec), rnp.dtype(spec)
+        eq(f"byteorder dtype {spec} str", w.str, g.str)
+        eq(f"byteorder dtype {spec} byteorder", w.byteorder, g.byteorder)
+        eq(f"byteorder dtype {spec} isnative", w.isnative, g.isnative)
+        for arg in (None, "<", ">", "=", "S", "|"):
+            args = () if arg is None else (arg,)
+            eq(f"byteorder dtype {spec} newbyteorder({arg})",
+               w.newbyteorder(*args).str, g.newbyteorder(*args).str)
+
+    # `view` through a swapped descriptor reinterprets without moving bytes.
+    w = np.arange(4, dtype="<i4")
+    g = rnp.arange(4, dtype="<i4")
+    eq("byteorder view swapped dtype",
+       str(w.view(">i4").dtype), str(g.view(">i4").dtype))
+    eq("byteorder view swapped bytes",
+       w.view(">i4").tobytes(), _tobytes(g.view(">i4")))
+    eq("byteorder view swapped values",
+       w.view(">i4").astype("i8").tobytes(),
+       _tobytes(g.view(">i4").astype("i8")))
+
+    # byteswap(inplace=True) mutates and returns the same object.
+    w = np.arange(4, dtype=">i4")
+    g = rnp.arange(4, dtype=">i4")
+    eq("byteorder byteswap inplace returns self",
+       w.byteswap(inplace=True) is w, g.byteswap(inplace=True) is g)
+    eq("byteorder byteswap inplace bytes", w.tobytes(), _tobytes(g))
+
+
 def run_m3_sections():
     """All the M3 sections, each isolated so one crash cannot hide the rest."""
     if not load_shim():
@@ -1414,6 +1522,7 @@ def run_m3_sections():
         ("ufunc methods", check_ufunc_methods),
         ("errstate", check_errstate),
         ("ulp", check_ulp),
+        ("byte order", check_byteorder),
     ]
     for name, fn in sections:
         try:

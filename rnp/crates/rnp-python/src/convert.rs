@@ -6,6 +6,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyComplex, PyFloat, PyInt, PyList, PySequence, PyString, PyTuple};
 
+use rnp_core::descr::Descr;
 use rnp_core::{promote, DType, NdArray, Scalar};
 
 use crate::pyarray::PyNdArray;
@@ -63,6 +64,13 @@ pub fn any_scalar(obj: &Bound<'_, PyAny>) -> PyResult<Option<Scalar>> {
 /// `dtype` objects. `ndarray` has a `dtype` but no `_v`, and Python numbers
 /// have neither, so nothing else is mistaken for one.
 pub fn np_scalar(obj: &Bound<'_, PyAny>) -> PyResult<Option<(DType, Scalar)>> {
+    Ok(np_scalar_descr(obj)?.map(|(d, s)| (d.dt, s)))
+}
+
+/// As [`np_scalar`], keeping the scalar's full descriptor — which is what
+/// carries the C-type alias that makes
+/// `np.array(np.longlong(2)).dtype.type is np.longlong` true.
+pub fn np_scalar_descr(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Descr, Scalar)>> {
     let v = match obj.getattr(pyo3::intern!(obj.py(), "_v")) {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -71,12 +79,13 @@ pub fn np_scalar(obj: &Bound<'_, PyAny>) -> PyResult<Option<(DType, Scalar)>> {
         Ok(d) => d,
         Err(_) => return Ok(None),
     };
-    let dt = match d.cast::<crate::pydtype::PyDType>() {
-        Ok(p) => p.get().d.dt,
+    let descr = match d.cast::<crate::pydtype::PyDType>() {
+        Ok(p) => p.get().d,
         Err(_) => return Ok(None),
     };
+    let dt = descr.dt;
     match scalar_from_py(&v) {
-        Some(s) => Ok(Some((dt, s.cast(dt)))),
+        Some(s) => Ok(Some((descr, s.cast(dt)))),
         None => Ok(None),
     }
 }
@@ -88,10 +97,10 @@ pub fn element_to_py<'py>(
     arr: &NdArray,
     off: isize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if arr.dtype.is_object() {
+    if arr.dtype().is_object() {
         return Ok(crate::objects::read(py, arr, off));
     }
-    if arr.dtype.is_flexible() {
+    if arr.dtype().is_flexible() {
         return flexible_to_py(py, arr, off);
     }
     scalar_to_py(py, arr.read_at(off))
@@ -126,11 +135,11 @@ pub fn npflexible_to_py<'py>(
     arr: &NdArray,
     off: isize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if arr.dtype.is_object() {
+    if arr.dtype().is_object() {
         return Ok(crate::objects::read(py, arr, off));
     }
     let v = flexible_to_py(py, arr, off)?;
-    match crate::pydtype::scalar_class(py, arr.dtype) {
+    match crate::pydtype::scalar_class(py, arr.dtype()) {
         Some(cls) => cls.call1((v,)),
         None => Ok(v),
     }
@@ -290,8 +299,9 @@ pub fn flexible_to_py<'py>(
     arr: &NdArray,
     off: isize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let raw = arr.raw_bytes_at(off);
-    match arr.dtype {
+    let raw = arr.element_bytes_at(off);
+    let raw: &[u8] = &raw;
+    match arr.dtype() {
         DType::Bytes(_) => {
             let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
             Ok(PyBytes::new(py, &raw[..end]).into_any())
@@ -371,6 +381,29 @@ fn collect_objects<'py>(
 }
 
 /// `np.array` / `np.asarray` core: build an `NdArray` from any Python object.
+/// [`array_from_any`] with a full descriptor: build in the host's byte order,
+/// then relabel (and swap) once, at the end.
+///
+/// This is the whole byte-swap policy in one place — nothing below ever sees
+/// non-native bytes, and the native path pays a single equality test.
+pub fn array_from_any_descr(
+    obj: &Bound<'_, PyAny>,
+    descr: Option<Descr>,
+    copy: bool,
+) -> PyResult<NdArray> {
+    let a = array_from_any(obj, descr.map(|d| d.dt), copy)?;
+    match descr {
+        // The *resolved* storage dtype is what the array actually has: an
+        // unsized `'>U'` request comes back as `U1`, so the byte order and
+        // alias are re-applied to that, not to the request.
+        Some(d) => {
+            let target = rnp_core::descr::Descr::with_alias(a.dtype(), d.bo, d.alias);
+            Ok(a.into_descr(target))
+        }
+        None => Ok(a),
+    }
+}
+
 pub fn array_from_any(
     obj: &Bound<'_, PyAny>,
     dtype: Option<DType>,
@@ -380,7 +413,7 @@ pub fn array_from_any(
     if let Ok(a) = obj.cast::<PyNdArray>() {
         let inner = a.borrow().arr.clone();
         return Ok(match dtype {
-            Some(d) if d != inner.dtype => inner.astype(d),
+            Some(d) if d != inner.dtype() => inner.astype(d),
             _ if copy => inner.copy(),
             _ => inner,
         });
@@ -390,10 +423,14 @@ pub fn array_from_any(
         return crate::objects::array_from_objects(obj);
     }
     // A numpy scalar is a strong 0-d operand.
-    if let Some((sd, sv)) = np_scalar(obj)? {
-        let d = dtype.unwrap_or(sd);
+    if let Some((sd, sv)) = np_scalar_descr(obj)? {
+        let d = dtype.unwrap_or(sd.dt);
         let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
         a.set(&[], sv.cast(d)).map_err(crate::err)?;
+        if dtype.is_none() {
+            // Keep the scalar's own descriptor, so `np.longlong` stays `'q'`.
+            a.descr = sd;
+        }
         return Ok(a);
     }
     // Structured dtypes: the "scalar" of the array is a Python tuple, one
@@ -501,7 +538,7 @@ fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
                     PyTypeError::new_err("unsupported field value in a structured array")
                 })?;
                 let mut field = out.clone();
-                field.dtype = fdt;
+                field.descr = f.descr;
                 field.write_at(off, sv);
             }
         }

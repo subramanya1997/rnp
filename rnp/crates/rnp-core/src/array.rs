@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::buffer::Buffer;
+use crate::descr::{ByteOrder, Descr};
 use crate::dtype::DType;
 use crate::element::{Element, Scalar};
 use crate::error::{Error, Result};
@@ -38,7 +39,14 @@ pub struct NdArray {
     pub shape: Vec<isize>,
     /// Strides in BYTES, as in numpy.
     pub strides: Vec<isize>,
-    pub dtype: DType,
+    /// The full descriptor — storage type *plus* byte order and C-type alias.
+    ///
+    /// The header carries a `Descr` rather than a bare [`DType`] for two
+    /// reasons numpy's own `PyArrayObject` carries `PyArray_Descr*`: an array
+    /// of `'>i4'` differs from one of `'<i4'` only in the descriptor, and
+    /// `np.array(np.longlong(2)).dtype.type is np.longlong` only holds if the
+    /// array remembers which C-type spelling it was built from.
+    pub descr: Descr,
     pub flags: Flags,
 }
 
@@ -134,7 +142,159 @@ pub fn check_storable(_dtype: DType) -> Result<()> {
     Ok(())
 }
 
+/// How one element of `dt` decomposes for byte-swapping: `(unit, count)`
+/// means `count` consecutive runs of `unit` bytes, each reversed.
+///
+/// `None` means the type has no byte order at all (`S`, `V`, `O`, 1-byte
+/// types). Structured and subarray dtypes are handled recursively by
+/// [`swap_element`], not here, because their members can disagree.
+pub fn swap_layout(dt: DType) -> Option<(usize, usize)> {
+    match dt {
+        DType::Bool | DType::I8 | DType::U8 => None,
+        DType::I16 | DType::U16 | DType::F16 => Some((2, 1)),
+        DType::I32 | DType::U32 | DType::F32 => Some((4, 1)),
+        DType::I64 | DType::U64 | DType::F64 => Some((8, 1)),
+        DType::DateTime(_) | DType::TimeDelta(_) => Some((8, 1)),
+        // A complex is two reals side by side; the *halves* swap, the pair
+        // order does not. This is what numpy's `@TYPE@_copyswapn` does.
+        DType::C64 => Some((4, 2)),
+        DType::C128 => Some((8, 2)),
+        // `U<n>` is n UCS4 code points, each swapped independently.
+        DType::Str(n) => {
+            if n == 0 {
+                None
+            } else {
+                Some((4, n as usize))
+            }
+        }
+        DType::Bytes(_) | DType::Void(_) | DType::Object => None,
+        DType::Struct(_) | DType::SubArray(_) => None,
+    }
+}
+
+/// Byte-swap one element of `descr` in place at `p`.
+///
+/// # Safety
+/// `p` must point at `descr.itemsize()` writable bytes.
+pub unsafe fn swap_element(p: *mut u8, descr: Descr) {
+    match descr.dt {
+        DType::Struct(id) => {
+            let def = crate::descr::registry::struct_def(id);
+            for f in &def.fields {
+                // SAFETY: field offsets are inside the record by construction.
+                unsafe { swap_element(p.add(f.offset), f.descr) };
+            }
+        }
+        DType::SubArray(id) => {
+            let def = crate::descr::registry::subarray_def(id);
+            let n = shape_size(&def.shape);
+            let isz = def.base.itemsize();
+            for i in 0..n {
+                // SAFETY: the subarray holds `n` base elements contiguously.
+                unsafe { swap_element(p.add(i * isz), def.base) };
+            }
+        }
+        _ => {
+            if let Some((unit, count)) = swap_layout(descr.dt) {
+                for i in 0..count {
+                    // SAFETY: `unit * count <= itemsize` for every layout above.
+                    unsafe {
+                        let q = p.add(i * unit);
+                        for k in 0..unit / 2 {
+                            std::ptr::swap(q.add(k), q.add(unit - 1 - k));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl NdArray {
+    /// The storage dtype. Byte order and C-type alias live in [`Self::descr`].
+    #[inline]
+    pub fn dtype(&self) -> DType {
+        self.descr.dt
+    }
+
+    /// True when the elements are stored in the host's byte order, which is
+    /// the only case the compute loops ever see: every entry point calls
+    /// [`Self::to_native`] first, and that is a no-op here.
+    #[inline(always)]
+    pub fn is_native(&self) -> bool {
+        // One byte compare for every non-compound dtype. The compound case
+        // walks the registry, so it is kept out of line: this predicate sits
+        // at the top of every hot entry point and must not grow one.
+        match self.descr.dt {
+            DType::Struct(_) | DType::SubArray(_) => self.compound_is_native(),
+            _ => self.descr.bo != ByteOrder::Big,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn compound_is_native(&self) -> bool {
+        self.descr.isnative()
+    }
+
+    /// Reverse the bytes of every element in place, leaving the descriptor
+    /// alone. This is `ndarray.byteswap(inplace=True)`.
+    pub fn byteswap_inplace(&mut self) {
+        if swap_layout(self.descr.dt).is_none()
+            && !matches!(self.descr.dt, DType::Struct(_) | DType::SubArray(_))
+        {
+            return;
+        }
+        let descr = self.descr;
+        for off in crate::iter::offsets(&self.shape, &self.strides, self.byte_offset) {
+            // SAFETY: `off` addresses one in-bounds element of `itemsize`
+            // bytes inside the allocation.
+            unsafe { swap_element(self.buffer.as_mut_ptr().offset(off), descr) };
+        }
+    }
+
+    /// The same values in the host's byte order.
+    ///
+    /// Returns `self` untouched when the array is already native — which is
+    /// the *only* thing this costs on the native path: one predictable
+    /// branch, taken once per operand, outside every loop.
+    pub fn to_native(&self) -> std::borrow::Cow<'_, NdArray> {
+        if self.is_native() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut out = self.copy();
+        out.byteswap_inplace();
+        out.descr = self.descr.newbyteorder(Some('=')).unwrap_or(self.descr);
+        std::borrow::Cow::Owned(out)
+    }
+
+    /// `self` with its storage in the same byte order as `other`, for the raw
+    /// element copies that flexible dtypes use (a `'>U3'` destination must
+    /// receive big-endian code points).
+    pub fn in_order_of(&self, other: &NdArray) -> std::borrow::Cow<'_, NdArray> {
+        if self.is_native() == other.is_native() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut o = self.copy();
+        o.byteswap_inplace();
+        o.descr = self.descr.newbyteorder(Some('S')).unwrap_or(self.descr);
+        std::borrow::Cow::Owned(o)
+    }
+
+    /// A copy of `self` whose bytes are in `descr`'s byte order (the storage
+    /// dtype is unchanged). Used when writing into a non-native destination.
+    pub fn with_byteorder(&self, descr: Descr) -> NdArray {
+        debug_assert_eq!(descr.dt, self.descr.dt);
+        // A deep copy first: `byteswap_inplace` writes through the shared
+        // `Arc<Buffer>`, so it must never run on a header-only clone.
+        let mut out = self.copy();
+        if out.is_native() != descr.isnative() {
+            out.byteswap_inplace();
+        }
+        out.descr = descr;
+        out
+    }
+
     pub fn ndim(&self) -> usize {
         self.shape.len()
     }
@@ -144,7 +304,7 @@ impl NdArray {
     }
 
     pub fn itemsize(&self) -> usize {
-        self.dtype.itemsize()
+        self.dtype().itemsize()
     }
 
     pub fn nbytes(&self) -> usize {
@@ -166,11 +326,16 @@ impl NdArray {
         self.flags.f_contiguous = is_f_contiguous(&self.shape, &self.strides, isz);
         self.flags.aligned =
             (self.buffer.as_ptr() as usize).wrapping_add(self.byte_offset as usize)
-                % self.dtype.alignment()
+                % self.dtype().alignment()
                 == 0;
     }
 
     fn new_uninit(shape: Vec<isize>, dtype: DType) -> Result<NdArray> {
+        NdArray::new_uninit_descr(shape, Descr::native(dtype))
+    }
+
+    fn new_uninit_descr(shape: Vec<isize>, descr: Descr) -> Result<NdArray> {
+        let dtype = descr.dt;
         check_storable(dtype)?;
         for &d in &shape {
             if d < 0 {
@@ -189,7 +354,7 @@ impl NdArray {
             byte_offset: 0,
             shape,
             strides,
-            dtype,
+            descr,
             flags: Flags::default(),
         };
         a.update_flags();
@@ -201,8 +366,18 @@ impl NdArray {
         NdArray::new_uninit(shape, dtype)
     }
 
-    /// `np.zeros`. Every supported dtype has an all-zero-bytes zero value.
+    pub fn empty_descr(shape: Vec<isize>, descr: Descr) -> Result<NdArray> {
+        NdArray::new_uninit_descr(shape, descr)
+    }
+
+    /// `np.zeros`. Every supported dtype has an all-zero-bytes zero value
+    /// *in either byte order*, so this needs no swap pass.
     pub fn zeros(shape: Vec<isize>, dtype: DType) -> Result<NdArray> {
+        NdArray::zeros_descr(shape, Descr::native(dtype))
+    }
+
+    pub fn zeros_descr(shape: Vec<isize>, descr: Descr) -> Result<NdArray> {
+        let dtype = descr.dt;
         check_storable(dtype)?;
         for &d in &shape {
             if d < 0 {
@@ -221,7 +396,7 @@ impl NdArray {
             byte_offset: 0,
             shape,
             strides,
-            dtype,
+            descr,
             flags: Flags::default(),
         };
         a.update_flags();
@@ -235,8 +410,18 @@ impl NdArray {
         Ok(a)
     }
 
+    pub fn full_descr(shape: Vec<isize>, descr: Descr, value: Scalar) -> Result<NdArray> {
+        let mut a = NdArray::new_uninit_descr(shape, descr)?;
+        a.fill(value);
+        Ok(a)
+    }
+
     pub fn ones(shape: Vec<isize>, dtype: DType) -> Result<NdArray> {
         NdArray::full(shape, dtype, Scalar::Int(1))
+    }
+
+    pub fn ones_descr(shape: Vec<isize>, descr: Descr) -> Result<NdArray> {
+        NdArray::full_descr(shape, descr, Scalar::Int(1))
     }
 
     /// Wrap raw bytes (copied) as a C-contiguous array.
@@ -255,7 +440,7 @@ impl NdArray {
             byte_offset: 0,
             shape,
             strides,
-            dtype,
+            descr: Descr::native(dtype),
             flags: Flags::default(),
         };
         a.update_flags();
@@ -372,7 +557,7 @@ impl NdArray {
     /// Read the element at a byte offset from the buffer start.
     #[inline]
     pub fn read_at(&self, byte_off: isize) -> Scalar {
-        if self.dtype.is_flexible() || self.dtype.is_object() {
+        if self.dtype().is_flexible() || self.dtype().is_object() {
             // Flexible elements have no scalar value; expose the leading
             // bytes so that generic code (copies, comparisons) still works.
             let raw = self.raw_bytes_at(byte_off);
@@ -381,13 +566,37 @@ impl NdArray {
             buf[..k].copy_from_slice(&raw[..k]);
             return Scalar::Uint(u64::from_le_bytes(buf));
         }
+        if !self.is_native() {
+            return self.read_at_swapped(byte_off);
+        }
         // SAFETY: `byte_off` is produced by `byte_index` from an in-bounds
         // index (or by an iterator over in-bounds indices), so the itemsize
         // bytes at that offset lie inside the allocation.
         unsafe {
             let p = self.buffer.as_ptr().offset(byte_off);
-            crate::dispatch_dtype!(self.dtype, T, {
+            crate::dispatch_dtype!(self.dtype(), T, {
                 (std::ptr::read_unaligned(p as *const T)).to_scalar()
+            })
+        }
+    }
+
+    /// The byte-swapped-storage half of [`Self::read_at`], kept out of line so
+    /// the native path stays a single predictable branch.
+    #[cold]
+    fn read_at_swapped(&self, byte_off: isize) -> Scalar {
+        let isz = self.itemsize();
+        debug_assert!(isz <= 16);
+        let mut buf = [0u8; 16];
+        // SAFETY: `byte_off` addresses `isz <= 16` in-bounds bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.buffer.as_ptr().offset(byte_off),
+                buf.as_mut_ptr(),
+                isz,
+            );
+            swap_element(buf.as_mut_ptr(), self.descr);
+            crate::dispatch_dtype!(self.dtype(), T, {
+                (std::ptr::read_unaligned(buf.as_ptr() as *const T)).to_scalar()
             })
         }
     }
@@ -395,7 +604,7 @@ impl NdArray {
     /// Write a scalar (cast to the array dtype) at a byte offset.
     #[inline]
     pub fn write_at(&self, byte_off: isize, value: Scalar) {
-        if self.dtype.is_flexible() || self.dtype.is_object() {
+        if self.dtype().is_flexible() || self.dtype().is_object() {
             // As `read_at`: store the scalar's little-endian bytes, padded or
             // truncated to the element size. Nothing interprets them, so no
             // wrong *numeric* answer can escape.
@@ -409,13 +618,37 @@ impl NdArray {
             self.write_raw_at(byte_off, &bits.to_le_bytes());
             return;
         }
+        if !self.is_native() {
+            return self.write_at_swapped(byte_off, value);
+        }
         // SAFETY: as `read_at`; the caller guarantees the offset is in range,
         // and the array is known writeable.
         unsafe {
             let p = self.buffer.as_mut_ptr().offset(byte_off);
-            crate::dispatch_dtype!(self.dtype, T, {
+            crate::dispatch_dtype!(self.dtype(), T, {
                 std::ptr::write_unaligned(p as *mut T, T::from_scalar(value))
             })
+        }
+    }
+
+    /// The byte-swapped-storage half of [`Self::write_at`].
+    #[cold]
+    fn write_at_swapped(&self, byte_off: isize, value: Scalar) {
+        let isz = self.itemsize();
+        debug_assert!(isz <= 16);
+        let mut buf = [0u8; 16];
+        // SAFETY: the scratch buffer holds `isz <= 16` bytes; the destination
+        // holds `isz` in-bounds bytes.
+        unsafe {
+            crate::dispatch_dtype!(self.dtype(), T, {
+                std::ptr::write_unaligned(buf.as_mut_ptr() as *mut T, T::from_scalar(value))
+            });
+            swap_element(buf.as_mut_ptr(), self.descr);
+            std::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                self.buffer.as_mut_ptr().offset(byte_off),
+                isz,
+            );
         }
     }
 
@@ -462,7 +695,7 @@ impl NdArray {
 
     /// A C-contiguous copy (`np.copy`).
     pub fn copy(&self) -> NdArray {
-        let mut out = NdArray::new_uninit(self.shape.clone(), self.dtype).expect("copy alloc");
+        let mut out = NdArray::new_uninit_descr(self.shape.clone(), self.descr).expect("copy alloc");
         if self.flags.c_contiguous {
             let n = self.nbytes();
             // SAFETY: both regions hold `n` valid bytes and are distinct
@@ -497,7 +730,31 @@ impl NdArray {
     /// `astype` with numpy's `unsafe` casting rules. Always returns a fresh
     /// C-contiguous array (numpy's `copy=True` default).
     pub fn astype(&self, dtype: DType) -> NdArray {
-        if dtype == self.dtype {
+        if !self.is_native() {
+            return self.astype_swapped(dtype);
+        }
+        self.astype_native(dtype)
+    }
+
+    /// numpy's `astype` always lands in the native order unless a
+    /// byte-swapped *descriptor* was asked for (see [`Self::astype_descr`]).
+    ///
+    /// Kept out of line so that [`Self::astype_native`] — which carries the
+    /// vectorised cast kernel — is neither recursive nor inlined into a cold
+    /// path.
+    #[cold]
+    #[inline(never)]
+    fn astype_swapped(&self, dtype: DType) -> NdArray {
+        let n = self.to_native();
+        if dtype == n.dtype() {
+            n.into_owned()
+        } else {
+            n.astype_native(dtype)
+        }
+    }
+
+    fn astype_native(&self, dtype: DType) -> NdArray {
+        if dtype == self.dtype() {
             return self.copy();
         }
         let mut out = NdArray::new_uninit(self.shape.clone(), dtype).expect("astype alloc");
@@ -505,7 +762,7 @@ impl NdArray {
         if self.flags.c_contiguous {
             // Typed inner loop: both sides are flat, so the per-element cast
             // inlines instead of routing through the `Scalar` enum.
-            crate::dispatch_dtype!(self.dtype, S, {
+            crate::dispatch_dtype!(self.dtype(), S, {
                 crate::dispatch_dtype!(dtype, D, {
                     // SAFETY: `self` is contiguous with n elements of S at
                     // `byte_offset`, and `out` was freshly allocated with n
@@ -531,6 +788,34 @@ impl NdArray {
         }
         out.update_flags();
         out
+    }
+
+    /// `astype` to a full descriptor: cast the values through the native
+    /// path, then store them in the target's byte order.
+    pub fn astype_descr(&self, d: Descr) -> NdArray {
+        let src = self.to_native();
+        let mut out = src.astype(d.dt);
+        out.descr = Descr::native(d.dt);
+        out.into_descr(d)
+    }
+
+    /// Re-label a uniquely-owned array with `descr`, byte-swapping the
+    /// storage when the new descriptor is not native. The storage dtype must
+    /// not change.
+    pub fn into_descr(mut self, descr: Descr) -> NdArray {
+        debug_assert_eq!(descr.dt, self.descr.dt);
+        if self.is_native() == descr.isnative() {
+            self.descr = descr;
+            return self;
+        }
+        // `byteswap_inplace` writes through the buffer, so a shared one has
+        // to be copied first.
+        if Arc::strong_count(&self.buffer) != 1 {
+            self = self.copy();
+        }
+        self.byteswap_inplace();
+        self.descr = descr;
+        self
     }
 
     /// A transposed view (reversed axes).
@@ -673,6 +958,22 @@ impl NdArray {
         }
     }
 
+    /// The element bytes at `byte_off`, in the *host's* byte order.
+    ///
+    /// `raw_bytes_at` hands back storage bytes, which for a `'>U3'` array are
+    /// not the ones any interpreter wants; this is the accessor for code that
+    /// reads a flexible element's *value*.
+    pub fn element_bytes_at(&self, byte_off: isize) -> std::borrow::Cow<'_, [u8]> {
+        let raw = self.raw_bytes_at(byte_off);
+        if self.is_native() {
+            return std::borrow::Cow::Borrowed(raw);
+        }
+        let mut v = raw.to_vec();
+        // SAFETY: `v` holds exactly one element's worth of bytes.
+        unsafe { swap_element(v.as_mut_ptr(), self.descr) };
+        std::borrow::Cow::Owned(v)
+    }
+
     /// Write raw element bytes, zero-padding or truncating to `itemsize`.
     pub fn write_raw_at(&self, byte_off: isize, src: &[u8]) {
         let n = self.itemsize();
@@ -687,7 +988,7 @@ impl NdArray {
 
     /// Typed contiguous slice, if the array is C-contiguous and matches `T`.
     pub fn as_slice<T: Element>(&self) -> Option<&[T]> {
-        if self.dtype != T::DTYPE || !self.flags.c_contiguous {
+        if self.dtype() != T::DTYPE || !self.flags.c_contiguous || !self.is_native() {
             return None;
         }
         // SAFETY: the array is C-contiguous with `size()` elements of exactly
@@ -704,7 +1005,7 @@ impl NdArray {
 impl std::fmt::Debug for NdArray {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NdArray")
-            .field("dtype", &self.dtype.name())
+            .field("dtype", &self.dtype().name())
             .field("shape", &self.shape)
             .field("strides", &self.strides)
             .finish()
@@ -836,7 +1137,7 @@ mod tests {
                 let y = x.astype(b);
                 let z = y.astype(a);
                 assert_eq!(x.to_vec(), z.to_vec(), "round trip {a} -> {b} -> {a}");
-                assert_eq!(y.dtype, b);
+                assert_eq!(y.dtype(), b);
                 assert_eq!(y.shape, vec![3]);
                 assert!(y.flags.c_contiguous);
             }

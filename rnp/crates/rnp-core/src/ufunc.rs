@@ -907,12 +907,27 @@ impl CplxUn for C32 {
 
 /// Element-wise unary ufunc.
 pub fn unary(a: &NdArray, op: UnOp) -> Result<NdArray> {
-    if a.dtype.is_flexible() || a.dtype.is_object() {
+    // Byte-swapped storage is normalised to the host order *here*, once per
+    // operand, and never inside a loop: everything below sees native bytes.
+    if !a.is_native() {
+        return unary_swapped(a, op);
+    }
+    unary_native(a, op)
+}
+
+#[cold]
+#[inline(never)]
+fn unary_swapped(a: &NdArray, op: UnOp) -> Result<NdArray> {
+    unary_native(&a.to_native(), op)
+}
+
+fn unary_native(a: &NdArray, op: UnOp) -> Result<NdArray> {
+    if a.dtype().is_flexible() || a.dtype().is_object() {
         return Err(unsupported(op));
     }
-    let (compute, out_dtype) = op.resolve(a.dtype)?;
+    let (compute, out_dtype) = op.resolve(a.dtype())?;
     let owned;
-    let src = if a.dtype == compute {
+    let src = if a.dtype() == compute {
         a
     } else {
         owned = a.astype(compute);

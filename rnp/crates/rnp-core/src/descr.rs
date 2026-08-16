@@ -319,6 +319,20 @@ impl Descr {
         format!("{}{}{}", prefix, self.dt.str_kind(), self.dt.str_size())
     }
 
+    /// The PEP 3118 format string numpy exposes through the buffer protocol,
+    /// including the `>` prefix a byte-swapped descriptor carries.
+    pub fn buffer_format(&self) -> String {
+        let prefix = if self.bo == ByteOrder::Big { ">" } else { "" };
+        match self.dt {
+            // numpy spells the flexible kinds with a repeat count: `'3s'`,
+            // `'3w'` (UCS4) and `'4x'` (opaque padding).
+            DType::Bytes(n) => format!("{prefix}{n}s"),
+            DType::Str(n) => format!("{prefix}{n}w"),
+            DType::Void(n) => format!("{prefix}{n}x"),
+            other => format!("{prefix}{}", other.buffer_format()),
+        }
+    }
+
     pub fn is_struct(&self) -> bool {
         matches!(self.dt, DType::Struct(_))
     }

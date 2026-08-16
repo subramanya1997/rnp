@@ -254,9 +254,11 @@ class generic(metaclass=_ScalarMeta):
         return self
 
     def view(self, dt=None, type_=None):
+        # numpy's scalar `.view` gives back a *scalar*, not a 0-d array.
         if dt is None:
             return self
-        return self.__array__().view(dt)
+        v = self.__array__().view(dt)
+        return v[()] if getattr(v, "ndim", 1) == 0 else v
 
     def fill(self, value):
         raise ValueError("cannot write to a numpy scalar")

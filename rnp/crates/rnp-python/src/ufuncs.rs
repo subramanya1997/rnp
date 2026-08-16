@@ -125,8 +125,8 @@ fn resolve_operands(
     for o in &ops {
         if let Some(a) = &o.arr {
             strong = Some(match strong {
-                None => a.dtype,
-                Some(d) => rnp_core::promote(d, a.dtype),
+                None => a.dtype(),
+                Some(d) => rnp_core::promote(d, a.dtype()),
             });
         }
     }
@@ -154,7 +154,7 @@ fn resolve_operands(
 fn apply_where(res: &NdArray, base: &NdArray, mask: &NdArray) -> PyResult<NdArray> {
     let m = rnp_core::iter::broadcast_to(mask, &res.shape).map_err(crate::err)?;
     let b = rnp_core::iter::broadcast_to(base, &res.shape).map_err(crate::err)?;
-    let out = NdArray::empty(res.shape.clone(), res.dtype).map_err(crate::err)?;
+    let out = NdArray::empty(res.shape.clone(), res.dtype()).map_err(crate::err)?;
     let ro: Vec<isize> =
         rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset).collect();
     let mo: Vec<isize> = rnp_core::iter::offsets(&m.shape, &m.strides, m.byte_offset).collect();
@@ -236,7 +236,7 @@ pub fn _ufunc_call<'py>(
                     .borrow()
                     .arr
                     .clone(),
-                _ => NdArray::zeros(res.shape.clone(), res.dtype).map_err(crate::err)?,
+                _ => NdArray::zeros(res.shape.clone(), res.dtype()).map_err(crate::err)?,
             };
             apply_where(&res, &base, &mask)?
         }
@@ -253,8 +253,8 @@ pub fn _ufunc_call<'py>(
 
 /// `frexp` / `modf`: the two-output float decompositions.
 fn split_pair(a: &NdArray, frexp: bool) -> PyResult<(NdArray, NdArray)> {
-    let dt = match a.dtype {
-        DType::F16 | DType::F32 | DType::F64 => a.dtype,
+    let dt = match a.dtype() {
+        DType::F16 | DType::F32 | DType::F64 => a.dtype(),
         d if d.is_complex() => {
             return Err(PyTypeError::new_err(
                 "ufunc not supported for complex inputs",
@@ -370,7 +370,7 @@ fn identity_of(op: BinOp, dt: DType) -> Option<Scalar> {
 fn reduce_along(a: &NdArray, axis: usize, op: BinOp, initial: Option<Scalar>) -> PyResult<NdArray> {
     let n = a.shape[axis];
     if n == 0 {
-        let ident = initial.or_else(|| identity_of(op, a.dtype)).ok_or_else(|| {
+        let ident = initial.or_else(|| identity_of(op, a.dtype())).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "zero-size array to reduction operation {} which has no identity",
                 op.name()
@@ -378,7 +378,7 @@ fn reduce_along(a: &NdArray, axis: usize, op: BinOp, initial: Option<Scalar>) ->
         })?;
         let mut shape = a.shape.clone();
         shape.remove(axis);
-        let (_, out_dt) = rnp_core::ops::result_dtypes(a.dtype, a.dtype, op).map_err(crate::err)?;
+        let (_, out_dt) = rnp_core::ops::result_dtypes(a.dtype(), a.dtype(), op).map_err(crate::err)?;
         let mut z = NdArray::zeros(shape, out_dt).map_err(crate::err)?;
         z.fill(ident.cast(out_dt));
         return Ok(z);
@@ -387,8 +387,8 @@ fn reduce_along(a: &NdArray, axis: usize, op: BinOp, initial: Option<Scalar>) ->
         Some(s) => {
             let mut shape = a.shape.clone();
             shape.remove(axis);
-            let mut z = NdArray::zeros(shape, a.dtype).map_err(crate::err)?;
-            z.fill(s.cast(a.dtype));
+            let mut z = NdArray::zeros(shape, a.dtype()).map_err(crate::err)?;
+            z.fill(s.cast(a.dtype()));
             z
         }
         None => a.slice_axis(axis, 0, 1, 1).remove_axis(axis).copy(),
@@ -457,7 +457,7 @@ pub fn _ufunc_reduce<'py>(
     if let Some(w) = where_ {
         if !w.is_none() && !matches!(w.extract::<bool>(), Ok(true)) {
             let ident = init_scalar
-                .or_else(|| identity_of(op, arr.dtype))
+                .or_else(|| identity_of(op, arr.dtype()))
                 .ok_or_else(|| {
                     PyValueError::new_err(format!(
                         "reduction operation '{}' does not have an identity, so a \
@@ -466,8 +466,8 @@ pub fn _ufunc_reduce<'py>(
                     ))
                 })?;
             let mask = array_from_any(w, Some(DType::Bool), false)?;
-            let mut base = NdArray::zeros(arr.shape.clone(), arr.dtype).map_err(crate::err)?;
-            base.fill(ident.cast(arr.dtype));
+            let mut base = NdArray::zeros(arr.shape.clone(), arr.dtype()).map_err(crate::err)?;
+            base.fill(ident.cast(arr.dtype()));
             where_mask = Some(
                 rnp_core::iter::broadcast_to(&mask, &arr.shape).map_err(crate::err)?,
             );
@@ -481,10 +481,10 @@ pub fn _ufunc_reduce<'py>(
     // platform integer, exactly as `np.sum`/`np.prod` do.
     if dtype.map(|d| d.is_none()).unwrap_or(true)
         && matches!(op, BinOp::Add | BinOp::Mul)
-        && arr.dtype.is_exact()
-        && arr.dtype.itemsize() < 8
+        && arr.dtype().is_exact()
+        && arr.dtype().itemsize() < 8
     {
-        arr = arr.astype(if arr.dtype.is_unsigned() {
+        arr = arr.astype(if arr.dtype().is_unsigned() {
             DType::U64
         } else {
             DType::I64
@@ -500,7 +500,7 @@ pub fn _ufunc_reduce<'py>(
     let axes = resolve_axes(&arr, axis)?;
     let mut removed: Vec<usize> = axes.clone();
     removed.sort_unstable();
-    let native = native_reduce_op(op).filter(|_| arr.dtype.is_numeric());
+    let native = native_reduce_op(op).filter(|_| arr.dtype().is_numeric());
     // numpy seeds the accumulator with `initial=` before the first element is
     // folded in, which for a sequential fold is *not* the same as combining it
     // with the finished result. A chain of per-axis reductions cannot express
@@ -523,7 +523,7 @@ pub fn _ufunc_reduce<'py>(
         let rop = native.expect("checked above");
         let v = rnp_core::reduce::reduce_all_with(&arr, rop, ropts)
             .map_err(crate::err)?;
-        let out0 = NdArray::zeros(vec![], rnp_core::reduce::reduce_dtype(rop, arr.dtype))
+        let out0 = NdArray::zeros(vec![], rnp_core::reduce::reduce_dtype(rop, arr.dtype()))
             .map_err(crate::err)?;
         out0.write_at(out0.byte_offset, v);
         out0
@@ -538,7 +538,7 @@ pub fn _ufunc_reduce<'py>(
                 rnp_core::reduce::ReduceOpts::default()
             };
             cur = match native {
-                Some(rop) if cur.dtype.is_numeric() => {
+                Some(rop) if cur.dtype().is_numeric() => {
                     rnp_core::reduce::reduce_axis_with(&cur, ax, rop, false, o)
                         .map_err(crate::err)?
                 }
@@ -550,8 +550,8 @@ pub fn _ufunc_reduce<'py>(
     // Only reached when the reduction was a chain, where the engine could not
     // seed the accumulator itself.
     if let Some(s) = post_init {
-        let mut seed = NdArray::zeros(cur.shape.clone(), cur.dtype).map_err(crate::err)?;
-        seed.fill(s.cast(cur.dtype));
+        let mut seed = NdArray::zeros(cur.shape.clone(), cur.dtype()).map_err(crate::err)?;
+        seed.fill(s.cast(cur.dtype()));
         cur = rnp_core::binary(&seed, &cur, op).map_err(crate::err)?;
     }
     if keepdims {
@@ -609,12 +609,12 @@ pub fn _ufunc_accumulate<'py>(
             arr = arr.astype(dtype_from_any(d)?);
         }
     } else if matches!(op, BinOp::Add | BinOp::Mul)
-        && arr.dtype.is_exact()
-        && arr.dtype.itemsize() < 8
+        && arr.dtype().is_exact()
+        && arr.dtype().itemsize() < 8
     {
         // numpy accumulates bools and narrow ints in the platform int, as
         // `np.cumsum`/`np.cumprod` do.
-        arr = arr.astype(if arr.dtype.is_unsigned() {
+        arr = arr.astype(if arr.dtype().is_unsigned() {
             DType::U64
         } else {
             DType::I64
@@ -644,7 +644,7 @@ pub fn _ufunc_accumulate<'py>(
         slices.push(next.clone());
         acc = Some(next);
     }
-    let out_dt = slices.first().map(|s| s.dtype).unwrap_or(arr.dtype);
+    let out_dt = slices.first().map(|s| s.dtype()).unwrap_or(arr.dtype());
     let res = NdArray::empty(arr.shape.clone(), out_dt).map_err(crate::err)?;
     for (i, s) in slices.iter().enumerate() {
         let dst = res.slice_axis(ax, i as isize, 1, 1).remove_axis(ax);
@@ -758,12 +758,12 @@ pub fn _scalar_binop<'py>(
     let r = rnp_core::binary(&xa, &ya, op).map_err(crate::err)?;
     let mut flags = fpe::take();
     // numpy reports integer overflow for *scalar* operations only.
-    if r.dtype.is_integer() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow) {
-        if int_overflowed(op, x.1.cast(r.dtype), y.1.cast(r.dtype), r.get_flat(0), r.dtype) {
+    if r.dtype().is_integer() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow) {
+        if int_overflowed(op, x.1.cast(r.dtype()), y.1.cast(r.dtype()), r.get_flat(0), r.dtype()) {
             flags |= fpe::OVER;
         }
     }
-    triple(py, r.dtype, r.get_flat(0), flags)
+    triple(py, r.dtype(), r.get_flat(0), flags)
 }
 
 /// A unary ufunc on one scalar.
@@ -787,14 +787,14 @@ pub fn _scalar_unop<'py>(
     fpe::clear();
     let r = rnp_core::unary(&xa, op).map_err(crate::err)?;
     let mut flags = fpe::take();
-    if r.dtype.is_integer() && op == UnOp::Negative {
-        if let (Scalar::Int(i), Scalar::Int(o)) = (v.cast(r.dtype), r.get_flat(0)) {
+    if r.dtype().is_integer() && op == UnOp::Negative {
+        if let (Scalar::Int(i), Scalar::Int(o)) = (v.cast(r.dtype()), r.get_flat(0)) {
             if i != 0 && i == o {
                 flags |= fpe::OVER;
             }
         }
     }
-    triple(py, r.dtype, r.get_flat(0), flags)
+    triple(py, r.dtype(), r.get_flat(0), flags)
 }
 
 /// `(dtype, value, flags)` — what the Python scalar wrapper needs.
@@ -1130,7 +1130,7 @@ pub fn _scalar_binop2<'py>(
                 let mut yb = NdArray::zeros(vec![], dtb).map_err(crate::err)?;
                 yb.set(&[], xb).map_err(crate::err)?;
                 let r = rnp_core::binary(&ya, &yb, op).map_err(crate::err)?;
-                (r.dtype, r.get_flat(0))
+                (r.dtype(), r.get_flat(0))
             }
         };
     let mut flags = fpe::take();

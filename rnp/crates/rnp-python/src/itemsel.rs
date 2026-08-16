@@ -56,7 +56,7 @@ pub fn put(
     let idx = asarr(indices)?;
     let ivals: Vec<i64> = int_values(&idx);
     let arr = cell.borrow().arr.clone();
-    let vals = array_from_any(values, Some(arr.dtype), false)?;
+    let vals = array_from_any(values, Some(arr.dtype()), false)?;
     rnp_core::indexing::put(&arr, &ivals, &vals, m).map_err(crate::err)
 }
 
@@ -71,7 +71,7 @@ pub fn putmask(
         .map_err(|_| PyTypeError::new_err("putmask: first argument must be an array"))?;
     let arr = cell.borrow().arr.clone();
     let m = asarr(mask)?;
-    let v = array_from_any(values, Some(arr.dtype), false)?;
+    let v = array_from_any(values, Some(arr.dtype()), false)?;
     rnp_core::indexing::putmask(&arr, &m, &v).map_err(crate::err)
 }
 
@@ -175,7 +175,7 @@ pub fn where_<'py>(
     };
     let xa = asarr(x)?;
     let ya = asarr(y)?;
-    let dt = rnp_core::promote(xa.dtype, ya.dtype);
+    let dt = rnp_core::promote(xa.dtype(), ya.dtype());
     let mut shape = rnp_core::iter::broadcast_shapes(&cond.shape, &xa.shape).map_err(crate::err)?;
     shape = rnp_core::iter::broadcast_shapes(&shape, &ya.shape).map_err(crate::err)?;
     let bc = rnp_core::iter::broadcast_to(&cond, &shape).map_err(crate::err)?;

@@ -16,8 +16,8 @@ mod objects;
 mod pydtype;
 mod ufuncs;
 
-use convert::{any_scalar, array_from_any, scalar_from_py};
-use pyarray::{dtype_or_default, shape_from_any, ufunc2, PyNdArray};
+use convert::{any_scalar, array_from_any, array_from_any_descr, scalar_from_py};
+use pyarray::{descr_or_default, shape_from_any, ufunc2, PyNdArray};
 use pydtype::{descr_from_any, dtype_from_any, PyDType};
 
 /// Python exception constructors the shim installs at import time, keyed by
@@ -80,8 +80,8 @@ fn zeros(
     shape: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
-    let d = dtype_or_default(dtype, DType::F64)?;
-    wrap(py, NdArray::zeros(shape_from_any(shape)?, d).map_err(err)?)
+    let d = descr_or_default(dtype, DType::F64)?;
+    wrap(py, NdArray::zeros_descr(shape_from_any(shape)?, d).map_err(err)?)
 }
 
 #[pyfunction]
@@ -91,8 +91,8 @@ fn ones(
     shape: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
-    let d = dtype_or_default(dtype, DType::F64)?;
-    wrap(py, NdArray::ones(shape_from_any(shape)?, d).map_err(err)?)
+    let d = descr_or_default(dtype, DType::F64)?;
+    wrap(py, NdArray::ones_descr(shape_from_any(shape)?, d).map_err(err)?)
 }
 
 #[pyfunction]
@@ -102,8 +102,8 @@ fn empty(
     shape: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
-    let d = dtype_or_default(dtype, DType::F64)?;
-    wrap(py, NdArray::empty(shape_from_any(shape)?, d).map_err(err)?)
+    let d = descr_or_default(dtype, DType::F64)?;
+    wrap(py, NdArray::empty_descr(shape_from_any(shape)?, d).map_err(err)?)
 }
 
 #[pyfunction]
@@ -123,11 +123,11 @@ fn full(
         None => v.natural_dtype(),
     };
     let d = match dtype {
-        None => inferred,
-        Some(o) if o.is_none() => inferred,
-        Some(o) => dtype_from_any(o)?,
+        None => Descr::native(inferred),
+        Some(o) if o.is_none() => Descr::native(inferred),
+        Some(o) => descr_from_any(o)?,
     };
-    wrap(py, NdArray::full(shape_from_any(shape)?, d, v).map_err(err)?)
+    wrap(py, NdArray::full_descr(shape_from_any(shape)?, d, v).map_err(err)?)
 }
 
 #[pyfunction]
@@ -183,9 +183,18 @@ fn arange(
                 DType::F64
             }
         }
-        Some(o) => dtype_from_any(o)?,
+        Some(o) => descr_from_any(o)?.dt,
     };
-    wrap(py, NdArray::arange(start_v, stop_v, step_v, d).map_err(err)?)
+    let bo = match dtype {
+        Some(o) if !o.is_none() => descr_from_any(o)?,
+        _ => Descr::native(d),
+    };
+    wrap(
+        py,
+        NdArray::arange(start_v, stop_v, step_v, d)
+            .map_err(err)?
+            .into_descr(bo),
+    )
 }
 
 #[pyfunction]
@@ -199,9 +208,9 @@ fn array(
     let d = match dtype {
         None => None,
         Some(o) if o.is_none() => None,
-        Some(o) => Some(dtype_from_any(o)?),
+        Some(o) => Some(descr_from_any(o)?),
     };
-    wrap(py, array_from_any(obj, d, copy)?)
+    wrap(py, array_from_any_descr(obj, d, copy)?)
 }
 
 #[pyfunction]
@@ -214,9 +223,9 @@ fn asarray(
     let d = match dtype {
         None => None,
         Some(o) if o.is_none() => None,
-        Some(o) => Some(dtype_from_any(o)?),
+        Some(o) => Some(descr_from_any(o)?),
     };
-    wrap(py, array_from_any(obj, d, false)?)
+    wrap(py, array_from_any_descr(obj, d, false)?)
 }
 
 macro_rules! binary_ufunc {
@@ -263,7 +272,7 @@ fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDType
 /// Classify one `result_type` argument under NEP 50.
 fn type_arg(a: &Bound<'_, PyAny>) -> PyResult<TypeArg> {
     if let Ok(arr) = a.cast::<PyNdArray>() {
-        return Ok(TypeArg::Concrete(arr.borrow().arr.dtype));
+        return Ok(TypeArg::Concrete(arr.borrow().arr.dtype()));
     }
     // A bare Python number is *weak*: it contributes its kind, not its value.
     if a.is_instance_of::<pyo3::types::PyBool>() {
@@ -303,7 +312,7 @@ fn can_cast(from_: &Bound<'_, PyAny>, to: &Bound<'_, PyAny>, casting: &str) -> P
         ))
     })?;
     let src = if let Ok(arr) = from_.cast::<PyNdArray>() {
-        Descr::native(arr.borrow().arr.dtype)
+        Descr::native(arr.borrow().arr.dtype())
     } else {
         descr_from_any(from_)?
     };
@@ -316,7 +325,7 @@ fn min_scalar_type(value: &Bound<'_, PyAny>) -> PyResult<PyDType> {
         let a = &arr.borrow().arr;
         // Only 0-d arrays and scalars get the value-based treatment.
         if a.ndim() > 0 {
-            return Ok(PyDType::new(a.dtype));
+            return Ok(PyDType::new(a.dtype()));
         }
         return Ok(PyDType::new(rnp_core::min_scalar_type(a.get_flat(0))));
     }
@@ -331,10 +340,10 @@ fn common_type(arrays: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
     let mut dts = Vec::with_capacity(arrays.len());
     for a in arrays.iter() {
         let arr = array_from_any(&a, None, false)?;
-        if !arr.dtype.is_numeric() {
+        if !arr.dtype().is_numeric() {
             return Err(PyTypeError::new_err("can't get common type for non-numeric array"));
         }
-        dts.push(arr.dtype);
+        dts.push(arr.dtype());
     }
     rnp_core::common_type(&dts)
         .map(PyDType::new)

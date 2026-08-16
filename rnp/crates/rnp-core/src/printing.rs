@@ -81,7 +81,7 @@ impl Formatter {
     /// what numpy does too.
     fn build(arr: &NdArray) -> Formatter {
         let values = arr.to_vec();
-        let mut strings: Vec<String> = match arr.dtype {
+        let mut strings: Vec<String> = match arr.dtype() {
             // numpy always reserves the width of "False" for bools, so a
             // lone True still prints as `array([ True])`.
             DType::Bool => values
@@ -258,10 +258,10 @@ impl Ctx {
 
 /// `repr(array)` in numpy's style.
 pub fn repr(arr: &NdArray) -> String {
-    let dtype_suffix = if is_default_dtype(arr.dtype) && arr.size() > 0 {
+    let dtype_suffix = if is_default_dtype(arr.dtype()) && arr.size() > 0 {
         String::new()
     } else {
-        format!(", dtype={}", arr.dtype.name())
+        format!(", dtype={}", arr.dtype().name())
     };
 
     if arr.size() == 0 {

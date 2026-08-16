@@ -229,7 +229,7 @@ fn expand(arr: &NdArray, items: &[IndexItem]) -> Result<Vec<IndexItem>> {
 pub fn nonzero(arr: &NdArray) -> Vec<NdArray> {
     // Fast path: a contiguous 1-D boolean mask, which is what every
     // `a[mask]` goes through.
-    if arr.ndim() == 1 && arr.dtype == DType::Bool && arr.flags.c_contiguous {
+    if arr.ndim() == 1 && arr.dtype() == DType::Bool && arr.flags.c_contiguous {
         let n = arr.size();
         // SAFETY: `n` contiguous bytes of bool at `byte_offset`.
         let bytes = unsafe {
@@ -326,9 +326,9 @@ fn fold_index_array(
     axis: usize,
 ) -> Result<()> {
     let n = len as i64;
-    if a.flags.c_contiguous && !a.dtype.is_flexible() {
+    if a.flags.c_contiguous && !a.dtype().is_flexible() {
         let mut err: Option<Error> = None;
-        crate::dispatch_dtype!(a.dtype, T, {
+        crate::dispatch_dtype!(a.dtype(), T, {
             // SAFETY: `a` is contiguous with `outer.len()` elements of `T`.
             unsafe {
                 let p = a.buffer.as_ptr().offset(a.byte_offset) as *const T;
@@ -365,8 +365,8 @@ fn fold_index_array(
 fn index_values(a: &NdArray) -> Vec<i64> {
     let n = a.size();
     let mut out = Vec::with_capacity(n);
-    if a.flags.c_contiguous && !a.dtype.is_flexible() {
-        crate::dispatch_dtype!(a.dtype, T, {
+    if a.flags.c_contiguous && !a.dtype().is_flexible() {
+        crate::dispatch_dtype!(a.dtype(), T, {
             // SAFETY: `a` is contiguous with `n` elements of `T` at
             // `byte_offset`, all inside the allocation.
             unsafe {
@@ -678,13 +678,13 @@ fn fmt_shape(s: &[isize]) -> String {
 
 /// Gather the elements selected by `plan` into a fresh C-contiguous array.
 pub fn gather(arr: &NdArray, plan: &FancyPlan) -> Result<NdArray> {
-    let out = NdArray::empty(plan.shape.clone(), arr.dtype)?;
+    let out = NdArray::empty_descr(plan.shape.clone(), arr.descr)?;
     let isz = arr.itemsize();
-    if arr.dtype.is_flexible() || arr.dtype.is_object() {
+    if arr.dtype().is_flexible() || arr.dtype().is_object() {
         plan.for_each(|k, o| out.write_raw_at((k * isz) as isize, arr.raw_bytes_at(o)));
         return Ok(out);
     }
-    crate::dispatch_dtype!(arr.dtype, T, {
+    crate::dispatch_dtype!(arr.dtype(), T, {
         let src = arr.buffer.as_ptr();
         // SAFETY: `out` was freshly allocated with `plan.len()` elements of T.
         let dst = unsafe { out.buffer.as_mut_ptr() } as *mut T;
@@ -699,7 +699,8 @@ pub fn gather(arr: &NdArray, plan: &FancyPlan) -> Result<NdArray> {
 
 /// Scatter `src` (already broadcast to `plan.shape`) into `arr`.
 pub fn scatter(arr: &NdArray, plan: &FancyPlan, src: &NdArray) -> Result<()> {
-    if arr.dtype.is_flexible() || arr.dtype.is_object() {
+    if arr.dtype().is_flexible() || arr.dtype().is_object() {
+        let src = src.in_order_of(arr);
         let src_offs: Vec<isize> =
             crate::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
         plan.for_each(|k, d| arr.write_raw_at(d, src.raw_bytes_at(src_offs[k])));
@@ -709,7 +710,7 @@ pub fn scatter(arr: &NdArray, plan: &FancyPlan, src: &NdArray) -> Result<()> {
     // walk at all; otherwise collect the source offsets once.
     if src.size() == 1 || src.strides.iter().all(|&s| s == 0) {
         let v = src.read_at(src.byte_offset);
-        crate::dispatch_dtype!(arr.dtype, T, {
+        crate::dispatch_dtype!(arr.dtype(), T, {
             // SAFETY: the plan only yields in-bounds element offsets of `arr`.
             let base = unsafe { arr.buffer.as_mut_ptr() };
             let val = T::from_scalar(v);
@@ -722,7 +723,7 @@ pub fn scatter(arr: &NdArray, plan: &FancyPlan, src: &NdArray) -> Result<()> {
     }
     let src_offs: Vec<isize> =
         crate::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
-    crate::dispatch_dtype!(arr.dtype, T, {
+    crate::dispatch_dtype!(arr.dtype(), T, {
         // SAFETY: the plan only yields in-bounds element offsets of `arr`.
         let dbase = unsafe { arr.buffer.as_mut_ptr() };
         let sbase = src.buffer.as_ptr();
@@ -815,7 +816,7 @@ pub fn take(arr: &NdArray, indices: &NdArray, axis: Option<usize>, mode: TakeMod
     shape.extend_from_slice(&src.shape[..ax]);
     shape.extend_from_slice(&indices.shape);
     shape.extend_from_slice(&src.shape[ax + 1..]);
-    let out = NdArray::empty(shape, src.dtype)?;
+    let out = NdArray::empty_descr(shape, src.descr)?;
 
     let outer: usize = shape_size(&src.shape[..ax]);
     let inner: usize = shape_size(&src.shape[ax + 1..]);
@@ -837,7 +838,7 @@ pub fn take(arr: &NdArray, indices: &NdArray, axis: Option<usize>, mode: TakeMod
     // one run of `inner` elements, which is a single memcpy.
     let post_contig = post.len() == inner
         && post.windows(2).all(|w| w[1] - w[0] == isz as isize);
-    if post_contig && !src.dtype.is_flexible() && !src.dtype.is_object() {
+    if post_contig && !src.dtype().is_flexible() && !src.dtype().is_object() {
         let run = inner * isz;
         // SAFETY: `pre`/`resolved` address in-bounds runs of `src`, and `out`
         // was allocated with exactly `pre.len() * resolved.len() * inner`
@@ -864,7 +865,7 @@ pub fn take(arr: &NdArray, indices: &NdArray, axis: Option<usize>, mode: TakeMod
         for &r in &resolved {
             for &q in &post {
                 let s = p + r * stride + q;
-                if src.dtype.is_flexible() || src.dtype.is_object() {
+                if src.dtype().is_flexible() || src.dtype().is_object() {
                     out.write_raw_at(k * isz as isize, src.raw_bytes_at(s));
                 } else {
                     out.write_at(k * isz as isize, src.read_at(s));
@@ -882,6 +883,7 @@ pub fn put(arr: &NdArray, indices: &[i64], values: &NdArray, mode: TakeMode) -> 
     if values.size() == 0 {
         return Ok(());
     }
+    let values = values.in_order_of(arr);
     let vals: Vec<isize> =
         crate::iter::offsets(&values.shape, &values.strides, values.byte_offset).collect();
     for (k, &i) in indices.iter().enumerate() {
@@ -893,7 +895,7 @@ pub fn put(arr: &NdArray, indices: &[i64], values: &NdArray, mode: TakeMode) -> 
         })?;
         let dst = flat_offset(arr, v as usize);
         let s = vals[k % vals.len()];
-        if arr.dtype.is_flexible() {
+        if arr.dtype().is_flexible() {
             arr.write_raw_at(dst, values.raw_bytes_at(s));
         } else {
             arr.write_at(dst, values.read_at(s));
@@ -930,6 +932,7 @@ pub fn putmask(arr: &NdArray, mask: &NdArray, values: &NdArray) -> Result<()> {
     }
     let mvals: Vec<isize> =
         crate::iter::offsets(&mask.shape, &mask.strides, mask.byte_offset).collect();
+    let values = values.in_order_of(arr);
     let vals: Vec<isize> =
         crate::iter::offsets(&values.shape, &values.strides, values.byte_offset).collect();
     for i in 0..arr.size() {
@@ -938,7 +941,7 @@ pub fn putmask(arr: &NdArray, mask: &NdArray, values: &NdArray) -> Result<()> {
         }
         let dst = flat_offset(arr, i);
         let s = vals[i % vals.len()];
-        if arr.dtype.is_flexible() {
+        if arr.dtype().is_flexible() {
             arr.write_raw_at(dst, values.raw_bytes_at(s));
         } else {
             arr.write_at(dst, values.read_at(s));
@@ -985,9 +988,9 @@ pub fn choose(sel: &NdArray, choices: &[NdArray], mode: TakeMode) -> Result<NdAr
     for c in choices {
         shape = crate::iter::broadcast_shapes(&shape, &c.shape)?;
     }
-    let mut dt = choices[0].dtype;
+    let mut dt = choices[0].dtype();
     for c in &choices[1..] {
-        dt = crate::dtype::promote(dt, c.dtype);
+        dt = crate::dtype::promote(dt, c.dtype());
     }
     let bsel = crate::iter::broadcast_to(sel, &shape)?;
     let bch: Vec<NdArray> = choices

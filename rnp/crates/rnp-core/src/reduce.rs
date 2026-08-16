@@ -376,7 +376,7 @@ impl Acc {
 unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
     // SAFETY: guaranteed by the caller.
     let p = unsafe { arr.buffer.as_ptr().offset(off) };
-    match arr.dtype {
+    match arr.dtype() {
         // SAFETY: `p`/`n`/`stride` describe an in-bounds run of this dtype.
         DType::F16 => Acc::F16(unsafe { pairwise_f16(p, n, stride) }),
         DType::F32 => Acc::F32(unsafe { pairwise_f32(p, n, stride) }),
@@ -773,18 +773,18 @@ unsafe fn extreme_run(
         && seed.is_none()
         && stride == arr.itemsize() as isize
         && n > 0
-        && (p as usize) % arr.dtype.alignment().max(1) == 0
+        && (p as usize) % arr.dtype().alignment().max(1) == 0
     {
         #[allow(unused_assignments)]
         let mut out = Scalar::Int(0);
-        crate::dispatch_dtype!(arr.dtype, T, {
+        crate::dispatch_dtype!(arr.dtype(), T, {
             // SAFETY: the caller guarantees `n` contiguous in-bounds elements.
             out = unsafe { extreme_contig::<T>(p as *const T, n, want_max) }.to_scalar();
         });
         return (out, 0);
     }
     let mut best = seed;
-    crate::dispatch_dtype!(arr.dtype, T, {
+    crate::dispatch_dtype!(arr.dtype(), T, {
         let mut cur: Option<(T, usize)> = best.map(|(s, i)| (T::from_scalar(s), i));
         for i in 0..n {
             // SAFETY: in-bounds by the caller's contract.
@@ -834,11 +834,11 @@ unsafe fn extreme_run(
 // ---------------------------------------------------------------------------
 
 fn check_numeric(arr: &NdArray, op: ReduceOp) -> Result<()> {
-    if !arr.dtype.is_numeric() {
+    if !arr.dtype().is_numeric() {
         return Err(Error::NotImplemented(format!(
             "{} is not implemented for dtype {}",
             op.name(),
-            arr.dtype
+            arr.dtype()
         )));
     }
     Ok(())
@@ -889,6 +889,19 @@ pub fn reduce_all(arr: &NdArray, op: ReduceOp) -> Result<Scalar> {
 
 /// Reduce the whole array, honouring `where=` and `initial=`.
 pub fn reduce_all_with(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Result<Scalar> {
+    if !arr.is_native() {
+        return reduce_all_swapped(arr, op, opts);
+    }
+    reduce_all_native(arr, op, opts)
+}
+
+#[cold]
+#[inline(never)]
+fn reduce_all_swapped(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Result<Scalar> {
+    reduce_all_native(&arr.to_native(), op, opts)
+}
+
+fn reduce_all_native(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Result<Scalar> {
     let ReduceOpts { mask, seed } = opts;
     check_numeric(arr, op)?;
     let n = arr.size();
@@ -899,12 +912,12 @@ pub fn reduce_all_with(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Res
                 op.name()
             )));
         }
-        let dt = reduce_dtype(op, arr.dtype);
+        let dt = reduce_dtype(op, arr.dtype());
         return Ok(seed.map_or_else(|| identity_scalar(op, dt), |s| s.cast(dt)));
     }
     match op {
         ReduceOp::Sum => {
-            let acc_dt = reduce_dtype(op, arr.dtype);
+            let acc_dt = reduce_dtype(op, arr.dtype());
             let mut acc = Acc::seeded(acc_dt, seed);
             // `runs` and `mask_bits` both walk the array in C order, so the
             // mask can be consumed run by run.
@@ -927,7 +940,7 @@ pub fn reduce_all_with(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Res
             Ok(acc.to_scalar())
         }
         ReduceOp::Prod => {
-            let out_dt = reduce_dtype(op, arr.dtype);
+            let out_dt = reduce_dtype(op, arr.dtype());
             let mut acc = seed.unwrap_or(Scalar::Int(1)).cast(out_dt);
             crate::dispatch_dtype!(out_dt, A, {
                 let mut a = A::from_scalar(acc);
@@ -943,7 +956,7 @@ pub fn reduce_all_with(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Res
             // never read, because `arg*` has no `initial`.
             let mut best: Option<(Scalar, usize)> = seed
                 .filter(|_| !op.is_arg())
-                .map(|s| (s.cast(arr.dtype), usize::MAX));
+                .map(|s| (s.cast(arr.dtype()), usize::MAX));
             let mut base = 0usize;
             for (off, len, stride) in runs(arr) {
                 if len == 0 {
@@ -1030,6 +1043,31 @@ pub fn reduce_axis_with(
     keepdims: bool,
     opts: ReduceOpts<'_>,
 ) -> Result<NdArray> {
+    if !arr.is_native() {
+        return reduce_axis_swapped(arr, axis, op, keepdims, opts);
+    }
+    reduce_axis_native(arr, axis, op, keepdims, opts)
+}
+
+#[cold]
+#[inline(never)]
+fn reduce_axis_swapped(
+    arr: &NdArray,
+    axis: usize,
+    op: ReduceOp,
+    keepdims: bool,
+    opts: ReduceOpts<'_>,
+) -> Result<NdArray> {
+    reduce_axis_native(&arr.to_native(), axis, op, keepdims, opts)
+}
+
+fn reduce_axis_native(
+    arr: &NdArray,
+    axis: usize,
+    op: ReduceOp,
+    keepdims: bool,
+    opts: ReduceOpts<'_>,
+) -> Result<NdArray> {
     let ReduceOpts { mask, seed } = opts;
     check_numeric(arr, op)?;
     if axis >= arr.ndim() {
@@ -1046,7 +1084,7 @@ pub fn reduce_axis_with(
             op.name()
         )));
     }
-    let out_dt = reduce_dtype(op, arr.dtype);
+    let out_dt = reduce_dtype(op, arr.dtype());
     let mut out_shape: Vec<isize> = arr.shape.clone();
     if keepdims {
         out_shape[axis] = 1;
@@ -1143,7 +1181,7 @@ pub fn reduce_axis_with(
                 // `initial=` seeds the accumulator, as it does for sum/prod.
                 let start = seed
                     .filter(|_| !op.is_arg())
-                    .map(|s| (s.cast(arr.dtype), usize::MAX));
+                    .map(|s| (s.cast(arr.dtype()), usize::MAX));
                 // SAFETY: the run lies inside `arr`.
                 let (v, i) = unsafe { extreme_run(arr, src_off, n, axis_stride, op, start) };
                 if op.is_arg() {
@@ -1275,7 +1313,7 @@ mod tests {
         assert_eq!(k.shape, vec![2, 1]);
         // argmax along axis 0
         let am = reduce_axis(&a, 0, ReduceOp::ArgMax, false).unwrap();
-        assert_eq!(am.dtype, DType::I64);
+        assert_eq!(am.dtype(), DType::I64);
         assert_eq!(am.to_vec(), vec![Scalar::Int(1); 3]);
     }
 

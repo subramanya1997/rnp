@@ -16,14 +16,14 @@ pub const BAD_INDEX: &str = "only integers, slices (`:`), ellipsis (`...`), \
 
 /// Classify one already-materialised array as an index.
 fn array_item(a: NdArray) -> PyResult<IndexItem> {
-    if a.dtype == DType::Bool {
+    if a.dtype() == DType::Bool {
         if a.ndim() == 0 {
             let v = matches!(a.get_flat(0), rnp_core::Scalar::Bool(true));
             return Ok(IndexItem::ZeroDBool(v));
         }
         return Ok(IndexItem::BoolArray(a));
     }
-    if a.dtype.is_integer() {
+    if a.dtype().is_integer() {
         return Ok(IndexItem::IntArray(a));
     }
     Err(PyIndexError::new_err(
@@ -105,10 +105,10 @@ fn parse_item(obj: &Bound<'_, PyAny>) -> PyResult<IndexItem> {
             .map_err(|_| PyIndexError::new_err(BAD_INDEX))?;
         // `a[[]]` is a legal empty fancy index even though the empty list
         // coerces to float64.
-        if a.size() == 0 && !a.dtype.is_integer() && a.dtype != DType::Bool {
+        if a.size() == 0 && !a.dtype().is_integer() && a.dtype() != DType::Bool {
             return Ok(IndexItem::IntArray(a.astype(DType::I64)));
         }
-        if !a.dtype.is_integer() && a.dtype != DType::Bool {
+        if !a.dtype().is_integer() && a.dtype() != DType::Bool {
             return Err(PyIndexError::new_err(BAD_INDEX));
         }
         return array_item(a);

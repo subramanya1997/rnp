@@ -16,7 +16,7 @@ use rnp_core::{binary, BinOp, DType, NdArray, Scalar};
 use crate::convert::{array_from_any, flexible_to_py, npflexible_to_py, npscalar_to_py,
                      operand_for, scalar_from_py, scalar_to_py};
 use rnp_core::printing;
-use crate::pydtype::{dtype_from_any, PyDType};
+use crate::pydtype::{descr_from_any, dtype_from_any, PyDType};
 
 #[pyclass(name = "ndarray", module = "_rnp", subclass)]
 pub struct PyNdArray {
@@ -52,6 +52,12 @@ impl PyNdArray {
             },
         )
     }
+}
+
+/// A deep copy of an array cell's contents, for the methods that must not
+/// write through a shared buffer.
+fn self_arr_copy(slf: &Bound<'_, PyNdArray>) -> NdArray {
+    slf.borrow().arr.copy()
 }
 
 fn nested_list<'py>(
@@ -106,11 +112,11 @@ impl PyFlatIter {
     /// Materialise the iterator as a fresh 1-D array.
     fn to_array(&self) -> NdArray {
         let n = self.arr.size();
-        let out = NdArray::empty(vec![n as isize], self.arr.dtype).expect("flat alloc");
+        let out = NdArray::empty_descr(vec![n as isize], self.arr.descr).expect("flat alloc");
         let isz = self.arr.itemsize() as isize;
         for i in 0..n {
             let s = self.offset(i);
-            if self.arr.dtype.is_flexible() {
+            if self.arr.dtype().is_flexible() {
                 out.write_raw_at(i as isize * isz, self.arr.raw_bytes_at(s));
             } else {
                 out.write_at(i as isize * isz, self.arr.read_at(s));
@@ -121,7 +127,7 @@ impl PyFlatIter {
 
     fn gather(&self, positions: &[i64], shape: &[isize]) -> PyResult<NdArray> {
         let n = self.n();
-        let out = NdArray::empty(shape.to_vec(), self.arr.dtype).map_err(crate::err)?;
+        let out = NdArray::empty_descr(shape.to_vec(), self.arr.descr).map_err(crate::err)?;
         let isz = self.arr.itemsize() as isize;
         for (k, &raw) in positions.iter().enumerate() {
             let v = if raw < 0 { raw + n as i64 } else { raw };
@@ -132,7 +138,7 @@ impl PyFlatIter {
                 )));
             }
             let s = self.offset(v as usize);
-            if self.arr.dtype.is_flexible() {
+            if self.arr.dtype().is_flexible() {
                 out.write_raw_at(k as isize * isz, self.arr.raw_bytes_at(s));
             } else {
                 out.write_at(k as isize * isz, self.arr.read_at(s));
@@ -200,7 +206,7 @@ impl PyFlatIter {
             None
         };
         if let Some(a) = as_arr {
-            if a.dtype == DType::Bool {
+            if a.dtype() == DType::Bool {
                 if a.size() as isize != self.n() {
                     return Err(PyIndexError::new_err(format!(
                         "boolean index did not match indexed flat iterator; size of \
@@ -219,7 +225,7 @@ impl PyFlatIter {
                 let n = pos.len() as isize;
                 return Ok(FlatKey::Gather(pos, vec![n]));
             }
-            if a.dtype.is_flexible() || !a.dtype.is_integer() {
+            if a.dtype().is_flexible() || !a.dtype().is_integer() {
                 // An empty non-integer index is accepted (it matches the array
                 // path, where `arr[[]]` must work).
                 if a.size() == 0 {
@@ -235,7 +241,7 @@ impl PyFlatIter {
         if key.is_instance_of::<PyList>() {
             let a = array_from_any(key, None, false)
                 .map_err(|_| PyIndexError::new_err(FLAT_BAD_INDEX))?;
-            if a.dtype == DType::Bool {
+            if a.dtype() == DType::Bool {
                 return Err(PyIndexError::new_err(
                     "boolean indices for iterators are not supported",
                 ));
@@ -243,8 +249,8 @@ impl PyFlatIter {
             if a.size() == 0 {
                 return Ok(FlatKey::Gather(vec![], vec![0]));
             }
-            if !a.dtype.is_integer() {
-                if !a.dtype.is_float() {
+            if !a.dtype().is_integer() {
+                if !a.dtype().is_float() {
                     return Err(PyIndexError::new_err(FLAT_BAD_INDEX));
                 }
                 PyErr::warn(
@@ -295,10 +301,10 @@ impl PyFlatIter {
         let py = slf.py();
         let off = slf.offset(slf.pos);
         slf.pos += 1;
-        if slf.arr.dtype.is_flexible() || slf.arr.dtype.is_object() {
+        if slf.arr.dtype().is_flexible() || slf.arr.dtype().is_object() {
             return Ok(Some(npflexible_to_py(py, &slf.arr, off)?));
         }
-        Ok(Some(npscalar_to_py(py, slf.arr.dtype, slf.arr.read_at(off))?))
+        Ok(Some(npscalar_to_py(py, slf.arr.dtype(), slf.arr.read_at(off))?))
     }
 
     #[getter]
@@ -337,7 +343,7 @@ impl PyFlatIter {
         let _ = copy;
         let a = self.to_array();
         let a = match dtype {
-            Some(d) if !d.is_none() => a.astype(dtype_from_any(d)?),
+            Some(d) if !d.is_none() => a.astype_descr(descr_from_any(d)?),
             _ => a,
         };
         PyNdArray::into_py_any(a, py)
@@ -360,10 +366,10 @@ impl PyFlatIter {
                     )));
                 }
                 let off = self.offset(v as usize);
-                if self.arr.dtype.is_flexible() {
+                if self.arr.dtype().is_flexible() {
                     return npflexible_to_py(py, &self.arr, off);
                 }
-                return npscalar_to_py(py, self.arr.dtype, self.arr.read_at(off));
+                return npscalar_to_py(py, self.arr.dtype(), self.arr.read_at(off));
             }
             FlatKey::Range(start, len, step) => {
                 let pos: Vec<i64> = (0..len).map(|k| (start + k * step) as i64).collect();
@@ -398,7 +404,7 @@ impl PyFlatIter {
             }
             resolved.push(v as usize);
         }
-        if !self.arr.dtype.is_flexible() {
+        if !self.arr.dtype().is_flexible() {
             if let Some(s) = scalar_from_py(value) {
                 for &v in &resolved {
                     self.arr.write_at(self.offset(v), s);
@@ -406,7 +412,7 @@ impl PyFlatIter {
                 return Ok(());
             }
         }
-        let src = array_from_any(value, Some(self.arr.dtype), false)?;
+        let src = array_from_any(value, Some(self.arr.dtype()), false)?;
         let want = [resolved.len() as isize];
         let src = match rnp_core::iter::broadcast_to(&src, &want) {
             Ok(s) => s,
@@ -418,11 +424,12 @@ impl PyFlatIter {
                 rnp_core::iter::broadcast_to(&flat, &want).map_err(crate::err)?
             }
         };
+        let src = src.in_order_of(&self.arr);
         let src_offs: Vec<isize> =
             rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
         for (k, &v) in resolved.iter().enumerate() {
             let d = self.offset(v);
-            if self.arr.dtype.is_flexible() {
+            if self.arr.dtype().is_flexible() {
                 self.arr.write_raw_at(d, src.raw_bytes_at(src_offs[k]));
             } else {
                 self.arr.write_at(d, src.read_at(src_offs[k]));
@@ -437,73 +444,209 @@ impl PyFlatIter {
 }
 
 /// numpy's `a.flags` object: attribute *and* item access.
+///
+/// It is a live *proxy* onto the owning array, not a snapshot, because
+/// `x.flags.writeable = False` has to change `x`.
 #[pyclass(name = "flagsobj", module = "_rnp")]
 pub struct PyFlags {
-    c: bool,
-    f: bool,
-    w: bool,
-    o: bool,
-    a: bool,
+    owner: Py<PyNdArray>,
+}
+
+impl PyFlags {
+    fn get<T>(&self, py: Python<'_>, f: impl FnOnce(&rnp_core::array::Flags) -> T) -> T {
+        f(&self.owner.borrow(py).arr.flags)
+    }
 }
 
 #[pymethods]
 impl PyFlags {
     #[getter]
-    fn c_contiguous(&self) -> bool {
-        self.c
+    fn c_contiguous(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.c_contiguous)
     }
     #[getter]
-    fn f_contiguous(&self) -> bool {
-        self.f
+    fn f_contiguous(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.f_contiguous)
     }
     #[getter]
-    fn contiguous(&self) -> bool {
-        self.c
+    fn contiguous(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.c_contiguous)
     }
     #[getter]
-    fn fortran(&self) -> bool {
-        self.f
+    fn fortran(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.f_contiguous)
     }
     #[getter]
-    fn writeable(&self) -> bool {
-        self.w
+    fn writeable(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.writeable)
+    }
+    #[setter]
+    fn set_writeable(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+        self.set_flag(py, "WRITEABLE", value)
     }
     #[getter]
-    fn owndata(&self) -> bool {
-        self.o
+    fn owndata(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.owndata)
     }
     #[getter]
-    fn aligned(&self) -> bool {
-        self.a
+    fn aligned(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.aligned)
+    }
+    #[setter]
+    fn set_aligned(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+        self.set_flag(py, "ALIGNED", value)
     }
     #[getter]
-    fn behaved(&self) -> bool {
-        self.a && self.w
+    fn behaved(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.aligned && f.writeable)
+    }
+    #[getter]
+    fn carray(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.c_contiguous && f.aligned && f.writeable)
+    }
+    #[getter]
+    fn farray(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.f_contiguous && !f.c_contiguous && f.aligned && f.writeable)
+    }
+    #[getter]
+    fn forc(&self, py: Python<'_>) -> bool {
+        self.get(py, |f| f.f_contiguous || f.c_contiguous)
+    }
+    #[getter]
+    fn writebackifcopy(&self) -> bool {
+        false
     }
 
-    fn __getitem__(&self, key: &str) -> PyResult<bool> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
         match key {
-            "C_CONTIGUOUS" | "C" => Ok(self.c),
-            "F_CONTIGUOUS" | "F" => Ok(self.f),
-            "WRITEABLE" | "W" => Ok(self.w),
-            "OWNDATA" | "O" => Ok(self.o),
-            "ALIGNED" | "A" => Ok(self.a),
-            "BEHAVED" | "B" => Ok(self.a && self.w),
+            "C_CONTIGUOUS" | "C" => Ok(self.c_contiguous(py)),
+            "F_CONTIGUOUS" | "F" => Ok(self.f_contiguous(py)),
+            "WRITEABLE" | "W" => Ok(self.writeable(py)),
+            "OWNDATA" | "O" => Ok(self.owndata(py)),
+            "ALIGNED" | "A" => Ok(self.aligned(py)),
+            "BEHAVED" | "B" => Ok(self.behaved(py)),
+            "CARRAY" | "CA" => Ok(self.carray(py)),
+            "FARRAY" | "FA" => Ok(self.farray(py)),
+            "FORC" => Ok(self.forc(py)),
+            "WRITEBACKIFCOPY" => Ok(false),
             other => Err(PyKeyError::new_err(other.to_string())),
         }
     }
 
-    fn __repr__(&self) -> String {
+    fn __setitem__(&self, py: Python<'_>, key: &str, value: bool) -> PyResult<()> {
+        self.set_flag(py, key, value)
+    }
+
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> bool {
+        match other.cast::<PyFlags>() {
+            Ok(o) => {
+                let a = self.owner.borrow(py).arr.flags;
+                let b = o.borrow().owner.borrow(py).arr.flags;
+                a == b
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
         format!(
             "  C_CONTIGUOUS : {}\n  F_CONTIGUOUS : {}\n  OWNDATA : {}\n  \
-             WRITEABLE : {}\n  ALIGNED : {}",
-            pybool(self.c),
-            pybool(self.f),
-            pybool(self.o),
-            pybool(self.w),
-            pybool(self.a)
+             WRITEABLE : {}\n  ALIGNED : {}\n  WRITEBACKIFCOPY : {}",
+            pybool(self.c_contiguous(py)),
+            pybool(self.f_contiguous(py)),
+            pybool(self.owndata(py)),
+            pybool(self.writeable(py)),
+            pybool(self.aligned(py)),
+            pybool(false)
         )
     }
+}
+
+impl PyFlags {
+    /// numpy only lets three flags be set from Python, and only
+    /// `WRITEABLE`/`ALIGNED` mean anything here.
+    fn set_flag(&self, py: Python<'_>, key: &str, value: bool) -> PyResult<()> {
+        match key {
+            "WRITEABLE" | "W" => {
+                if value {
+                    // numpy refuses to re-enable writing on an array that
+                    // neither owns its data nor has a writeable base.
+                    let ok = {
+                        let me = self.owner.borrow(py);
+                        me.arr.flags.owndata
+                            || match &me.base {
+                                None => true,
+                                Some(b) => match b.bind(py).cast::<PyNdArray>() {
+                                    Ok(bb) => bb.borrow().arr.flags.writeable,
+                                    Err(_) => true,
+                                },
+                            }
+                    };
+                    if !ok {
+                        return Err(PyValueError::new_err(
+                            "cannot set WRITEABLE flag to True of this array",
+                        ));
+                    }
+                }
+                self.owner.borrow_mut(py).arr.flags.writeable = value;
+                Ok(())
+            }
+            "ALIGNED" | "A" => {
+                if value && !self.owner.borrow(py).arr.flags.aligned {
+                    return Err(PyValueError::new_err(
+                        "cannot set ALIGNED flag to True of this array",
+                    ));
+                }
+                Ok(())
+            }
+            "WRITEBACKIFCOPY" => {
+                if value {
+                    return Err(PyValueError::new_err(
+                        "cannot set WRITEBACKIFCOPY flag to True",
+                    ));
+                }
+                Ok(())
+            }
+            "C_CONTIGUOUS" | "C" | "F_CONTIGUOUS" | "F" | "OWNDATA" | "O" => Err(
+                PyKeyError::new_err(format!("Cannot set flag {key}")),
+            ),
+            other => Err(PyKeyError::new_err(other.to_string())),
+        }
+    }
+}
+
+/// numpy accepts `kind=` and `stable=` but not both; only the stability
+/// matters here.
+fn sort_stable(kind: Option<&Bound<'_, PyAny>>, stable: Option<bool>) -> PyResult<bool> {
+    let k = match kind {
+        Some(o) if !o.is_none() => Some(o.extract::<String>()?),
+        _ => None,
+    };
+    if k.is_some() && stable.is_some() {
+        return Err(PyValueError::new_err(
+            "`kind` and `stable` parameters can't be provided at the same time. Use only one of them.",
+        ));
+    }
+    match k.as_deref() {
+        None => Ok(stable.unwrap_or(false)),
+        Some("quicksort") | Some("introsort") => Ok(false),
+        Some("stable") | Some("mergesort") | Some("timsort") | Some("radixsort") => Ok(true),
+        Some("heapsort") => Ok(false),
+        Some(other) => Err(PyValueError::new_err(format!("{other} is an unrecognized kind of sort"))),
+    }
+}
+
+/// Normalise a (possibly negative) sort axis.
+fn norm_sort_axis(arr: &NdArray, axis: isize) -> PyResult<usize> {
+    let nd = arr.ndim().max(1) as isize;
+    let ax = if axis < 0 { axis + nd } else { axis };
+    if ax < 0 || ax >= nd {
+        return Err(PyValueError::new_err(format!(
+            "axis {axis} is out of bounds for array of dimension {}",
+            arr.ndim()
+        )));
+    }
+    Ok(ax as usize)
 }
 
 fn pybool(b: bool) -> &'static str {
@@ -535,7 +678,7 @@ impl PyNdArray {
 
     #[getter]
     fn dtype(&self) -> PyDType {
-        PyDType::new(self.arr.dtype)
+        PyDType::from_descr(self.arr.descr)
     }
 
     #[getter]
@@ -559,13 +702,9 @@ impl PyNdArray {
     }
 
     #[getter]
-    fn flags(&self) -> PyFlags {
+    fn flags(slf: &Bound<'_, Self>) -> PyFlags {
         PyFlags {
-            c: self.arr.flags.c_contiguous,
-            f: self.arr.flags.f_contiguous,
-            w: self.arr.flags.writeable,
-            o: self.arr.flags.owndata,
-            a: self.arr.flags.aligned,
+            owner: slf.clone().unbind(),
         }
     }
 
@@ -651,26 +790,177 @@ impl PyNdArray {
         dtype: &Bound<'_, PyAny>,
         copy: bool,
     ) -> PyResult<Py<PyNdArray>> {
-        let d = dtype_from_any(dtype)?;
-        let out = if d == self.arr.dtype {
+        let d = descr_from_any(dtype)?;
+        let out = if d == self.arr.descr && d.alias == self.arr.descr.alias {
             if copy {
                 self.arr.copy()
             } else {
                 self.arr.clone()
             }
-        } else if d.is_flexible() || self.arr.dtype.is_flexible() {
+        } else if d.dt == self.arr.dtype() {
+            // Same storage, different byte order (or C-type spelling): a
+            // straight swap-and-relabel, no value cast involved.
+            self.arr.copy().into_descr(d)
+        } else if d.dt.is_flexible() || self.arr.dtype().is_flexible() {
             return Err(PyNotImplementedError::new_err(format!(
                 "astype from {} to {} is not implemented yet",
-                self.arr.dtype, d
+                self.arr.dtype(), d.dt
             )));
         } else {
-            self.arr.astype(d)
+            self.arr.astype_descr(d)
         };
         PyNdArray::into_py_any(out, py)
     }
 
     fn copy(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
         PyNdArray::into_py_any(self.arr.copy(), py)
+    }
+
+    /// numpy's array interface (version 3). `strides` is `None` exactly when
+    /// the array is C-contiguous, which is what numpy reports.
+    #[getter]
+    fn __array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("shape", PyTuple::new(py, self.arr.shape.iter().map(|&x| x as usize))?)?;
+        d.set_item("typestr", self.arr.descr.str_code())?;
+        d.set_item(
+            "descr",
+            crate::pydtype::PyDType::from_descr(self.arr.descr).descr(py)?,
+        )?;
+        if self.arr.flags.c_contiguous {
+            d.set_item("strides", py.None())?;
+        } else {
+            d.set_item("strides", PyTuple::new(py, self.arr.strides.iter().copied())?)?;
+        }
+        let ptr = self.arr.buffer.as_ptr() as usize;
+        let addr = (ptr as isize + self.arr.byte_offset) as usize;
+        d.set_item("data", (addr, !self.arr.flags.writeable))?;
+        d.set_item("version", 3)?;
+        Ok(d)
+    }
+
+    /// `a.sort(axis=-1, kind=None, order=None, *, stable=None)`, in place.
+    #[pyo3(signature = (axis = -1, kind = None, order = None, *, stable = None))]
+    fn sort(
+        &mut self,
+        axis: isize,
+        kind: Option<&Bound<'_, PyAny>>,
+        order: Option<&Bound<'_, PyAny>>,
+        stable: Option<bool>,
+    ) -> PyResult<()> {
+        if order.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "sort(order=) is not implemented yet",
+            ));
+        }
+        let stable = sort_stable(kind, stable)?;
+        let ax = norm_sort_axis(&self.arr, axis)?;
+        rnp_core::sort::sort_inplace(&mut self.arr, ax, stable).map_err(crate::err)
+    }
+
+    #[pyo3(signature = (axis = Some(-1), kind = None, order = None, *, stable = None))]
+    fn argsort(
+        &self,
+        py: Python<'_>,
+        axis: Option<isize>,
+        kind: Option<&Bound<'_, PyAny>>,
+        order: Option<&Bound<'_, PyAny>>,
+        stable: Option<bool>,
+    ) -> PyResult<Py<PyNdArray>> {
+        if order.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "argsort(order=) is not implemented yet",
+            ));
+        }
+        let stable = sort_stable(kind, stable)?;
+        let (arr, ax) = match axis {
+            None => {
+                let flat = self.arr.reshape(&[-1]).map_err(crate::err)?;
+                (flat, 0)
+            }
+            Some(a) => {
+                let ax = norm_sort_axis(&self.arr, a)?;
+                (self.arr.clone(), ax)
+            }
+        };
+        let out = rnp_core::sort::argsort(&arr, ax, stable).map_err(crate::err)?;
+        PyNdArray::into_py_any(out, py)
+    }
+
+    #[pyo3(signature = (v, side = "left", sorter = None))]
+    fn searchsorted(
+        &self,
+        py: Python<'_>,
+        v: &Bound<'_, PyAny>,
+        side: &str,
+        sorter: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if sorter.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "searchsorted(sorter=) is not implemented yet",
+            ));
+        }
+        let right = match side {
+            "left" => false,
+            "right" => true,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "'{other}' is an invalid value for keyword 'side'"
+                )))
+            }
+        };
+        let vv = array_from_any(v, Some(self.arr.dtype()), false)?;
+        let out = rnp_core::sort::searchsorted(&self.arr, &vv, right).map_err(crate::err)?;
+        if out.ndim() == 0 {
+            return crate::convert::npscalar_to_py(py, out.dtype(), out.get_flat(0))
+                .map(|b| b.unbind());
+        }
+        Ok(PyNdArray::into_py_any(out, py)?.into_any())
+    }
+
+    /// `ndarray.setflags(write=None, align=None, uic=None)`.
+    #[pyo3(signature = (write = None, align = None, uic = None))]
+    fn setflags(
+        slf: &Bound<'_, Self>,
+        write: Option<bool>,
+        align: Option<bool>,
+        uic: Option<bool>,
+    ) -> PyResult<()> {
+        let flags = PyFlags {
+            owner: slf.clone().unbind(),
+        };
+        let py = slf.py();
+        if let Some(w) = write {
+            flags.set_flag(py, "WRITEABLE", w)?;
+        }
+        if let Some(a) = align {
+            flags.set_flag(py, "ALIGNED", a)?;
+        }
+        if let Some(u) = uic {
+            flags.set_flag(py, "WRITEBACKIFCOPY", u)?;
+        }
+        Ok(())
+    }
+
+    /// `ndarray.byteswap(inplace=False)`: reverse the bytes of every element,
+    /// leaving the *descriptor* alone, so the values change.
+    #[pyo3(signature = (inplace = false))]
+    fn byteswap(slf: &Bound<'_, Self>, inplace: bool) -> PyResult<Py<PyAny>> {
+        if inplace {
+            {
+                let mut me = slf.borrow_mut();
+                if !me.arr.flags.writeable {
+                    return Err(PyValueError::new_err(
+                        "assignment destination is read-only",
+                    ));
+                }
+                me.arr.byteswap_inplace();
+            }
+            return Ok(slf.clone().into_any().unbind());
+        }
+        let mut out = self_arr_copy(slf);
+        out.byteswap_inplace();
+        Ok(PyNdArray::into_py_any(out, slf.py())?.into_any())
     }
 
     fn __copy__(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
@@ -691,7 +981,7 @@ impl PyNdArray {
 
     #[pyo3(signature = (*args))]
     fn item<'py>(&self, py: Python<'py>, args: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyAny>> {
-        if self.arr.dtype.is_object() {
+        if self.arr.dtype().is_object() {
             if self.arr.size() != 1 {
                 return Err(PyValueError::new_err(
                     "can only convert an array of size 1 to a Python scalar",
@@ -699,7 +989,7 @@ impl PyNdArray {
             }
             return Ok(crate::objects::read(py, &self.arr, self.arr.byte_offset));
         }
-        if self.arr.dtype.is_flexible() {
+        if self.arr.dtype().is_flexible() {
             if self.arr.size() != 1 || !args.is_empty() {
                 return Err(PyNotImplementedError::new_err(
                     "item() on flexible dtypes is only implemented for size-1 arrays",
@@ -748,16 +1038,16 @@ impl PyNdArray {
             Some(o) if o.is_none() => return PyNdArray::view_of(me, slf),
             // `a.view(np.ndarray)` asks for a type, not a dtype.
             Some(o) if o.cast::<pyo3::types::PyType>().is_ok()
-                && dtype_from_any(o).is_err() =>
+                && descr_from_any(o).is_err() =>
             {
                 return PyNdArray::view_of(me, slf)
             }
-            Some(o) => dtype_from_any(o)?,
+            Some(o) => descr_from_any(o)?,
         };
         let old = me.itemsize();
         let new = d.itemsize();
         let mut out = me.clone();
-        out.dtype = d;
+        out.descr = d;
         if old != new {
             if me.ndim() == 0 {
                 return Err(PyValueError::new_err(
@@ -925,7 +1215,7 @@ impl PyNdArray {
             ))
         })?;
         let idx = array_from_any(indices, None, false)?;
-        if !idx.dtype.is_integer() && idx.dtype != DType::Bool {
+        if !idx.dtype().is_integer() && idx.dtype() != DType::Bool {
             if idx.size() != 0 {
                 return Err(PyIndexError::new_err(
                     "arrays used as indices must be of integer (or boolean) type",
@@ -961,7 +1251,7 @@ impl PyNdArray {
                 Scalar::Complex(c) => c.re as i64,
             })
             .collect();
-        let vals = array_from_any(values, Some(self.arr.dtype), false)?;
+        let vals = array_from_any(values, Some(self.arr.dtype()), false)?;
         rnp_core::indexing::put(&self.arr, &ivals, &vals, m).map_err(crate::err)
     }
 
@@ -1113,11 +1403,11 @@ impl PyNdArray {
                 "mean(out=) is not implemented yet",
             ));
         }
-        let is_half = self.arr.dtype == DType::F16;
+        let is_half = self.arr.dtype() == DType::F16;
         let acc_dt = match dtype {
             Some(d) if !d.is_none() => dtype_from_any(d)?,
             _ if is_half => DType::F32,
-            _ => mean_dtype(self.arr.dtype),
+            _ => mean_dtype(self.arr.dtype()),
         };
         let promoted = self.arr.astype(acc_dt);
         let ax = resolve_axis(&self.arr, axis)?;
@@ -1230,8 +1520,8 @@ impl PyNdArray {
         // `Arc` bump) and a dtype-name lookup, all to read eight bytes. A
         // bare `int` on a 1-d simple-dtype array skips straight to the read.
         if me.ndim() == 1
-            && !me.dtype.is_flexible()
-            && !me.dtype.is_object()
+            && !me.dtype().is_flexible()
+            && !me.dtype().is_object()
             && key.is_exact_instance_of::<pyo3::types::PyInt>()
         {
             if let Ok(i) = key.extract::<isize>() {
@@ -1244,27 +1534,27 @@ impl PyNdArray {
                     )));
                 }
                 let off = me.byte_offset + v * me.strides[0];
-                return npscalar_to_py(py, me.dtype, me.read_at(off));
+                return npscalar_to_py(py, me.dtype(), me.read_at(off));
             }
         }
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: view, scalarize } => {
                 if scalarize {
-                    if view.dtype.is_flexible() || view.dtype.is_object() {
+                    if view.dtype().is_flexible() || view.dtype().is_object() {
                         return npflexible_to_py(py, &view, view.byte_offset);
                     }
-                    return npscalar_to_py(py, view.dtype, view.get(&[]).map_err(crate::err)?);
+                    return npscalar_to_py(py, view.dtype(), view.get(&[]).map_err(crate::err)?);
                 }
                 Ok(PyNdArray::view_of(view, slf)?.into_bound(py).into_any())
             }
             Indexed::Fancy(plan) => {
                 let out = rnp_core::indexing::gather(&me, &plan).map_err(crate::err)?;
                 if plan.scalarize {
-                    if out.dtype.is_flexible() || out.dtype.is_object() {
+                    if out.dtype().is_flexible() || out.dtype().is_object() {
                         return npflexible_to_py(py, &out, out.byte_offset);
                     }
-                    return npscalar_to_py(py, out.dtype, out.get_flat(0));
+                    return npscalar_to_py(py, out.dtype(), out.get_flat(0));
                 }
                 Ok(PyNdArray::into_py_any(out, py)?.into_bound(py).into_any())
             }
@@ -1288,7 +1578,7 @@ impl PyNdArray {
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: mut view, .. } => {
-                if view.dtype.is_object() {
+                if view.dtype().is_object() {
                     let src = crate::objects::array_from_objects(value)?;
                     let src = if src.shape == view.shape {
                         src
@@ -1304,18 +1594,19 @@ impl PyNdArray {
                     }
                     return Ok(());
                 }
-                if !view.dtype.is_flexible() {
+                if !view.dtype().is_flexible() {
                     if let Some(s) = scalar_from_py(value) {
-                        view.fill(s.cast(view.dtype));
+                        view.fill(s.cast(view.dtype()));
                         return Ok(());
                     }
                 }
-                let src = assignment_source(value, &view.shape, view.dtype)?;
+                let src = assignment_source(value, &view.shape, view.dtype())?;
+                let src = src.in_order_of(&view);
                 let dst_offsets: Vec<isize> =
                     rnp_core::iter::offsets(&view.shape, &view.strides, view.byte_offset).collect();
                 let src_offsets: Vec<isize> =
                     rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
-                if view.dtype.is_flexible() {
+                if view.dtype().is_flexible() {
                     for (&d, &s) in dst_offsets.iter().zip(src_offsets.iter()) {
                         view.write_raw_at(d, src.raw_bytes_at(s));
                     }
@@ -1327,14 +1618,14 @@ impl PyNdArray {
                 Ok(())
             }
             Indexed::Fancy(plan) => {
-                let src = assignment_source(value, &plan.shape, me.dtype)?;
+                let src = assignment_source(value, &plan.shape, me.dtype())?;
                 rnp_core::indexing::scatter(&me, &plan, &src).map_err(crate::err)
             }
         }
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        if self.arr.dtype.is_object() {
+        if self.arr.dtype().is_object() {
             return Ok(format!("array({}, dtype=object)",
                               object_body(py, &self.arr, &mut Vec::new())?));
         }
@@ -1342,7 +1633,7 @@ impl PyNdArray {
     }
 
     fn __str__(&self, py: Python<'_>) -> PyResult<String> {
-        if self.arr.dtype.is_object() {
+        if self.arr.dtype().is_object() {
             return object_body(py, &self.arr, &mut Vec::new());
         }
         Ok(printing::to_str(&self.arr))
@@ -1603,7 +1894,7 @@ impl PyNdArray {
         let info = Box::new(BufInfo {
             shape: arr.shape.iter().map(|&d| d as ffi::Py_ssize_t).collect(),
             strides: arr.strides.iter().map(|&s| s as ffi::Py_ssize_t).collect(),
-            format: CString::new(arr.dtype.buffer_format()).unwrap(),
+            format: CString::new(arr.descr.buffer_format()).unwrap(),
         });
 
         // SAFETY: `view` is a valid, writable Py_buffer supplied by CPython.
@@ -1691,12 +1982,13 @@ pub fn store_or_wrap<'py>(
             fmt_shape(&target.shape)
         )));
     }
+    let res = res.in_order_of(&target);
     let src: Vec<isize> =
         rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset).collect();
     let dst: Vec<isize> =
         rnp_core::iter::offsets(&target.shape, &target.strides, target.byte_offset).collect();
     for (&s, &d) in src.iter().zip(dst.iter()) {
-        if target.dtype.is_flexible() {
+        if target.dtype().is_flexible() {
             target.write_raw_at(d, res.raw_bytes_at(s));
         } else {
             target.write_at(d, res.read_at(s));
@@ -1855,11 +2147,11 @@ impl PyNdArray {
                 if keepdims {
                     let shape = vec![1isize; src.ndim()];
                     let mut a =
-                        NdArray::zeros(shape, reduce_dtype(op, src.dtype)).map_err(crate::err)?;
+                        NdArray::zeros(shape, reduce_dtype(op, src.dtype())).map_err(crate::err)?;
                     a.fill(v);
                     return Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any());
                 }
-                npscalar_to_py(py, reduce_dtype(op, src.dtype), v)
+                npscalar_to_py(py, reduce_dtype(op, src.dtype()), v)
             }
             Some(ax) => {
                 let a = reduce_axis(src, ax, op, keepdims).map_err(crate::err)?;
@@ -1871,17 +2163,19 @@ impl PyNdArray {
     /// The real (`k == 0`) or imaginary (`k == 1`) component view.
     fn component(slf: &Bound<'_, Self>, k: isize) -> PyResult<Py<PyNdArray>> {
         let a = slf.borrow().arr.clone();
-        if !a.dtype.is_complex() {
+        if !a.dtype().is_complex() {
             if k == 0 {
                 return PyNdArray::view_of(a, slf);
             }
             // numpy's `.imag` on a real array is a read-only zero array.
-            let z = NdArray::zeros(a.shape.clone(), a.dtype).map_err(crate::err)?;
+            let z = NdArray::zeros(a.shape.clone(), a.dtype()).map_err(crate::err)?;
             return PyNdArray::into_py_any(z, slf.py());
         }
-        let comp = if a.dtype == DType::C64 { DType::F32 } else { DType::F64 };
+        let comp = if a.dtype() == DType::C64 { DType::F32 } else { DType::F64 };
         let mut v = a.clone();
-        v.dtype = comp;
+        // The component view keeps the parent's byte order: a `'>c16'` array
+        // has `'>f8'` halves.
+        v.descr = rnp_core::descr::Descr::new(comp, a.descr.bo);
         v.byte_offset += k * comp.itemsize() as isize;
         v.update_flags();
         PyNdArray::view_of(v, slf)
@@ -1894,7 +2188,7 @@ impl PyNdArray {
         op: BinOp,
         reflected: bool,
     ) -> PyResult<Py<PyAny>> {
-        let rhs = match operand_for(other, self.arr.dtype, op.is_comparison())? {
+        let rhs = match operand_for(other, self.arr.dtype(), op.is_comparison())? {
             Some(a) => a,
             None => return Ok(py.NotImplemented()),
         };
@@ -1924,7 +2218,7 @@ impl PyNdArray {
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
         let me = slf.borrow().arr.clone();
-        let rhs = match operand_for(other, me.dtype, false)? {
+        let rhs = match operand_for(other, me.dtype(), false)? {
             Some(a) => a,
             None => return Ok(py.NotImplemented().into_bound(py)),
         };
@@ -1947,7 +2241,7 @@ impl PyNdArray {
                 "output array is read-only",
             ));
         }
-        let rhs = operand_for(other, me.dtype, false)?
+        let rhs = operand_for(other, me.dtype(), false)?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for in-place op"))?;
         rnp_core::fpe::clear();
         let res = binary(&me, &rhs, op).map_err(crate::err)?;
@@ -1993,7 +2287,7 @@ pub fn shape_from_any(obj: &Bound<'_, PyAny>) -> PyResult<Vec<isize>> {
     // (`a.transpose(np.random.permutation(5))`).
     if let Ok(a) = obj.cast::<PyNdArray>() {
         let arr = a.borrow().arr.clone();
-        if arr.dtype.is_integer() && arr.ndim() <= 1 {
+        if arr.dtype().is_integer() && arr.ndim() <= 1 {
             return Ok(arr.to_vec().into_iter().map(as_i64).map(|v| v as isize).collect());
         }
     }
@@ -2014,12 +2308,12 @@ pub fn ufunc2(
     let b_is_arr = b.cast::<PyNdArray>().is_ok();
     let (lhs, rhs) = if a_is_arr && !b_is_arr {
         let lhs = array_from_any(a, None, false)?;
-        let rhs = operand_for(b, lhs.dtype, op.is_comparison())?
+        let rhs = operand_for(b, lhs.dtype(), op.is_comparison())?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for ufunc"))?;
         (lhs, rhs)
     } else if b_is_arr && !a_is_arr {
         let rhs = array_from_any(b, None, false)?;
-        let lhs = operand_for(a, rhs.dtype, op.is_comparison())?
+        let lhs = operand_for(a, rhs.dtype(), op.is_comparison())?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for ufunc"))?;
         (lhs, rhs)
     } else {
@@ -2050,5 +2344,17 @@ pub fn dtype_or_default(obj: Option<&Bound<'_, PyAny>>, default: DType) -> PyRes
         None => Ok(default),
         Some(o) if o.is_none() => Ok(default),
         Some(o) => dtype_from_any(o),
+    }
+}
+
+/// As [`dtype_or_default`], keeping the byte order and C-type alias.
+pub fn descr_or_default(
+    obj: Option<&Bound<'_, PyAny>>,
+    default: DType,
+) -> PyResult<rnp_core::descr::Descr> {
+    match obj {
+        None => Ok(rnp_core::descr::Descr::native(default)),
+        Some(o) if o.is_none() => Ok(rnp_core::descr::Descr::native(default)),
+        Some(o) => descr_from_any(o),
     }
 }

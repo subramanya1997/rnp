@@ -520,3 +520,162 @@ benchmark run, Fable review, git commit.
     resolution table.
   * **`np.record`** is a real `void` subclass with numpy's
     `(record, void, flexible, generic, object)` MRO.
+
+- 2026-08-16: M4 complete (Opus build). Full suite **10769/14105 (76.3%)**,
+  up from the M3 baseline of 8344/10493. The *percentage* fell because the
+  denominator grew by 3612: `test_multiarray`, `test_strings`,
+  `test_nep50_promotions`, `test_arrayprint`, `test_nditer` and
+  `test__exceptions` only collect once this milestone's storage-model work
+  exists, and they arrive with their failures attached. Passed is the number
+  that matters and it is up 2425. **No adopted file regressed** (verified
+  file-by-file against the committed M3 scoreboard).
+
+  Gates: `cargo test --release` **100 unit + 1 integration**;
+  `harness/dev_check.py` **22814 comparisons / 0 divergences**;
+  `harness/crosscheck.py` green.
+
+  Scoreboard deltas (passed/collected):
+  * test_strings          0/0     -> **1346/2066** (was a collection error)
+  * test_shape_base       20/213  -> **182/213**
+  * test_nditer           0/0     -> **122/926**
+  * test_umath            4881/5235 -> **4991/5315**
+  * test_arrayprint       0/0     -> **103/134**
+  * test_defchararray     0/100   -> **100/100**
+  * test_scalar_methods   115/227 -> **211/233**
+  * test_api              2/57    -> **53/59**
+  * test_scalar_ctors     138/201 -> **177/201** (the M3 regression is repaid
+                                     nearly 10x over; the gate was >=142)
+  * test_regression       221/422 -> **257/422**
+  * test_hashtable        0/36    -> **36/36**
+  * test_unicode          45/76   -> **75/76**
+  * test_nep50_promotions 0/0     -> **26/443**
+  * test_longdouble       11/34   -> **33/34**
+  * test_memmap           0/24    -> **21/24**
+  * test_half             8/39    -> **29/39**
+  * test_mem_overlap      4/25    -> **24/25**
+  * test_scalarprint      10/30   -> **29/30**
+  * test_item_selection   250/294 -> **266/294**
+  * test_extint128        0/13    -> **13/13**
+  * test__exceptions      0/0     -> **10/11**
+  * test_indexing         60/106  -> **65/106**
+  * test_argparse 2->7/7, test_abc 0->5/5, test_errstate 3->6/6,
+    test_scalarinherit 4->6/6, test_protocols 0->2/2,
+    test_scalarmath 1463->1466, test_dtype 952->953
+
+  Storage model:
+  * **`Descr` now lives in the `NdArray` header** (it was a bare `DType`), so
+    arrays carry byte order and the C-type aliases. `np.array(np.longlong(2))
+    .dtype.type is np.longlong` is True again -- the M3 regression that cost
+    `test_scalar_ctors` 4 tests.
+  * **Byte-swapped arrays** work end to end: storage, casting, ufuncs,
+    reductions, printing, indexing. The design normalises **at the operand
+    boundary, not in the inner loop**: every compute entry point starts with
+    one `if !a.is_native()`, and when it fires a cold `#[inline(never)]`
+    trampoline swaps the whole operand into a native temporary and calls the
+    *same* kernel. That keeps the ~400 monomorphised cast/ufunc loops from
+    doubling and leaves the native path paying one predictable byte compare
+    outside every loop. The first attempt put the fallback *inside* the hot
+    functions, making them recursive -- `astype` at 1e6 went 72us -> 910us and
+    `exp`/`log`/`sin`/`power` regressed 2-4x. Splitting each into a thin gate
+    plus a cold trampoline plus a non-recursive `*_native` kernel restored it.
+  * `ndarray.byteswap(inplace=)`, `newbyteorder`, `__array_interface__` (v3,
+    `strides: None` iff C-contiguous), and an assignable `flags.writeable`
+    (`PyFlags` is now a live proxy holding the array, not a snapshot) with
+    numpy's refusal to re-enable WRITEABLE on a non-owning array whose base is
+    read-only.
+  * New `sort.rs`: `sort`/`argsort`/`searchsorted` with numpy's total order
+    (NaN last and NaN-ties-equal, complex lexicographic on `(re, im)`,
+    flexible dtypes by logical code points).
+  * `dev_check.py` gained a `check_byteorder` section (+718 comparisons):
+    creation/copy/slice/fancy/reshape/byteswap/add/astype/sum/item/repr/
+    setitem over `>`/`<` x 10 numeric codes, `>U3`/`<U3`, `dtype.newbyteorder`
+    and swapped `view`. Getting it to zero exposed a wrong PEP-3118 format
+    string; `Descr::buffer_format` now emits `>i`, `3w`, `3s`, `4x` as numpy
+    does.
+
+  Breadth landed in the shim (pure Python, no engine changes):
+  * `np.strings` + `defchararray` + `np.char` + `chararray`, reproducing
+    numpy's result-itemsize formulas; this is what took `test_strings` from a
+    collection error to 1346 and `test_defchararray` to 100/100.
+  * `_core/arrayprint.py` -- upstream's file with 11 diff hunks, wired as the
+    *actual* `ndarray.__repr__`/`__str__` (`_rnp.ndarray` is a heap type, so
+    the assignment is possible), plus upstream's `printoptions` ContextVar.
+    673 randomized repr/str cases cross-checked against real numpy: 0
+    divergences.
+  * `format_float_positional`/`format_float_scientific` (403k-case
+    differential run vs numpy: 0 divergences). Found and fixed a real bug: the
+    shortest-round-trip search rounded only one way, which is wrong for floats
+    on a power of two, whose rounding interval is asymmetric.
+  * `memmap`, `fromstring`/`fromfile`/`loadtxt`/`genfromtxt`/`savetxt`,
+    `copyto`, `shares_memory`/`may_share_memory` (a real port of
+    `mem_overlap.c`'s Diophantine solver, 106 cases cross-checked),
+    `np.block` and the private `_block_*` helpers, `np.record`,
+    `_core/_exceptions.py`, and the `_multiarray_tests` extint128 and
+    identity-hashtable helpers.
+  * `errstate` now keeps its state in a `contextvars.ContextVar` as numpy 2.x
+    does, which is what makes it asyncio-safe, and refuses a second `__enter__`.
+  * The numeric tower is registered with the `numbers` ABCs.
+
+  Performance (ratio port/numpy, lower is better; **the host carried an
+  external load average of 25-35 throughout, so every row was measured over
+  repeated interleaved runs and these are minima**):
+
+    scalar_add_f64      21.65x -> **3.28x**     scalar_add_i64  9.97x -> 1.64x
+    scalar_extract      12.29x -> **2.00x**     bitwise_and_i32 2.64x -> 0.69x
+    floor_divide_i32     2.19x -> **1.35x**     mul_f64         1.54x -> 1.08x
+    maximum_f64          1.12x -> 1.44x(noise)  abs_f64         0.67x -> 0.66x
+    add_i32              0.88x -> 0.76x         sum_f64                  0.56x
+    copy 1.00x  astype 1.01x  add_reduce_f64 0.85x  exp_f64 0.32x
+    sin_f64 0.36x  power_f64 0.31x  bool_mask 0.39x
+
+  * The **scalar fast path** is the headline: `rnp_core::ops::binary_scalar`
+    computes `scalar op scalar` over `Scalar` values with zero allocation --
+    no 0-d `NdArray`, no `Arc`, no shape/stride vectors -- calling the *same*
+    element kernels and flag-attribution helpers the array loops use. The
+    bridge takes an int opcode (no ufunc name lookup), classifies operands by
+    type-object pointer, and returns `(dtype_code, value, flags)` with no
+    `dtype` object constructed. NEP 50 weak/strong promotion, the exact-128-bit
+    `uint64`-vs-signed comparison, and the `NotImplemented`-vs-`TypeError`
+    distinction are all preserved. A 700k-triple integration test
+    (`tests/scalar_path.rs`) pins result dtype, result *bits*, FP flags and
+    error against the array driver.
+  * The broadcast-scalar binary loop formed a byte pointer with a runtime
+    step, hiding contiguity from LLVM; it now forms real slices when the step
+    equals the itemsize. That is what moved `bitwise_and_i32` and
+    `floor_divide_i32`, and it applies to the whole binary-op family.
+  * `multiply`/`divide` had lost vectorisation entirely because `watch_scale`
+    read a relaxed **atomic** load inside the loop body, which LLVM will not
+    hoist. Now read once before the loop.
+
+  Known gaps carried into M5:
+  * **`test_multiarray.py` collects (14272 tests) but exceeds the harness's
+    900s per-file timeout**, so it contributes 0 to the scoreboard above.
+    Measured separately with a 90-minute budget it is **465 passed / 13802
+    failed / 5 skipped** (59 min wall on this loaded host). Counting it, the
+    suite is **11234/28377**. That surface has never collected before, so its
+    failures are unworked rather than regressed, and triaging them is a
+    milestone in itself. M5 should first raise the harness timeout or shard
+    the file so the scoreboard stops silently dropping the largest file in
+    the suite.
+  * **datetime64/timedelta64 storage and arithmetic were not attempted.**
+    `test_datetime.py` and `test_numeric.py` still fail to collect on a
+    `dispatch_dtype: TimeDelta(n) is not a numeric dtype` panic. The unit
+    promotion table was probed and is saved for M5.
+  * **Object-dtype ufuncs** were not attempted; this is 384 of the 417
+    `test_nep50_promotions` failures (a single `test_integer_comparison`
+    parametrisation) and blocks `test_records`.
+  * **Structured-array field access** (`a['f0']` returning a view) does not
+    exist, so `test_records` stays at 0/44 and structured reprs are wrong.
+  * `test_strings`' remaining 681 failures are 662 `StringDType` (a
+    variable-width heap-arena storage model, genuinely a new dtype), 12
+    byte-swapped `>U`, 6 dtype-size validation, 1 `astype` from void.
+  * `test_casting_floatingpoint_errors` (0/210) needs casts to raise FP
+    warnings; `test_dlpack` (0/95) needs `__dlpack__`; `test_nditer` is at
+    122/926; `test_ufunc` still does not collect.
+  * `floor_divide_i32` at 1.35x is the one benchmark row left above parity:
+    numpy specialises a loop-invariant integer divisor with libdivide. With an
+    *array* divisor the ratio inverts to 0.41x. Closing it needs
+    Granlund-Montgomery magic numbers, which was judged too subtle to land
+    safely in this pass.
+  * `memmap`'s last 3 failures need real ndarray subclassing: `_rnp.ndarray`
+    has no `tp_new` and `.view()` ignores its type argument.

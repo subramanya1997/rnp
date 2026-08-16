@@ -69,7 +69,7 @@ fn scalar_matches_array() {
                         checked += 1;
                         match (want, got) {
                             (Ok(w), Ok((gd, gv))) => {
-                                assert_eq!(w.dtype, gd, "{da:?} {op:?} {db:?} dtype");
+                                assert_eq!(w.dtype(), gd, "{da:?} {op:?} {db:?} dtype");
                                 let wv = w.get_flat(0);
                                 assert!(
                                     same_bits(wv, gv),
