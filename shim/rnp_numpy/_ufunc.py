@@ -34,7 +34,39 @@ deg2rad rad2deg degrees radians
 conj conjugate invert bitwise_invert bitwise_not bitwise_count
 isnan isinf isfinite signbit spacing
 frexp modf _ones_like
+matmul vecdot matvec vecmat
 """.split())
+
+
+#: The four ufuncs numpy gives a *core signature*. They are dispatched
+#: through `_rnp._matmul` rather than the elementwise loop selector, because
+#: the operands' trailing dimensions are consumed by the signature rather
+#: than broadcast. Probed from numpy 2.5.2.
+GUFUNC_SIGNATURES = {
+    "matmul": "(n?,k),(k,m?)->(n?,m?)",
+    "vecdot": "(n),(n)->()",
+    "matvec": "(m,n),(n)->(m)",
+    "vecmat": "(n),(n,m)->(m)",
+}
+
+#: How many core dimensions each operand of each gufunc has, in the order
+#: (input 0, input 1, output). Used only by the `axes=` rewrite.
+_GUFUNC_CORE_NDIM = {
+    "matmul": (2, 2, 2),
+    "vecdot": (1, 1, 0),
+    "matvec": (2, 1, 1),
+    "vecmat": (1, 2, 1),
+}
+
+
+class _Unset:
+    """Marker for "the caller did not pass this keyword at all"."""
+
+    def __repr__(self):
+        return "<unset>"
+
+
+_UNSET = _Unset()
 
 
 #: Ufuncs numpy gives string loops that the engine has no loop for.  Each
@@ -167,6 +199,52 @@ def _detached(x, target):
     return x.copy() if mod.may_share_memory(x, target) else x
 
 
+def _obj_kind(x):
+    """The dtype kind of `x` as an array operand, or None if it is not one."""
+    dt = getattr(x, "dtype", None)
+    if dt is None:
+        try:
+            dt = _rnp.asarray(x).dtype
+        except Exception:  # noqa: BLE001
+            return None
+    return dt.kind
+
+
+def _object_gufunc(name, a, b, out):
+    """`matmul` and friends over `object` arrays.
+
+    numpy's `OBJECT_matmul_inner_noblas` builds each output element as
+    ``a[i,0]*b[0,j]`` and then repeatedly ``+=`` the remaining products, i.e.
+    it goes through Python's own `__mul__`/`__add__` in `k` order. Doing the
+    same with whole-array slices reproduces that exactly, and reuses the
+    engine's object-dtype elementwise loops rather than duplicating them.
+    """
+    from . import asarray, broadcast_to, empty, zeros
+
+    aa, bb = asarray(a), asarray(b)
+    loop, out_shape, rows, inner, cols, a_rowless, b_colless = _rnp._matmul_plan(
+        name, aa.shape, bb.shape,
+        None if out is None else out.shape)
+    loop, out_shape = tuple(loop), tuple(out_shape)
+    a2 = aa.reshape(aa.shape[:-1] + (1, aa.shape[-1])) if a_rowless else aa
+    b2 = bb.reshape(bb.shape + (1,)) if b_colless else bb
+    a2 = broadcast_to(a2, loop + (rows, inner))
+    b2 = broadcast_to(b2, loop + (inner, cols))
+    if inner == 0:
+        res = zeros(loop + (rows, cols), dtype="object")
+        res[...] = 0
+    else:
+        res = None
+        for t in range(inner):
+            term = a2[..., :, t:t + 1] * b2[..., t:t + 1, :]
+            res = term if res is None else res + term
+    res = res.reshape(out_shape)
+    if out is not None:
+        out[...] = res
+        return out
+    return res
+
+
 def _is_scalarish(x):
     """True for the inputs that make a ufunc return a scalar rather than a
     0-d array (numpy's rule: every input is a scalar or a 0-d array)."""
@@ -195,7 +273,7 @@ class ufunc:
         self.types = list(types)
         self.ntypes = len(types)
         self.identity = identity
-        self.signature = None
+        self.signature = GUFUNC_SIGNATURES.get(name)
         self._ok = name in _IMPLEMENTED
 
     # -- introspection -----------------------------------------------------
@@ -207,6 +285,12 @@ class ufunc:
     def __doc__(self):
         return f"{self.__name__}(x1, x2, /, out=None, *, where=True, ...)"
 
+    def _no_signature_method(self, what):
+        """numpy refuses every reduction method on a ufunc with a signature,
+        with one shared RuntimeError."""
+        if self.signature is not None:
+            raise RuntimeError("Reduction not defined on ufunc with signature")
+
     def _nope(self, what=""):
         suffix = f".{what}" if what else ""
         raise NotImplementedError(
@@ -214,11 +298,26 @@ class ufunc:
 
     # -- the call ----------------------------------------------------------
 
-    def __call__(self, *args, out=None, where=True, casting="same_kind",
+    def __call__(self, *args, out=None, where=_UNSET, casting="same_kind",
                  order="K", dtype=None, subok=True, signature=None,
                  axes=None, axis=None, keepdims=None):
         if not self._ok:
             self._nope()
+        if self.signature is not None:
+            # A gufunc has no `where=`: numpy's argument parser does not even
+            # define the keyword for it.
+            if where is not _UNSET:
+                raise TypeError(
+                    f"{self.__name__}() got an unexpected keyword argument "
+                    "'where'")
+            if len(args) > self.nin:
+                out = args[self.nin] if out is None else out
+                args = args[:self.nin]
+            if len(args) != self.nin:
+                raise TypeError(
+                    f"invalid number of arguments to ufunc {self.__name__!r}")
+            return self._call_gufunc(args, out, casting, dtype, axes, axis)
+        where = True if where is _UNSET else where
         if len(args) > self.nin:
             # numpy allows the outputs to be passed positionally.
             out = args[self.nin] if out is None else out
@@ -249,10 +348,105 @@ class ufunc:
             return tuple(_maybe_scalar(r, scalar_out) for r in res)
         return _maybe_scalar(res, scalar_out)
 
+    # -- the generalized (core-signature) call ------------------------------
+
+    def _call_gufunc(self, args, out, casting, dtype, axes, axis):
+        name = self.__name__
+        if isinstance(out, tuple):
+            if len(out) != 1:
+                raise ValueError(
+                    f"The 'out' tuple must have exactly one entry per ufunc "
+                    f"output")
+            out = out[0]
+        if out is not None and not isinstance(out, ndarray):
+            raise TypeError("return arrays must be of ArrayType")
+        if axis is not None:
+            # numpy only accepts `axis=` for gufuncs whose operands share a
+            # single core dimension; none of this family does.
+            raise TypeError(
+                f"{name}: axis can only be used with a single shared core "
+                "dimension, not with the 2 distinct ones implied by "
+                f"signature {self.signature}.")
+        if axes is not None:
+            return self._call_with_axes(args, out, casting, dtype, axes)
+
+        a, b = args
+        if _obj_kind(a) == "O" or _obj_kind(b) == "O":
+            return _object_gufunc(name, a, b, out)
+
+        if out is not None:
+            loop_dt = (_rnp.dtype(dtype) if dtype is not None
+                       else _rnp.dtype(_rnp._matmul_dtype(name, a, b)))
+            if not _rnp.can_cast(loop_dt, out.dtype, casting):
+                from ._core._exceptions import _UFuncOutputCastingError
+                raise _UFuncOutputCastingError(
+                    self, casting, loop_dt, out.dtype, 0)
+
+        res = _rnp._matmul(name, a, b, out=out, dtype=dtype)
+        _errstate.drain(name)
+        if out is None and isinstance(res, ndarray) and res.ndim == 0:
+            # Like every ufunc, a 0-d result comes back as a numpy scalar.
+            return res[()]
+        return res
+
+    def _call_with_axes(self, args, out, casting, dtype, axes):
+        """`axes=[(..), (..), (..)]`: run the core dimensions from wherever
+        the caller put them, and put the result's back where asked.
+
+        numpy implements this by remapping the iterator's axes; moving the
+        core dimensions to the end with a transpose and undoing it afterwards
+        gives the same answer without a second iterator.
+        """
+        axes = list(axes)
+        if len(axes) not in (self.nin, self.nin + self.nout):
+            raise ValueError(
+                "axes don't match ufunc: must have entries for all inputs "
+                "(and outputs if they have core dimensions)")
+
+        def norm(entry, nd):
+            """One `axes` entry as a tuple of non-negative axis numbers.
+
+            numpy accepts a bare int wherever the operand has exactly one core
+            dimension, which is how `axes=[(1, 0), (0), (0)]` -- the spelling
+            upstream's own test uses -- gets parsed.
+            """
+            if isinstance(entry, int):
+                entry = (entry,)
+            entry = tuple(int(x) for x in entry)
+            return tuple(x + nd if x < 0 else x for x in entry)
+
+        moved = []
+        for i, operand in enumerate(args):
+            arr = _rnp.asarray(operand)
+            src = norm(axes[i], arr.ndim)
+            if not src:
+                moved.append(arr)
+                continue
+            rest = [d for d in range(arr.ndim) if d not in src]
+            moved.append(arr.transpose(tuple(rest + list(src))))
+        res = self._call_gufunc(tuple(moved), None, casting, dtype, None, None)
+
+        if len(axes) > self.nin:
+            arr = _rnp.asarray(res)
+            dest = norm(axes[self.nin], arr.ndim)
+            want_out = len(dest)
+            order = [None] * arr.ndim
+            core_start = arr.ndim - want_out
+            for j, pos in enumerate(dest):
+                order[pos] = core_start + j
+            it = iter(range(core_start))
+            order = [x if x is not None else next(it) for x in order]
+            res = arr.transpose(tuple(order))
+        if out is not None:
+            out[...] = res
+            return out
+        return res
+
     # -- methods -----------------------------------------------------------
 
     def reduce(self, array, axis=0, dtype=None, out=None, keepdims=False,
                initial=None, where=True):
+        self._no_signature_method("reduce")
         if not self._ok or self.nin != 2:
             self._nope("reduce")
         if isinstance(out, tuple):
@@ -264,6 +458,7 @@ class ufunc:
         return _maybe_scalar(res, out is None)
 
     def accumulate(self, array, axis=0, dtype=None, out=None):
+        self._no_signature_method("accumulate")
         if not self._ok or self.nin != 2:
             self._nope("accumulate")
         if isinstance(out, tuple):
@@ -275,6 +470,7 @@ class ufunc:
         return res
 
     def reduceat(self, array, indices, axis=0, dtype=None, out=None):
+        self._no_signature_method("reduceat")
         if not self._ok or self.nin != 2:
             self._nope("reduceat")
         axis = _single_axis(array, axis, "reduceat")
@@ -329,6 +525,10 @@ class ufunc:
         return res
 
     def outer(self, a, b, **kwargs):
+        if self.signature is not None:
+            raise TypeError(
+                "method outer is not allowed in ufunc with non-trivial "
+                "signature")
         if not self._ok or self.nin != 2:
             self._nope("outer")
         a = _rnp.asarray(a)
@@ -337,6 +537,10 @@ class ufunc:
         return self(a2, b, **kwargs)
 
     def at(self, a, indices, b=None):
+        if self.signature is not None:
+            raise TypeError(
+                f"{self.__name__}.at does not support ufunc with non-trivial "
+                f"signature: {self.__name__} has signature {self.signature}.")
         if not self._ok:
             self._nope("at")
         # The *operand* is unbuffered, but the index array and the second

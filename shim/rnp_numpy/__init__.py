@@ -705,13 +705,6 @@ def indices(dimensions, dtype=int_):
 
 
 
-def array_equal(a1, a2):
-    a1, a2 = _asarr(a1), _asarr(a2)
-    if a1.shape != a2.shape:
-        return False
-    return _builtins.all(_flat_values(equal(a1, a2)))
-
-
 def isscalar(x):
     return isinstance(x, (int, float, complex, str, bytes, _builtins.bool))
 
@@ -885,13 +878,48 @@ def _wire_subsystem(module, names):
 
 import importlib as _importlib  # noqa: E402
 
-_wire_subsystem("._core._numeric_close", ("isclose", "allclose"))
+_wire_subsystem("._core._numeric_close",
+                ("isclose", "allclose", "array_equal", "array_equiv"))
 _wire_subsystem("._core.defchararray", ("chararray", "compare_chararrays"))
 _wire_subsystem("._core.memmap", ("memmap",))
 _wire_subsystem(
     "._core._textio",
     ("fromstring", "fromfile", "loadtxt", "genfromtxt", "savetxt"),
 )
+
+
+# --------------------------------------------------------------------------
+# The non-ufunc products, on the same Rust kernel as `matmul`.
+#
+# `dot` and `inner` are *not* gufuncs in numpy either: `dot` contracts a's
+# last axis with b's second-to-last and keeps every other axis of both (no
+# broadcasting at all), and `inner` contracts the last axis of both.
+# --------------------------------------------------------------------------
+
+def dot(a, b, out=None):
+    """Dot product of two arrays (numpy's `np.dot`)."""
+    res = _rnp._dot(a, b, out=out)
+    if out is None and isinstance(res, ndarray) and res.ndim == 0:
+        return res[()]
+    return res
+
+
+def inner(a, b):
+    """Inner product: the last axes of `a` and `b` are contracted."""
+    res = _rnp._inner(a, b)
+    if isinstance(res, ndarray) and res.ndim == 0:
+        return res[()]
+    return res
+
+
+def vdot(a, b):
+    """Dot product over the flattened arrays, conjugating the first."""
+    a = _asarr(a).ravel()
+    b = _asarr(b).ravel()
+    if a.dtype.kind == "c":
+        a = conjugate(a)
+    return dot(a, b)
+
 
 for _name in ("char", "strings"):
     try:
