@@ -21,6 +21,25 @@ use crate::ops::Arith;
 /// numpy's `PW_BLOCKSIZE`.
 const PW_BLOCKSIZE: usize = 128;
 
+/// Element count above which a reduction is split across rayon's pool.
+///
+/// For the float sums the split happens *on numpy's own pairwise-tree
+/// boundaries*, so the parallel result is bit-identical to the serial one --
+/// the recursion already brackets the additions, and rayon only decides which
+/// thread evaluates each bracket.
+const PAR_THRESHOLD: usize = 1 << 16;
+
+/// A raw pointer that may cross a rayon `join`.
+///
+/// Sound because every parallel branch only ever *reads* a disjoint slice of
+/// one immutable buffer.
+#[derive(Copy, Clone)]
+struct SendPtr(*const u8);
+// SAFETY: see above -- read-only access to a live, shared allocation.
+unsafe impl Send for SendPtr {}
+// SAFETY: as above.
+unsafe impl Sync for SendPtr {}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ReduceOp {
     Sum,
@@ -129,9 +148,28 @@ macro_rules! pairwise_float {
             let mut n2 = n / 2;
             n2 -= n2 % 8;
             // SAFETY: both halves lie inside the caller's range.
-            unsafe {
-                $name(a, n2, stride) + $name(a.offset(n2 as isize * stride), n - n2, stride)
+            let right = unsafe { a.offset(n2 as isize * stride) };
+            if n >= PAR_THRESHOLD {
+                // Same brackets, different threads: bit-identical.
+                let (l, r) = (SendPtr(a), SendPtr(right));
+                let (x, y) = rayon::join(
+                    // SAFETY: disjoint read-only halves of the same buffer.
+                    // (`let p = l` captures the whole `SendPtr`, not the raw
+                    // pointer field, which is what makes the closure `Send`.)
+                    || {
+                        let p = l;
+                        unsafe { $name(p.0, n2, stride) }
+                    },
+                    // SAFETY: as above.
+                    || {
+                        let p = r;
+                        unsafe { $name(p.0, n - n2, stride) }
+                    },
+                );
+                return x + y;
             }
+            // SAFETY: both halves lie inside the caller's range.
+            unsafe { $name(a, n2, stride) + $name(right, n - n2, stride) }
         }
     };
 }
@@ -210,9 +248,26 @@ macro_rules! pairwise_complex {
             let mut n2 = n / 2;
             n2 -= n2 % 8;
             // SAFETY: both halves lie inside the caller's range.
+            let right = unsafe { a.offset(n2 as isize * stride) };
+            if n >= PAR_THRESHOLD {
+                let (l, r) = (SendPtr(a), SendPtr(right));
+                let ((rr1, ri1), (rr2, ri2)) = rayon::join(
+                    // SAFETY: disjoint read-only halves of the same buffer.
+                    || {
+                        let p = l;
+                        unsafe { $name(p.0, n2, stride) }
+                    },
+                    // SAFETY: as above.
+                    || {
+                        let p = r;
+                        unsafe { $name(p.0, n - n2, stride) }
+                    },
+                );
+                return (rr1 + rr2, ri1 + ri2);
+            }
+            // SAFETY: both halves lie inside the caller's range.
             let (rr1, ri1) = unsafe { $name(a, n2, stride) };
-            let (rr2, ri2) =
-                unsafe { $name(a.offset(n2 as isize * stride), n - n2, stride) };
+            let (rr2, ri2) = unsafe { $name(right, n - n2, stride) };
             (rr1 + rr2, ri1 + ri2)
         }
     };
@@ -300,6 +355,26 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
         }
         d if d.is_unsigned() => {
             let mut acc = 0u64;
+            if stride == d.itemsize() as isize
+                && (p as usize) % d.alignment().max(1) == 0
+            {
+                crate::dispatch_dtype!(d, T, {
+                    // SAFETY: `n` contiguous, aligned, in-bounds elements.
+                    let s: &[T] = unsafe { std::slice::from_raw_parts(p as *const T, n) };
+                    acc = sum_int_contig(
+                        s,
+                        |v: T| match v.to_scalar() {
+                            Scalar::Uint(u) => u,
+                            Scalar::Int(x) => x as u64,
+                            Scalar::Bool(b) => b as u64,
+                            _ => 0,
+                        },
+                        |x: u64, y: u64| x.wrapping_add(y),
+                        0u64,
+                    );
+                });
+                return Acc::Uint(acc);
+            }
             crate::dispatch_dtype!(d, T, {
                 for i in 0..n {
                     // SAFETY: in-bounds by the caller's contract.
@@ -317,6 +392,26 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
         }
         d => {
             let mut acc = 0i64;
+            if stride == d.itemsize() as isize
+                && (p as usize) % d.alignment().max(1) == 0
+            {
+                crate::dispatch_dtype!(d, T, {
+                    // SAFETY: `n` contiguous, aligned, in-bounds elements.
+                    let s: &[T] = unsafe { std::slice::from_raw_parts(p as *const T, n) };
+                    acc = sum_int_contig(
+                        s,
+                        |v: T| match v.to_scalar() {
+                            Scalar::Int(x) => x,
+                            Scalar::Uint(u) => u as i64,
+                            Scalar::Bool(b) => b as i64,
+                            _ => 0,
+                        },
+                        |x: i64, y: i64| x.wrapping_add(y),
+                        0i64,
+                    );
+                });
+                return Acc::Int(acc);
+            }
             crate::dispatch_dtype!(d, T, {
                 for i in 0..n {
                     // SAFETY: in-bounds by the caller's contract.
@@ -396,71 +491,109 @@ impl MaybeNan for C64v {
     }
 }
 
-/// The contiguous min/max fast path.
+/// The ordered max/min of two elements, ignoring NaN and signed zero (both
+/// are corrected afterwards in `extreme_contig`).
 ///
-/// The inner loop is deliberately branch-free (`nan |= ...` plus a select)
-/// so LLVM vectorises it; NaN propagation and the signed-zero preference are
-/// resolved in a second pass, which only runs when they actually occur.
+/// The float impls call `f64::max`/`f64::min`, which lower to a single
+/// `fmaxnm`/`fminnm` instruction and therefore vectorise; the generic
+/// comparison version does not.
+pub trait Extreme: Copy {
+    fn omax(self, o: Self) -> Self;
+    fn omin(self, o: Self) -> Self;
+}
+
+macro_rules! extreme_by_cmp {
+    ($($t:ty),*) => {$(
+        impl Extreme for $t {
+            #[inline]
+            fn omax(self, o: Self) -> Self {
+                if crate::ops::Cmp::c_lt(self, o) { o } else { self }
+            }
+            #[inline]
+            fn omin(self, o: Self) -> Self {
+                if crate::ops::Cmp::c_lt(o, self) { o } else { self }
+            }
+        }
+    )*};
+}
+extreme_by_cmp!(i8, i16, i32, i64, u8, u16, u32, u64, crate::element::NpBool, F16, C32, C64v);
+
+macro_rules! extreme_by_intrinsic {
+    ($($t:ty),*) => {$(
+        impl Extreme for $t {
+            #[inline]
+            fn omax(self, o: Self) -> Self { <$t>::max(self, o) }
+            #[inline]
+            fn omin(self, o: Self) -> Self { <$t>::min(self, o) }
+        }
+    )*};
+}
+extreme_by_intrinsic!(f32, f64);
+
+/// The pure ordered min/max fold over a contiguous slice.
 ///
-/// # Safety
-/// `p` must point at `n` contiguous elements of `T`.
-#[inline]
-unsafe fn extreme_contig<T>(p: *const T, n: usize, want_max: bool) -> T
+/// Sixteen independent accumulators: a floating-point max is not associative
+/// in LLVM's eyes, so a plain fold stays scalar, and splitting the reduction
+/// by hand is what lets it use vector lanes. That is safe here because
+/// ordered min/max *is* associative once NaN and signed zero are handled
+/// separately (see `extreme_contig`), and rayon may therefore split it too.
+fn ordered_extreme<T>(s: &[T], want_max: bool) -> T
 where
-    T: Element + crate::ops::Cmp + MaybeNan,
+    T: Element + Extreme + Send + Sync,
 {
-    // SAFETY: the caller guarantees `n` contiguous, in-bounds, correctly
-    // aligned elements of `T`.
-    let s: &[T] = unsafe { std::slice::from_raw_parts(p, n) };
-    // Eight independent accumulators over `chunks_exact` blocks. A
-    // floating-point max is not associative in LLVM's eyes, so a plain fold
-    // stays scalar; splitting the reduction by hand is what lets it use
-    // vector lanes, and it is safe here because ordered max/min *is*
-    // associative once NaN and signed zero are handled separately (below).
-    let mut r: [T; 8] = [s[0]; 8];
-    let mut tail: &[T] = s;
-    if want_max {
-        let mut it = s.chunks_exact(8);
-        for c in &mut it {
-            for k in 0..8 {
-                if crate::ops::Cmp::c_lt(r[k], c[k]) {
-                    r[k] = c[k];
-                }
-            }
-        }
-        tail = it.remainder();
-    } else {
-        let mut it = s.chunks_exact(8);
-        for c in &mut it {
-            for k in 0..8 {
-                if crate::ops::Cmp::c_lt(c[k], r[k]) {
-                    r[k] = c[k];
-                }
-            }
-        }
-        tail = it.remainder();
+    const LANES: usize = 16;
+    if s.len() >= PAR_THRESHOLD {
+        let mid = s.len() / 2;
+        let (l, r) = s.split_at(mid);
+        let (a, b) = rayon::join(
+            || ordered_extreme(l, want_max),
+            || ordered_extreme(r, want_max),
+        );
+        return if want_max { a.omax(b) } else { a.omin(b) };
     }
-    let mut acc = r[0];
-    for k in 1..8 {
-        let better = if want_max {
-            crate::ops::Cmp::c_lt(acc, r[k])
-        } else {
-            crate::ops::Cmp::c_lt(r[k], acc)
-        };
-        if better {
-            acc = r[k];
+    let mut r: [T; LANES] = [s[0]; LANES];
+    let mut it = s.chunks_exact(LANES);
+    // `try_into` on a `chunks_exact` block gives the optimiser a fixed-size
+    // array, which removes the bounds checks and lets it use vector lanes.
+    if want_max {
+        for c in &mut it {
+            let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES");
+            for k in 0..LANES {
+                r[k] = r[k].omax(c[k]);
+            }
         }
+    } else {
+        for c in &mut it {
+            let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES");
+            for k in 0..LANES {
+                r[k] = r[k].omin(c[k]);
+            }
+        }
+    }
+    let tail = it.remainder();
+    let mut acc = r[0];
+    for k in 1..LANES {
+        acc = if want_max { acc.omax(r[k]) } else { acc.omin(r[k]) };
     }
     for &v in tail {
-        let better = if want_max {
-            crate::ops::Cmp::c_lt(acc, v)
-        } else {
-            crate::ops::Cmp::c_lt(v, acc)
-        };
-        if better {
-            acc = v;
-        }
+        acc = if want_max { acc.omax(v) } else { acc.omin(v) };
     }
+    acc
+}
+
+/// The contiguous min/max fast path: an ordered reduction plus numpy's NaN
+/// and signed-zero rules, both resolved in passes that only cost anything
+/// when they actually apply (and vanish entirely for integer dtypes).
+///
+/// # Safety
+/// `p` must point at `n` contiguous, aligned, in-bounds elements of `T`.
+unsafe fn extreme_contig<T>(p: *const T, n: usize, want_max: bool) -> T
+where
+    T: Element + Extreme + MaybeNan + Send + Sync,
+{
+    // SAFETY: guaranteed by the caller.
+    let s: &[T] = unsafe { std::slice::from_raw_parts(p, n) };
+    let acc = ordered_extreme(s, want_max);
     // A branchless fold: `any` would short-circuit, which keeps the scan
     // scalar and costs more than the reduction itself. For integer dtypes
     // `elem_is_nan` is a constant `false`, so this disappears entirely.
@@ -483,6 +616,45 @@ where
         }
     }
     acc
+}
+
+/// Contiguous integer/bool sum: sixteen widening accumulators, split across
+/// rayon above the threshold. Wrapping integer addition is associative and
+/// commutative, so any split gives bit-identical results.
+fn sum_int_contig<T, A, W, P>(s: &[T], widen: W, add: P, zero: A) -> A
+where
+    T: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    // Generic (not `fn` pointers): the closures must inline for the inner
+    // loop to vectorise at all.
+    W: Fn(T) -> A + Copy + Send + Sync,
+    P: Fn(A, A) -> A + Copy + Send + Sync,
+{
+    const LANES: usize = 16;
+    if s.len() >= PAR_THRESHOLD {
+        let (l, r) = s.split_at(s.len() / 2);
+        let (a, b) = rayon::join(
+            || sum_int_contig(l, widen, add, zero),
+            || sum_int_contig(r, widen, add, zero),
+        );
+        return add(a, b);
+    }
+    let mut acc = [zero; LANES];
+    let mut it = s.chunks_exact(LANES);
+    for c in &mut it {
+        let c: &[T; LANES] = c.try_into().expect("chunks_exact yields LANES");
+        for k in 0..LANES {
+            acc[k] = add(acc[k], widen(c[k]));
+        }
+    }
+    let mut total = zero;
+    for a in acc {
+        total = add(total, a);
+    }
+    for &v in it.remainder() {
+        total = add(total, widen(v));
+    }
+    total
 }
 
 /// Reduce one strided run with min/max/argmin/argmax.
@@ -510,6 +682,7 @@ unsafe fn extreme_run(
         && n > 0
         && (p as usize) % arr.dtype.alignment().max(1) == 0
     {
+        #[allow(unused_assignments)]
         let mut out = Scalar::Int(0);
         crate::dispatch_dtype!(arr.dtype, T, {
             // SAFETY: the caller guarantees `n` contiguous in-bounds elements.

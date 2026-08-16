@@ -86,3 +86,47 @@ benchmark run, Fable review, git commit.
   S/U/V, structured basics so test_dtype.py collects), promote_types/
   result_type/can_cast/min_scalar_type, and native Rust full reductions
   (sum/prod/min/max) to retire the placeholder 550x benchmark rows.
+- 2026-08-16: M1 complete (Opus build). cargo test 70/70; dev_check 9971
+  comparisons / 0 divergences; crosscheck green. Scoreboard: test_dtype
+  660/890 (74.2%, was a collection crash), test_numerictypes 76/138 (55.1%,
+  was a collection crash), test_shape_base 20/212 (unchanged); full suite
+  968/2109 (45.9%).
+
+  What landed:
+  * `descr.rs` — the real descriptor model. `DType` keeps the storage type
+    (now including `float16` and the flexible `S`/`U`/`V` kinds, plus interned
+    ids for structured and subarray dtypes, so it stays `Copy`); `Descr` adds
+    byte order and the `q`/`Q`/`c` C-type aliases that carry their own `num`
+    and `char`. repr/str are transcriptions of `upstream/numpy/_core/_dtype.py`
+    (packed-vs-dict struct forms, `align=True`, titles, nested and subarray
+    fields). Equality/hash normalise `<` vs `=` and ignore the alias, as numpy
+    does.
+  * `casting.rs` — `can_cast` (all five kinds, numeric table generated from
+    real numpy by `harness/gen_tables.py`, flexible rules probed), NEP 50
+    `result_type` with weak python scalars, `min_scalar_type` transcribed from
+    numpy's `min_scalar_type_num`, `common_type`, flexible `promote_types`.
+  * `reduce.rs` — native sum/prod/min/max/argmin/argmax with `axis=` and
+    `keepdims=`, plus `mean`. numpy's pairwise summation is reproduced exactly
+    (8 accumulators, `PW_BLOCKSIZE` 128, `-0.0` tail seed, split rounded down
+    to a multiple of 8), including the complex variant, so float sums are
+    bit-identical. Which grouping applies also follows numpy's iterator:
+    pairwise when the reduced axis ends up innermost, sequential slice
+    accumulation otherwise.
+  * Fidelity work found by the differential check: FMA-contracted complex
+    multiply, `fmin`/`fmax` signed-zero preference in min/max (but not in
+    argmin/argmax), numpy's float16 mean accumulating in float32, and the
+    complex64 mean widening to double before dividing.
+  * Performance: `lto = "fat"`, rayon-parallel reductions and elementwise
+    loops above 2^16 elements. The float sums split *on numpy's own pairwise
+    tree boundaries*, so parallelism does not change a single rounding.
+    1e6-element ratios (port/numpy, lower is better): sum_f64 0.49x,
+    max_f64 0.80x, add_f64 0.77x, mul_f64 0.66x, astype 0.92x, copy 0.99x,
+    add_i32 1.15x, strided_add 1.41x. Integer sums run 3-4x faster than
+    numpy. (The host is noisy; ratios move +-50% between runs.)
+
+  Known gaps carried into later milestones: byte-swapped *arrays* raise
+  NotImplementedError (the dtype objects round-trip correctly); structured
+  arrays are limited to construction; `longdouble`/`clongdouble` alias
+  float64/complex128; no real numpy scalar types yet, so whole-array
+  reductions return Python numbers; `S`/`U` support comparisons but no
+  string ufuncs.

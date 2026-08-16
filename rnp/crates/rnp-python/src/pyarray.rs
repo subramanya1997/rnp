@@ -541,10 +541,11 @@ impl PyNdArray {
                     return Scalar::Complex(num_complex::Complex::new(re, im)).cast(out_dt);
                 }
             }
-            let mut v = total;
-            rnp_core::dispatch_dtype!(acc_dt, A, {
+            // `dispatch_dtype!` expands to a match, so the result is
+            // assigned from every arm rather than returned.
+            let v: Scalar = rnp_core::dispatch_dtype!(acc_dt, A, {
                 let count = A::from_scalar(Scalar::Float(n as f64));
-                v = rnp_core::ops::Arith::a_div(A::from_scalar(total), count).to_scalar();
+                rnp_core::ops::Arith::a_div(A::from_scalar(total), count).to_scalar()
             });
             v.cast(out_dt)
         };

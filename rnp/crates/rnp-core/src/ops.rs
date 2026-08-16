@@ -377,21 +377,49 @@ fn flat_ptr<T>(a: &NdArray) -> Option<*const T> {
     unsafe { Some(a.buffer.as_ptr().offset(a.byte_offset) as *const T) }
 }
 
+/// Element count above which an elementwise loop is split across rayon.
+/// Element-wise results are independent, so any split is bit-identical.
+const PAR_THRESHOLD: usize = 1 << 16;
+
+/// Chunk handed to each rayon task.
+const PAR_CHUNK: usize = 1 << 14;
+
 /// The inner loop, generic over the element type *and* the operation.
 ///
 /// `F` is a distinct zero-sized type per call site, so the operation inlines
 /// into the loop body and LLVM can vectorise the contiguous path. Passing a
 /// `fn(T, T) -> T` pointer instead costs roughly 4x on f64 adds.
 #[inline]
-fn elementwise<T: Element, U: Copy, F: Fn(T, T) -> U>(
-    a: &NdArray,
-    b: &NdArray,
-    o: *mut U,
-    n: usize,
-    f: F,
-) {
+fn elementwise<T, U, F>(a: &NdArray, b: &NdArray, o: *mut U, n: usize, f: F)
+where
+    T: Element + Sync,
+    U: Copy + Send,
+    F: Fn(T, T) -> U + Sync + Send,
+{
     if let (Some(pa), Some(pb)) = (flat_ptr::<T>(a), flat_ptr::<T>(b)) {
         // Fast path: both operands are contiguous and already the out shape.
+        if n >= PAR_THRESHOLD {
+            use rayon::prelude::*;
+            // SAFETY: `o` owns `n` freshly allocated elements that nothing
+            // else refers to yet, and `pa`/`pb` are contiguous runs of `n`
+            // elements of a live buffer.
+            let (dst, sa, sb) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(o, n),
+                    std::slice::from_raw_parts(pa, n),
+                    std::slice::from_raw_parts(pb, n),
+                )
+            };
+            dst.par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .for_each(|(c, chunk)| {
+                    let base = c * PAR_CHUNK;
+                    for (k, slot) in chunk.iter_mut().enumerate() {
+                        *slot = f(sa[base + k], sb[base + k]);
+                    }
+                });
+            return;
+        }
         for i in 0..n {
             // SAFETY: i < n and all three buffers hold at least n elements.
             unsafe { *o.add(i) = f(*pa.add(i), *pb.add(i)) }
@@ -435,7 +463,7 @@ fn elementwise<T: Element, U: Copy, F: Fn(T, T) -> U>(
     }
 }
 
-fn run_arith<T: Arith>(a: &NdArray, b: &NdArray, out: &NdArray, op: BinOp) {
+fn run_arith<T: Arith + Send + Sync>(a: &NdArray, b: &NdArray, out: &NdArray, op: BinOp) {
     let n = out.size();
     // SAFETY: `out` was freshly allocated C-contiguous with `n` elements of T.
     let o = unsafe { out.buffer.as_mut_ptr() as *mut T };
@@ -448,7 +476,7 @@ fn run_arith<T: Arith>(a: &NdArray, b: &NdArray, out: &NdArray, op: BinOp) {
     }
 }
 
-fn run_cmp<T: Cmp>(a: &NdArray, b: &NdArray, out: &NdArray, op: BinOp) {
+fn run_cmp<T: Cmp + Send + Sync>(a: &NdArray, b: &NdArray, out: &NdArray, op: BinOp) {
     let n = out.size();
     // SAFETY: `out` is a freshly allocated contiguous bool array of n bytes.
     let o = unsafe { out.buffer.as_mut_ptr() };

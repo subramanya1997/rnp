@@ -1,15 +1,359 @@
 {
-  "timestamp": "2026-08-16T09:47:47.192357+00:00",
-  "overall_passed": 754,
-  "overall_total": 1240,
+  "timestamp": "2026-08-16T10:18:41.538659+00:00",
+  "overall_passed": 968,
+  "overall_total": 2109,
   "files": [
     {
+      "file": "test__exceptions.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_abc.py",
+      "passed": 0,
+      "failed": 5,
+      "errors": 0,
+      "skipped": 0,
+      "total": 5
+    },
+    {
+      "file": "test_api.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_argparse.py",
+      "passed": 2,
+      "failed": 5,
+      "errors": 0,
+      "skipped": 0,
+      "total": 7
+    },
+    {
+      "file": "test_array_api_info.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_array_coercion.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_array_interface.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_arraymethod.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_arrayobject.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_arrayprint.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_casting_floatingpoint_errors.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_casting_unittests.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_conversion_utils.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_cpu_dispatcher.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_cpu_features.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_custom_dtypes.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_cython.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_datetime.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_defchararray.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_deprecations.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_dlpack.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
       "file": "test_dtype.py",
-      "passed": 658,
-      "failed": 232,
+      "passed": 660,
+      "failed": 230,
       "errors": 0,
       "skipped": 4,
       "total": 894
+    },
+    {
+      "file": "test_einsum.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_errstate.py",
+      "passed": 0,
+      "failed": 6,
+      "errors": 0,
+      "skipped": 0,
+      "total": 6
+    },
+    {
+      "file": "test_extint128.py",
+      "passed": 0,
+      "failed": 13,
+      "errors": 0,
+      "skipped": 0,
+      "total": 13
+    },
+    {
+      "file": "test_finfo.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_function_base.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_getlimits.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_half.py",
+      "passed": 0,
+      "failed": 39,
+      "errors": 0,
+      "skipped": 0,
+      "total": 39
+    },
+    {
+      "file": "test_hashtable.py",
+      "passed": 0,
+      "failed": 36,
+      "errors": 0,
+      "skipped": 0,
+      "total": 36
+    },
+    {
+      "file": "test_indexerrors.py",
+      "passed": 2,
+      "failed": 6,
+      "errors": 0,
+      "skipped": 0,
+      "total": 8
+    },
+    {
+      "file": "test_indexing.py",
+      "passed": 17,
+      "failed": 89,
+      "errors": 0,
+      "skipped": 0,
+      "total": 106
+    },
+    {
+      "file": "test_item_selection.py",
+      "passed": 0,
+      "failed": 244,
+      "errors": 0,
+      "skipped": 0,
+      "total": 244
+    },
+    {
+      "file": "test_limited_api.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_longdouble.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_mem_overlap.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_mem_policy.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_memmap.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_multiarray.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_multiprocessing.py",
+      "passed": 0,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 0,
+      "total": 1
+    },
+    {
+      "file": "test_multithreading.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_nditer.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_nep50_promotions.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_numeric.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
     },
     {
       "file": "test_numerictypes.py",
@@ -20,12 +364,172 @@
       "total": 138
     },
     {
+      "file": "test_overrides.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_print.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_protocols.py",
+      "passed": 0,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 0,
+      "total": 2
+    },
+    {
+      "file": "test_records.py",
+      "passed": 0,
+      "failed": 44,
+      "errors": 0,
+      "skipped": 0,
+      "total": 44
+    },
+    {
+      "file": "test_regression.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_scalar_ctors.py",
+      "passed": 142,
+      "failed": 55,
+      "errors": 0,
+      "skipped": 4,
+      "total": 201
+    },
+    {
+      "file": "test_scalar_methods.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_scalarbuffer.py",
+      "passed": 0,
+      "failed": 79,
+      "errors": 0,
+      "skipped": 0,
+      "total": 79
+    },
+    {
+      "file": "test_scalarinherit.py",
+      "passed": 4,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 0,
+      "total": 6
+    },
+    {
+      "file": "test_scalarmath.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_scalarprint.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
       "file": "test_shape_base.py",
       "passed": 20,
       "failed": 192,
       "errors": 0,
       "skipped": 1,
       "total": 213
+    },
+    {
+      "file": "test_simd.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_simd_module.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_stringdtype.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_strings.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_ufunc.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_umath.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_umath_accuracy.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_umath_complex.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "test_unicode.py",
+      "passed": 45,
+      "failed": 31,
+      "errors": 0,
+      "skipped": 0,
+      "total": 76
     }
   ]
 }

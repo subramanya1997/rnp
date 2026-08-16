@@ -7,3 +7,4 @@ description = "Pure-Rust ndarray engine for rnp (a Rust port of NumPy)"
 
 [dependencies]
 num-complex.workspace = true
+rayon = "1.12.0"

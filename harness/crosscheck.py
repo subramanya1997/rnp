@@ -78,14 +78,27 @@ def test_binary(a, b, op):
     (dt_a, sh_a, va), (dt_b, sh_b, vb) = a, b
     ra = real_np.array(va, dtype=dt_a).reshape(sh_a)
     rb = real_np.array(vb, dtype=dt_b).reshape(sh_b)
-    try:
-        expected = getattr(real_np, op)(ra, rb)
-    except ValueError:
-        return  # non-broadcastable; port behavior checked in unit tests
     pa = port_np.array(va, dtype=dt_a).reshape(sh_a)
     pb = port_np.array(vb, dtype=dt_b).reshape(sh_b)
+    label = f"{op}({dt_a}{sh_a}, {dt_b}{sh_b})"
+    try:
+        expected = getattr(real_np, op)(ra, rb)
+    except Exception as exc:  # noqa: BLE001
+        # numpy refuses some combinations (bool subtract, bad broadcast); the
+        # port must refuse them the same way.
+        try:
+            getattr(port_np, op)(pa, pb)
+        except Exception as port_exc:  # noqa: BLE001
+            if type(exc).__name__ != type(port_exc).__name__:
+                failures.append(
+                    f"{label}: port raised {type(port_exc).__name__}, "
+                    f"numpy raised {type(exc).__name__}")
+        else:
+            failures.append(f"{label}: port accepted what numpy rejected "
+                            f"({type(exc).__name__})")
+        return
     got = getattr(port_np, op)(pa, pb)
-    check(f"{op}({dt_a}{sh_a}, {dt_b}{sh_b})", expected, got)
+    check(label, expected, got)
 
 
 @seed(1)

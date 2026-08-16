@@ -28,7 +28,7 @@ except ImportError as e:
 RESULTS = ROOT / "benchmarks" / "results.json"
 
 
-def bench(fn, *args, reps=7, inner=1):
+def bench(fn, *args, reps=25, inner=1):
     fn(*args)  # warmup
     best = float("inf")
     for _ in range(reps):
