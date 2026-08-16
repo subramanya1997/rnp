@@ -818,6 +818,9 @@ from ._datetime import (  # noqa: E402,F401
     busday_count, busday_offset, busdaycalendar, datetime_as_string,
     datetime_data, is_busday, isnat,
 )
+# `arange` gains datetime64/timedelta64 ranges; the numeric path is unchanged
+# (the wrapper delegates straight to the engine when no operand is time-like).
+from ._datetime import arange  # noqa: E402,F401
 from ._core import multiarray  # noqa: E402,F401
 from . import dtypes  # noqa: E402,F401
 from ._stubs import inert_class as _inert_class  # noqa: E402
