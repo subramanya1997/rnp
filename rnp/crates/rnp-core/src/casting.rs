@@ -61,6 +61,19 @@ fn cast_ok(from: DType, to: DType, same_kind: bool) -> bool {
     if from == to {
         return true;
     }
+    if (from.is_datetime_like() || to.is_datetime_like())
+        && to.category() != Kind::Void
+    {
+        return datetime_cast_ok(
+            from,
+            to,
+            if same_kind {
+                Casting::SameKind
+            } else {
+                Casting::Safe
+            },
+        );
+    }
     if from.is_numeric() && to.is_numeric() {
         return numeric_cast(from, to, same_kind);
     }
@@ -115,6 +128,37 @@ fn cast_ok(from: DType, to: DType, same_kind: bool) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// The datetime half of the casting lattice, from numpy's
+/// `can_cast_datetime64_metadata` / `can_cast_timedelta64_metadata` plus the
+/// cross-kind rules in `PyArray_CanCastTypeTo`.
+fn datetime_cast_ok(from: DType, to: DType, casting: Casting) -> bool {
+    use crate::datetime::meta_of;
+    match (from.is_datetime_like(), to.is_datetime_like()) {
+        (true, true) => {
+            if from.is_datetime() != to.is_datetime() {
+                // datetime64 <-> timedelta64 is `unsafe` only.
+                return false;
+            }
+            crate::datetime::can_cast_meta(
+                meta_of(from).unwrap(),
+                meta_of(to).unwrap(),
+                from.is_timedelta(),
+                casting,
+            )
+        }
+        // Probed: datetime64/timedelta64 -> S/U and -> any numeric dtype is
+        // `unsafe` only, in both directions.
+        (true, false) => false,
+        (false, true) => {
+            // Integers (and bool) cast *safely* into timedelta64; nothing
+            // casts into datetime64 short of `unsafe`.
+            let _ = casting;
+            to.is_timedelta() && (from.is_integer() || from.is_bool())
+        }
+        (false, false) => unreachable!(),
     }
 }
 

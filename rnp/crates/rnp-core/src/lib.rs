@@ -4,6 +4,8 @@
 pub mod array;
 pub mod buffer;
 pub mod casting;
+pub mod datetime;
+pub mod datetime_ops;
 pub mod descr;
 pub mod dtype;
 pub mod element;

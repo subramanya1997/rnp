@@ -1579,6 +1579,14 @@ impl PyNdArray {
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: mut view, .. } => {
                 if view.dtype().is_object() {
+                    // A scalar destination stores the object itself, whatever
+                    // it is: `obj_arr[0] = [[...]]` keeps the list rather than
+                    // descending into it (and a co-recursive list has no
+                    // shape to descend into at all).
+                    if view.ndim() == 0 {
+                        crate::objects::write(&view, view.byte_offset, value);
+                        return Ok(());
+                    }
                     let src = crate::objects::array_from_objects(value)?;
                     let src = if src.shape == view.shape {
                         src

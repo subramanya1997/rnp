@@ -34,6 +34,28 @@ pub fn register_scalar_wraps(v: Vec<Py<PyAny>>) {
     let _ = SCALAR_WRAPS.set(v);
 }
 
+/// The shim's `datetime64`/`timedelta64` builder, `f(raw_int, dtype)`.
+///
+/// The datetime scalars cannot go through `SCALAR_WRAPS`: that table is
+/// indexed by numeric dtype code, and a datetime scalar needs its *unit* as
+/// well as its value.
+static DATETIME_FACTORY: OnceLock<Py<PyAny>> = OnceLock::new();
+
+pub fn register_datetime_factory(f: Py<PyAny>) {
+    let _ = DATETIME_FACTORY.set(f);
+}
+
+/// Build the shim's datetime scalar for `(dt, value)`, if it registered one.
+pub fn datetime_scalar<'py>(
+    py: Python<'py>,
+    dt: DType,
+    v: i64,
+) -> Option<PyResult<Bound<'py, PyAny>>> {
+    DATETIME_FACTORY
+        .get()
+        .map(|f| f.bind(py).call1((v, PyDType::new(dt))))
+}
+
 /// The `_wrap` for a storage dtype, if the shim registered one.
 #[inline]
 pub fn scalar_wrap<'py>(py: Python<'py>, dt: DType) -> Option<&'py Bound<'py, PyAny>> {
@@ -48,6 +70,8 @@ pub fn scalar_class<'py>(py: Python<'py>, dt: DType) -> Option<Bound<'py, PyAny>
         DType::Str(_) => "str_".into(),
         DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => "void".into(),
         DType::Object => "object_".into(),
+        DType::DateTime(_) => "datetime64".into(),
+        DType::TimeDelta(_) => "timedelta64".into(),
         d => d.name(),
     };
     SCALAR_TYPES
@@ -400,6 +424,9 @@ impl PyDType {
             DType::Bytes(_) => "bytes_".into(),
             DType::Str(_) => "str_".into(),
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => "void".into(),
+            // The datetime classes are one per *family*, not per unit.
+            DType::DateTime(_) => "datetime64".into(),
+            DType::TimeDelta(_) => "timedelta64".into(),
             d => d.name(),
         };
         match SCALAR_TYPES.get() {

@@ -100,9 +100,7 @@ def _missing(name):
     return fn
 
 
-datetime_as_string = _missing("datetime_as_string")
-datetime_data = _missing("datetime_data")
-isnat = _missing("isnat")
+from .._datetime import datetime_as_string, datetime_data, isnat  # noqa: E402
 
 
 def _boolean_select(a, mask):

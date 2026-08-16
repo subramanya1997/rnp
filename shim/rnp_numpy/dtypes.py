@@ -57,3 +57,14 @@ HalfDType = Float16DType  # noqa: F821
 _make("BytesDType", dtype("S"))
 _make("StrDType", dtype("U"))
 _make("VoidDType", dtype("V"))
+_make("ObjectDType", dtype("O"))
+# The datetime classes are parameterised by unit, so the class stands for the
+# whole family; the engine reports the family name in its error payloads.
+_make("DateTime64DType", dtype("M8"))
+_make("TimeDelta64DType", dtype("m8"))
+_CLASS_NAMES.update({
+    "datetime64": "DateTime64DType",
+    "timedelta64": "TimeDelta64DType",
+    "bytes": "BytesDType", "str": "StrDType", "void": "VoidDType",
+    "object": "ObjectDType",
+})

@@ -308,12 +308,7 @@ impl Descr {
             return "|O".to_string();
         }
         if let DType::DateTime(u) | DType::TimeDelta(u) = self.dt {
-            let unit = crate::dtype::DATETIME_UNITS[u as usize];
-            let suffix = if unit.is_empty() {
-                String::new()
-            } else {
-                format!("[{unit}]")
-            };
+            let suffix = crate::datetime::DtMeta::unpack(u).suffix();
             return format!("{}{}8{}", prefix, self.dt.kind(), suffix);
         }
         format!("{}{}{}", prefix, self.dt.str_kind(), self.dt.str_size())
@@ -455,12 +450,7 @@ impl Descr {
             // numpy always reprs a datetime dtype in its `<M8[unit]` form,
             // never as `datetime64[unit]`.
             DType::DateTime(u) | DType::TimeDelta(u) => {
-                let unit = crate::dtype::DATETIME_UNITS[u as usize];
-                let suffix = if unit.is_empty() {
-                    String::new()
-                } else {
-                    format!("[{unit}]")
-                };
+                let suffix = crate::datetime::DtMeta::unpack(u).suffix();
                 format!("'{}{}8{}'", bo, self.dt.kind(), suffix)
             }
             d => {
@@ -825,18 +815,33 @@ fn parse_datetime(rest: &str, bo: ByteOrder) -> Option<Descr> {
         (first, t)
     };
     let tail = tail.strip_prefix('8').unwrap_or(tail);
-    let unit = if tail.is_empty() {
-        0
+    let meta = if tail.is_empty() {
+        crate::datetime::DtMeta::GENERIC
     } else {
         let inner = tail.strip_prefix('[')?.strip_suffix(']')?;
-        crate::dtype::datetime_unit_index(inner)?
+        parse_meta_str(inner)?
     };
     let dt = if head == 'M' {
-        DType::DateTime(unit)
+        DType::DateTime(meta.pack())
     } else {
-        DType::TimeDelta(unit)
+        DType::TimeDelta(meta.pack())
     };
     Some(Descr::new(dt, bo))
+}
+
+/// The inside of `M8[...]`: an optional decimal multiplier then a unit, e.g.
+/// `ns`, `7D`, `10m`. numpy's multiplier is a C `int`, so anything above
+/// `i32::MAX` is rejected (`np.dtype('M8[3000000000ps]')` is a TypeError).
+pub fn parse_meta_str(inner: &str) -> Option<crate::datetime::DtMeta> {
+    let digits = inner.len() - inner.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (numstr, unit) = inner.split_at(digits);
+    let num: u32 = if numstr.is_empty() {
+        1
+    } else {
+        numstr.parse::<i64>().ok().filter(|&n| n <= i32::MAX as i64)? as u32
+    };
+    let base = crate::datetime::parse_unit(unit)?;
+    Some(crate::datetime::DtMeta::new(base, num))
 }
 
 // ---- structured / subarray construction --------------------------------

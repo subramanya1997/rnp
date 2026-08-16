@@ -255,12 +255,38 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
             return _empty(self.shape, dt)
     if not copy and dt == src and _order_ok(self, order):
         return self
+    if src.kind == "O" and dt.kind in "mM":
+        # The engine's datetime coercion handles every object form numpy
+        # accepts (and rejects the rest with numpy's own ValueError), so the
+        # generic element-by-element path -- which would recurse into a
+        # co-recursive list -- is bypassed.
+        return _pkg().array(self.tolist(), dtype=dt).reshape(self.shape)
     if src.kind == "O" and dt.kind != "O":
         return _object_astype(self, dt)
     if src.kind in "SU" and dt.kind in "biufc":
         return _object_astype(self, dt)
+    if src.kind in "mM" and dt.kind == "O":
+        return _pkg().array(_rnp._datetime_objects(self), dtype=object
+                            ).reshape(self.shape)
     if dt.kind == "O" and src.kind != "O":
         return _to_object(self)
+    if dt.kind in "SU" and src.kind in "mM":
+        # datetime -> text: the engine renders each element the way numpy's
+        # `datetime_as_string` (for M8) and `str(scalar)` (for m8) do, and an
+        # unsized target takes numpy's own per-unit width.
+        from . import _datetime as _dtmod  # noqa: F401
+        strs = _rnp._datetime_strings(self, casting="unsafe")
+        width = dt.itemsize // (4 if dt.kind == "U" else 1)
+        if width == 0:
+            width = _rnp._datetime_string_len(src)
+        out = _empty(self.shape, _dtype(f"{dt.char}{width}"))
+        flat = out.reshape(-1)
+        for i, text in enumerate(strs):
+            flat[i] = text if dt.kind == "U" else text.encode()
+        return out
+    if src.kind in "SU" and dt.kind in "mM":
+        # text -> datetime: the array constructor already parses ISO strings.
+        return _pkg().array(self.tolist(), dtype=dt)
     if dt.kind in "SU" and src.kind in "biufc":
         # Numbers rendered as text.  Note this must come before the
         # `itemsize == 0` branch below: that one sizes the result from the
@@ -504,15 +530,31 @@ def _object_array(obj):
     return out
 
 
-def _as_lists(obj):
+#: numpy's `NPY_MAXDIMS`. Nesting deeper than this is how a co-recursive
+#: list (gh-11154) announces itself; numpy answers with a ValueError rather
+#: than blowing the C stack, and so must the port.
+_MAXDIMS = 64
+
+
+def _too_deep(found):
+    return ValueError(
+        f"maximum supported dimension for an ndarray is {_MAXDIMS}, "
+        f"found {found}")
+
+
+def _as_lists(obj, _depth=0):
     if isinstance(obj, (_b.list, _b.tuple)):
-        return [_as_lists(x) for x in obj]
+        if _depth >= _MAXDIMS:
+            raise _too_deep(_depth + 1)
+        return [_as_lists(x, _depth + 1) for x in obj]
     return obj
 
 
 def _shape_of(obj):
     shape = []
     while isinstance(obj, (_b.list, _b.tuple)):
+        if len(shape) >= _MAXDIMS:
+            raise _too_deep(len(shape) + 1)
         shape.append(len(obj))
         if not obj:
             break

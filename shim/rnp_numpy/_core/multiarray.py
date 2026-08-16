@@ -63,10 +63,10 @@ def _vec_string(char_array, dtype, method, args=()):
 scalar = not_implemented("numpy._core.multiarray.scalar")
 set_datetimeparse_function = not_implemented(
     "numpy._core.multiarray.set_datetimeparse_function")
-datetime_data = not_implemented("numpy._core.multiarray.datetime_data")
-busday_count = not_implemented("numpy._core.multiarray.busday_count")
-busday_offset = not_implemented("numpy._core.multiarray.busday_offset")
-is_busday = not_implemented("numpy._core.multiarray.is_busday")
+from .._datetime import (  # noqa: E402
+    datetime_data, datetime_as_string, is_busday, busday_count, busday_offset,
+    busdaycalendar,
+)
 frombuffer = not_implemented("numpy._core.multiarray.frombuffer")
 fromfile = not_implemented("numpy._core.multiarray.fromfile")
 fromiter = not_implemented("numpy._core.multiarray.fromiter")

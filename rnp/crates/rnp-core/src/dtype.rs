@@ -44,11 +44,12 @@ pub enum DType {
     Struct(u32),
     /// A subarray dtype (`('f4', (2, 2))`); indexes the subarray registry.
     SubArray(u32),
-    /// `M8[unit]` — a descriptor only so far. The payload indexes
-    /// [`DATETIME_UNITS`]; `0` is the unit-less `M8`.
-    DateTime(u8),
+    /// `M8[unit]`. The payload is a packed
+    /// [`crate::datetime::DtMeta`] (base unit in the low 8 bits, multiplier
+    /// above); the generic `M8` is `base == UNIT_GENERIC`.
+    DateTime(u64),
     /// `m8[unit]`; see [`DType::DateTime`].
-    TimeDelta(u8),
+    TimeDelta(u64),
     /// `object` — arrays of it store 8-byte handles into the interning slab
     /// on the Python side (see `rnp-python/src/objects.rs`).
     Object,
@@ -76,15 +77,14 @@ pub enum Kind {
     Object,
 }
 
-/// numpy's datetime unit codes, in its own order. Index 0 is the unit-less
-/// `M8`/`m8`; the rest are what appears in `dtype('M8[ns]')`.
-pub const DATETIME_UNITS: [&str; 14] = [
-    "", "Y", "M", "W", "D", "h", "m", "s", "ms", "us", "ns", "ps", "fs", "as",
-];
+/// The generic (unit-less) `M8`/`m8` storage dtype.
+pub fn generic_datetime() -> DType {
+    DType::DateTime(crate::datetime::DtMeta::GENERIC.pack())
+}
 
-/// The index of a unit string, or `None` when it is not one of numpy's.
-pub fn datetime_unit_index(u: &str) -> Option<u8> {
-    DATETIME_UNITS.iter().position(|&x| x == u).map(|i| i as u8)
+/// The generic (unit-less) `m8` storage dtype.
+pub fn generic_timedelta() -> DType {
+    DType::TimeDelta(crate::datetime::DtMeta::GENERIC.pack())
 }
 
 /// The numeric dtypes, in numpy's own ordering.
@@ -235,12 +235,7 @@ impl DType {
             } else {
                 "timedelta64"
             };
-            let unit = DATETIME_UNITS[u as usize];
-            return if unit.is_empty() {
-                stem.to_string()
-            } else {
-                format!("{stem}[{unit}]")
-            };
+            return format!("{stem}{}", crate::datetime::DtMeta::unpack(u).suffix());
         }
         let stem = match self.category() {
             Kind::Bytes => "bytes",
@@ -359,6 +354,18 @@ impl DType {
     pub fn is_flexible(self) -> bool {
         matches!(self.category(), Kind::Bytes | Kind::Str | Kind::Void)
     }
+    /// True for `M8`/`m8`: int64 storage plus unit metadata.
+    pub fn is_datetime_like(self) -> bool {
+        matches!(self, DType::DateTime(_) | DType::TimeDelta(_))
+    }
+    /// True only for `M8[...]`.
+    pub fn is_datetime(self) -> bool {
+        matches!(self, DType::DateTime(_))
+    }
+    /// True only for `m8[...]`.
+    pub fn is_timedelta(self) -> bool {
+        matches!(self, DType::TimeDelta(_))
+    }
     /// `object` dtype: a descriptor with no storage behind it.
     pub fn is_object(self) -> bool {
         self == DType::Object
@@ -439,6 +446,9 @@ pub fn promote(a: DType, b: DType) -> DType {
     if a.is_flexible() || b.is_flexible() {
         return promote_flexible(a, b).unwrap_or(DType::Void(0));
     }
+    if a.is_datetime_like() || b.is_datetime_like() {
+        return promote_datetime(a, b).unwrap_or(DType::Void(0));
+    }
     let (ka, kb) = (a.category(), b.category());
     if ka == Bool {
         return b;
@@ -509,6 +519,22 @@ pub fn promote_flexible(a: DType, b: DType) -> Option<DType> {
         (Bytes(n), Str(m)) | (Str(m), Bytes(n)) => Some(Str(n.max(m))),
         _ => None,
     }
+}
+
+/// `promote_types` where at least one side is datetime-like. numpy allows
+/// `m8 + integer` (the integer is read in the timedelta's own unit) but no
+/// other cross-kind combination, and `M8`/`m8` mixes yield `M8`.
+pub fn promote_datetime(a: DType, b: DType) -> Option<DType> {
+    if a.is_datetime_like() && b.is_datetime_like() {
+        return crate::datetime::promote_meta(a, b).ok();
+    }
+    // np.promote_types('m8[s]', 'int64') is timedelta64[s]; the datetime side
+    // has no such rule.
+    let (dt, other) = if a.is_datetime_like() { (a, b) } else { (b, a) };
+    if dt.is_timedelta() && (other.is_integer() || other.is_bool()) {
+        return Some(dt);
+    }
+    None
 }
 
 fn int_of_size(size: usize, signed: bool) -> DType {
@@ -616,6 +642,15 @@ mod tests {
         assert_eq!(DType::Void(10).itemsize(), 10);
         assert_eq!(DType::Void(10).name(), "void80");
         assert_eq!(DType::Void(10).num(), 20);
+    }
+
+    /// `DType` is copied into every loop prologue and compared on every
+    /// operand, so its width is a performance fact worth pinning: 8 bytes of
+    /// payload plus the discriminant.
+    #[test]
+    fn dtype_stays_small() {
+        assert_eq!(std::mem::size_of::<DType>(), 16);
+        assert!(std::mem::size_of::<crate::descr::Descr>() <= 24);
     }
 
     #[test]

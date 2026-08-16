@@ -64,19 +64,38 @@ fn check_axis(arr: &NdArray, axis: usize) -> Result<()> {
 enum Key {
     Num(Scalar),
     Text(Vec<u32>),
+    /// datetime64 / timedelta64: NaT sorts last, like NaN.
+    Time(i64),
 }
 
 fn key_at(arr: &NdArray, off: isize) -> Key {
     if arr.dtype().is_flexible() {
         Key::Text(crate::ops::logical_bytes(arr, off))
+    } else if arr.dtype().is_datetime_like() {
+        Key::Time(match arr.read_at(off) {
+            Scalar::Int(i) => i,
+            s => s.as_f64() as i64,
+        })
     } else {
         Key::Num(arr.read_at(off))
+    }
+}
+
+/// numpy's datetime order: NaT is greater than everything and ties with
+/// itself, exactly as NaN does for floats (probed: `np.sort` puts NaT last).
+fn cmp_time(a: i64, b: i64) -> Ordering {
+    match (a == crate::datetime::NAT, b == crate::datetime::NAT) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.cmp(&b),
     }
 }
 
 fn cmp_key(a: &Key, b: &Key) -> Ordering {
     match (a, b) {
         (Key::Num(x), Key::Num(y)) => cmp_scalar(*x, *y),
+        (Key::Time(x), Key::Time(y)) => cmp_time(*x, *y),
         (Key::Text(x), Key::Text(y)) => x.cmp(y),
         _ => Ordering::Equal,
     }
