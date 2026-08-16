@@ -35,6 +35,13 @@ DEFAULT_TARGETS = [
 ]
 
 
+def display_name(test_file: Path) -> str:
+    # Disambiguate same-named files across suites (e.g. test_regression.py
+    # exists in _core, lib, and ma).
+    sub = test_file.parent.parent.name
+    return test_file.name if sub == "_core" else f"{sub}/{test_file.name}"
+
+
 def run_file(test_file: Path, timeout: int = 900) -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
@@ -59,9 +66,9 @@ def run_file(test_file: Path, timeout: int = 900) -> dict:
         proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
                               timeout=timeout, cwd=ROOT / "harness")
     except subprocess.TimeoutExpired:
-        return {"file": test_file.name, "error": "timeout", "passed": 0,
+        return {"file": display_name(test_file), "error": "timeout", "passed": 0,
                 "failed": 0, "errors": 0, "skipped": 0, "total": 0}
-    summary = {"file": test_file.name, "passed": 0, "failed": 0, "errors": 0,
+    summary = {"file": display_name(test_file), "passed": 0, "failed": 0, "errors": 0,
                "skipped": 0, "total": 0}
     if report.exists():
         data = json.loads(report.read_text())
@@ -86,9 +93,19 @@ def main() -> int:
     ap.add_argument("files", nargs="*", help="upstream test file names")
     ap.add_argument("--all", action="store_true",
                     help="run every file in upstream/numpy/_core/tests")
+    ap.add_argument("--full", action="store_true",
+                    help="run every test file in all upstream numpy suites "
+                         "(_core, lib, linalg, fft, random, ma, polynomial)")
     args = ap.parse_args()
 
-    if args.all:
+    if args.full:
+        files = []
+        for sub in ["_core", "lib", "linalg", "fft", "random", "ma",
+                    "polynomial"]:
+            d = ROOT / "upstream" / "numpy" / sub / "tests"
+            if d.is_dir():
+                files.extend(sorted(d.glob("test_*.py")))
+    elif args.all:
         files = sorted(UPSTREAM_TESTS.glob("test_*.py"))
     elif args.files:
         files = [UPSTREAM_TESTS / f for f in args.files]
