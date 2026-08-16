@@ -648,15 +648,13 @@ benchmark run, Fable review, git commit.
     hoist. Now read once before the loop.
 
   Known gaps carried into M5:
-  * **`test_multiarray.py` collects (14272 tests) but exceeds the harness's
-    900s per-file timeout**, so it contributes 0 to the scoreboard above.
-    Measured separately with a 90-minute budget it is **465 passed / 13802
-    failed / 5 skipped** (59 min wall on this loaded host). Counting it, the
-    suite is **11234/28377**. That surface has never collected before, so its
-    failures are unworked rather than regressed, and triaging them is a
-    milestone in itself. M5 should first raise the harness timeout or shard
-    the file so the scoreboard stops silently dropping the largest file in
-    the suite.
+  * **`test_multiarray.py` collects (14272 tests, verified by `--co -q`) but
+    exceeds the harness's 900s per-file timeout**, so it contributes 0 to the
+    scoreboard above and **its pass count is UNMEASURED**. An out-of-harness
+    run with a 90-minute budget was started but was killed before producing
+    any output, so there is no number for this file -- do not assume one. It
+    is the largest single unknown in the scoreboard, and M5 should first raise
+    the harness timeout or shard the file, then measure it.
   * **datetime64/timedelta64 storage and arithmetic were not attempted.**
     `test_datetime.py` and `test_numeric.py` still fail to collect on a
     `dispatch_dtype: TimeDelta(n) is not a numeric dtype` panic. The unit
