@@ -16,6 +16,35 @@ fn is_default_dtype(d: DType) -> bool {
     matches!(d, DType::Bool | DType::I64 | DType::F64 | DType::C128)
 }
 
+/// The shortest decimal string that round-trips through `dtype`.
+///
+/// Rust's `{}` gives the shortest round-trip for `f64`, which is wrong for
+/// narrower dtypes: `np.float32(0.1)` prints as `0.1`, not as the `f64`
+/// spelling `0.10000000149011612` of the same bits.
+fn shortest_for_dtype(v: f64, dtype: DType) -> f64 {
+    if dtype == DType::F64 || !v.is_finite() {
+        return v;
+    }
+    let matches = |cand: f64| -> bool {
+        match dtype {
+            DType::F32 => (cand as f32).to_bits() == (v as f32).to_bits(),
+            DType::F16 => {
+                crate::element::f64_to_f16_bits(cand) == crate::element::f64_to_f16_bits(v)
+            }
+            _ => cand.to_bits() == v.to_bits(),
+        }
+    };
+    for prec in 1..=17 {
+        let s = format!("{:.*e}", prec - 1, v);
+        if let Ok(cand) = s.parse::<f64>() {
+            if matches(cand) {
+                return cand;
+            }
+        }
+    }
+    v
+}
+
 /// Shortest round-trip decimal for a float, in numpy's style: a trailing
 /// `.` instead of `.0`, and `inf`/`nan` spelled out.
 fn fmt_float(v: f64) -> String {
@@ -74,13 +103,14 @@ impl Formatter {
                 let raw: Vec<String> = values
                     .iter()
                     .map(|v| match v {
-                        Scalar::Float(f) => fmt_float(*f),
+                        Scalar::Float(f) => fmt_float(shortest_for_dtype(*f, d)),
                         other => format!("{:?}", other),
                     })
                     .collect();
                 align_decimals(&raw)
             }
-            _ => {
+            d if d.is_complex() => {
+                let comp = if d == DType::C64 { DType::F32 } else { DType::F64 };
                 let (re, im): (Vec<f64>, Vec<f64>) = values
                     .iter()
                     .map(|v| match v {
@@ -88,9 +118,16 @@ impl Formatter {
                         _ => (0.0, 0.0),
                     })
                     .unzip();
-                let re_s = align_decimals(&re.iter().map(|&x| fmt_float(x)).collect::<Vec<_>>());
-                let im_s =
-                    align_decimals(&im.iter().map(|&x| fmt_float(x.abs())).collect::<Vec<_>>());
+                let re_s = align_decimals(
+                    &re.iter()
+                        .map(|&x| fmt_float(shortest_for_dtype(x, comp)))
+                        .collect::<Vec<_>>(),
+                );
+                let im_s = align_decimals(
+                    &im.iter()
+                        .map(|&x| fmt_float(shortest_for_dtype(x.abs(), comp)))
+                        .collect::<Vec<_>>(),
+                );
                 re_s.iter()
                     .zip(im_s.iter())
                     .zip(im.iter())
@@ -104,6 +141,9 @@ impl Formatter {
                     })
                     .collect()
             }
+            // Flexible dtypes have no numeric formatter yet (M5 owns the
+            // real arrayprint); show the raw bytes' repr placeholder.
+            _ => values.iter().map(|v| format!("{v:?}")).collect(),
         };
         let width = strings.iter().map(|s| s.len()).max().unwrap_or(0);
         for s in &mut strings {

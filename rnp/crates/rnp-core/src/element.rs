@@ -110,6 +110,7 @@ impl Scalar {
                 other => other.as_u64() as u32 as u64,
             }),
             DType::U64 => Scalar::Uint(self.as_u64()),
+            DType::F16 => Scalar::Float(F16::from_f64(self.as_f64()).to_f64()),
             DType::F32 => Scalar::Float(self.as_f64() as f32 as f64),
             DType::F64 => Scalar::Float(self.as_f64()),
             DType::C64 => {
@@ -117,6 +118,10 @@ impl Scalar {
                 Scalar::Complex(Complex::new(c.re as f32 as f64, c.im as f32 as f64))
             }
             DType::C128 => Scalar::Complex(self.as_complex()),
+            // Flexible dtypes hold bytes, not numbers: `Scalar` cannot
+            // represent them, and every path that could reach here is
+            // guarded by `DType::is_numeric`.
+            _ => self,
         }
     }
 }
@@ -126,6 +131,152 @@ fn f2i64(f: f64) -> i64 {
 }
 fn f2u64(f: f64) -> u64 {
     f as u64
+}
+
+/// IEEE-754 binary16, stored as its raw bits.
+///
+/// numpy has no hardware half type either: every arithmetic operation is
+/// performed in `float` and converted back (`npy_half_add` and friends in
+/// `halffloat.c`), which is exactly what the `Arith`/`Cmp` impls do.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(transparent)]
+pub struct F16(pub u16);
+
+impl F16 {
+    pub const ZERO: F16 = F16(0);
+
+    #[inline]
+    pub fn to_f32(self) -> f32 {
+        f16_bits_to_f32(self.0)
+    }
+
+    #[inline]
+    pub fn to_f64(self) -> f64 {
+        self.to_f32() as f64
+    }
+
+    #[inline]
+    pub fn from_f32(v: f32) -> F16 {
+        F16(f32_to_f16_bits(v))
+    }
+
+    /// Direct double -> half conversion. Going via `f32` would round twice
+    /// and disagree with numpy's `npy_double_to_half` on the values that sit
+    /// exactly on a half-precision rounding boundary.
+    #[inline]
+    pub fn from_f64(v: f64) -> F16 {
+        F16(f64_to_f16_bits(v))
+    }
+
+    pub fn is_nan(self) -> bool {
+        (self.0 & 0x7C00) == 0x7C00 && (self.0 & 0x03FF) != 0
+    }
+}
+
+/// Round-to-nearest-even f32 -> binary16.
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    let x = value.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = (x >> 23) & 0xFF;
+    let man = x & 0x007F_FFFF;
+    if exp == 0xFF {
+        // inf keeps its sign; any NaN becomes the canonical quiet NaN, which
+        // is what numpy's conversion produces for the payloads we can make.
+        return if man == 0 { sign | 0x7C00 } else { sign | 0x7E00 };
+    }
+    if exp == 0 {
+        // f32 subnormals are far below the half subnormal range.
+        return sign;
+    }
+    let half_exp = exp as i32 - 127 + 15;
+    if half_exp >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if half_exp <= 0 {
+        let shift = (14 - half_exp) as u32;
+        if shift > 24 {
+            return sign;
+        }
+        let full = man | 0x0080_0000;
+        let mut out = (full >> shift) as u16;
+        let round_bit = 1u32 << (shift - 1);
+        if (full & round_bit) != 0 && (full & (3 * round_bit - 1)) != 0 {
+            out += 1;
+        }
+        return sign | out;
+    }
+    let mut bits = sign | ((half_exp as u16) << 10) | ((man >> 13) as u16);
+    let round_bit = 1u32 << 12;
+    if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
+        // A carry out of the mantissa flows into the exponent, which is the
+        // correct result (and reaches inf at the top).
+        bits += 1;
+    }
+    bits
+}
+
+/// Round-to-nearest-even f64 -> binary16.
+pub fn f64_to_f16_bits(value: f64) -> u16 {
+    let x = value.to_bits();
+    let sign = ((x >> 48) & 0x8000) as u16;
+    let exp = (x >> 52) & 0x7FF;
+    let man = x & 0x000F_FFFF_FFFF_FFFF;
+    if exp == 0x7FF {
+        return if man == 0 { sign | 0x7C00 } else { sign | 0x7E00 };
+    }
+    if exp == 0 {
+        return sign;
+    }
+    let half_exp = exp as i64 - 1023 + 15;
+    if half_exp >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if half_exp <= 0 {
+        let shift = (43 - half_exp) as u32;
+        if shift > 53 {
+            return sign;
+        }
+        let full = man | 0x0010_0000_0000_0000;
+        let mut out = (full >> shift) as u16;
+        let round_bit = 1u64 << (shift - 1);
+        if (full & round_bit) != 0 && (full & (3 * round_bit - 1)) != 0 {
+            out += 1;
+        }
+        return sign | out;
+    }
+    let mut bits = sign | ((half_exp as u16) << 10) | ((man >> 42) as u16);
+    let round_bit = 1u64 << 41;
+    if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
+        bits += 1;
+    }
+    bits
+}
+
+/// binary16 -> f32 (always exact).
+pub fn f16_bits_to_f32(i: u16) -> f32 {
+    let sign = ((i & 0x8000) as u32) << 16;
+    let exp = (i & 0x7C00) as u32;
+    let man = (i & 0x03FF) as u32;
+    if exp == 0x7C00 {
+        // inf / nan
+        return f32::from_bits(sign | 0x7F80_0000 | (man << 13));
+    }
+    if exp == 0 {
+        if man == 0 {
+            return f32::from_bits(sign);
+        }
+        // Subnormal: renormalise.
+        let mut m = man;
+        let mut e = 0u32;
+        while m & 0x0400 == 0 {
+            m <<= 1;
+            e += 1;
+        }
+        let exp32 = (127 - 15 - e) << 23;
+        return f32::from_bits(sign | exp32 | ((m & 0x03FF) << 13));
+    }
+    let exp32 = ((exp >> 10) + (127 - 15)) << 23;
+    f32::from_bits(sign | exp32 | (man << 13))
 }
 
 /// A Rust type that can live inside an `NdArray` buffer.
@@ -186,6 +337,19 @@ impl Element for NpBool {
     }
     fn to_scalar(self) -> Scalar {
         Scalar::Bool(self.get())
+    }
+}
+
+impl Element for F16 {
+    const DTYPE: DType = DType::F16;
+    fn from_scalar(s: Scalar) -> Self {
+        match s.cast(DType::F16) {
+            Scalar::Float(f) => F16::from_f64(f),
+            _ => unreachable!(),
+        }
+    }
+    fn to_scalar(self) -> Scalar {
+        Scalar::Float(self.to_f64())
     }
 }
 
@@ -284,6 +448,10 @@ macro_rules! dispatch_dtype {
                 type $T = u64;
                 $body
             }
+            $crate::dtype::DType::F16 => {
+                type $T = $crate::element::F16;
+                $body
+            }
             $crate::dtype::DType::F32 => {
                 type $T = f32;
                 $body
@@ -300,6 +468,9 @@ macro_rules! dispatch_dtype {
                 type $T = $crate::element::C64v;
                 $body
             }
+            // Unreachable: every caller guards on `DType::is_numeric` first,
+            // because flexible dtypes have no scalar element type.
+            other => panic!("dispatch_dtype: {other:?} is not a numeric dtype"),
         }
     };
 }

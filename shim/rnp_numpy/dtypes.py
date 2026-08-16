@@ -32,6 +32,7 @@ _CLASS_NAMES = {
     "int32": "Int32DType", "int64": "Int64DType",
     "uint8": "UInt8DType", "uint16": "UInt16DType",
     "uint32": "UInt32DType", "uint64": "UInt64DType",
+    "float16": "Float16DType",
     "float32": "Float32DType", "float64": "Float64DType",
     "complex64": "Complex64DType", "complex128": "Complex128DType",
 }
@@ -50,3 +51,9 @@ UShortDType = UInt16DType  # noqa: F821
 UIntDType = UInt32DType  # noqa: F821
 ULongDType = UInt64DType  # noqa: F821
 ULongLongDType = UInt64DType  # noqa: F821
+HalfDType = Float16DType  # noqa: F821
+
+# The flexible dtypes are parameterised, so their classes take a size.
+_make("BytesDType", dtype("S"))
+_make("StrDType", dtype("U"))
+_make("VoidDType", dtype("V"))

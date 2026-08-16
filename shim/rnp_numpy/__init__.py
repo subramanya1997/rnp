@@ -10,10 +10,16 @@ import builtins as _builtins
 
 from _rnp import (
     add,
+    amax,
+    amin,
     arange,
+    argmax,
+    argmin,
     array,
     asarray,
     broadcast_shapes,
+    can_cast,
+    common_type,
     divide,
     dtype,
     empty,
@@ -23,18 +29,23 @@ from _rnp import (
     greater_equal,
     less,
     less_equal,
+    mean,
+    min_scalar_type,
     multiply,
     ndarray,
     not_equal,
     ones,
+    prod,
     promote_types,
     result_type,
     shape,
     subtract,
+    sum,
     true_divide,
     zeros,
 )
 from _rnp import _dtype_table as _dtype_table
+import _rnp
 
 from . import exceptions
 from .exceptions import AxisError, ComplexWarning, DTypePromotionError, VisibleDeprecationWarning
@@ -142,6 +153,7 @@ uint8 = _make_scalar_type("uint8", _DTYPES["uint8"], unsignedinteger)
 uint16 = _make_scalar_type("uint16", _DTYPES["uint16"], unsignedinteger)
 uint32 = _make_scalar_type("uint32", _DTYPES["uint32"], unsignedinteger)
 uint64 = _make_scalar_type("uint64", _DTYPES["uint64"], unsignedinteger)
+float16 = _make_scalar_type("float16", _DTYPES["float16"], floating)
 float32 = _make_scalar_type("float32", _DTYPES["float32"], floating)
 float64 = _make_scalar_type("float64", _DTYPES["float64"], floating)
 complex64 = _make_scalar_type("complex64", _DTYPES["complex64"], complexfloating)
@@ -162,6 +174,7 @@ uint = uint64
 ulong = uint64
 ulonglong = uint64
 uintp = uint64
+half = float16
 single = float32
 double = float64
 float_ = float64
@@ -186,24 +199,96 @@ def _unsupported_scalar_type(name, base=generic):
     return _ScalarMeta(name, (base,), {"__new__": __new__})
 
 
-str_ = _unsupported_scalar_type("str_", character)
+# The flexible scalar types exist as dtype *descriptors* (M1); their scalar
+# behaviour (indexing an array of them returns a plain str/bytes for now)
+# arrives with the real scalar hierarchy.
+str_ = _make_scalar_type("str_", dtype("U"), character)
 unicode_ = str_
-bytes_ = _unsupported_scalar_type("bytes_", character)
-void = _unsupported_scalar_type("void", flexible)
+bytes_ = _make_scalar_type("bytes_", dtype("S"), character)
+void = _make_scalar_type("void", dtype("V"), flexible)
 object_ = _unsupported_scalar_type("object_")
 datetime64 = _unsupported_scalar_type("datetime64")
 timedelta64 = _unsupported_scalar_type("timedelta64", signedinteger)
-float16 = _unsupported_scalar_type("float16", floating)
-half = float16
-longdouble = _unsupported_scalar_type("longdouble", floating)
-clongdouble = _unsupported_scalar_type("clongdouble", complexfloating)
+# On this platform (macOS/arm64) numpy's long double *is* an IEEE double; it
+# keeps a distinct type number (13) that the port does not model yet, so the
+# aliases below behave like float64/complex128.
+longdouble = _make_scalar_type("longdouble", _DTYPES["float64"], floating)
+clongdouble = _make_scalar_type("clongdouble", _DTYPES["complex128"], complexfloating)
 longfloat = longdouble
 clongfloat = clongdouble
 
 sctypeDict = {t.__name__: t for t in (
     bool_, int8, int16, int32, int64, uint8, uint16, uint32, uint64,
-    float32, float64, complex64, complex128,
+    float16, float32, float64, complex64, complex128,
 )}
+
+
+_rnp._register_scalar_types({
+    **{t.__name__: t for t in (
+        bool_, int8, int16, int32, int64, uint8, uint16, uint32, uint64,
+        float16, float32, float64, complex64, complex128,
+    )},
+    "str_": str_, "bytes_": bytes_, "void": void,
+})
+
+sctypeDict.update({d.char: t for d, t in
+                   ((t.dtype, t) for t in sctypeDict.values())})
+
+ScalarType = (int, float, complex, _builtins.bool, bytes, str, memoryview)
+
+# numpy's typecode groups, minus the codes the port has no dtype for yet
+# (longdouble 'g'/'G', object 'O', datetime 'M'/'m').
+typecodes = {
+    'Character': 'c',
+    'Integer': 'bhilqnp',
+    'UnsignedInteger': 'BHILQNP',
+    'Float': 'efd',
+    'Complex': 'FD',
+    'AllInteger': 'bBhHiIlLqQnNpP',
+    'AllFloat': 'efdFD',
+    'Datetime': '',
+    'All': '?bhilqnpBHILQNPefdFDSUV',
+}
+
+
+def issubdtype(arg1, arg2):
+    """numpy's `issubdtype`, over the abstract scalar hierarchy above."""
+    if not isinstance(arg1, type) or not issubclass(arg1, generic):
+        arg1 = dtype(arg1).type
+    if not isinstance(arg2, type) or not issubclass(arg2, generic):
+        try:
+            arg2 = dtype(arg2).type
+        except Exception:  # noqa: BLE001
+            pass
+    return issubclass(arg1, arg2)
+
+
+def isdtype(dtype_, kind):
+    """Array-API `isdtype`."""
+    d = dtype(dtype_)
+    kinds = kind if isinstance(kind, tuple) else (kind,)
+    groups = {
+        "bool": lambda x: x.kind == "b",
+        "signed integer": lambda x: x.kind == "i",
+        "unsigned integer": lambda x: x.kind == "u",
+        "integral": lambda x: x.kind in "iu",
+        "real floating": lambda x: x.kind == "f",
+        "complex floating": lambda x: x.kind == "c",
+        "numeric": lambda x: x.kind in "biufc",
+    }
+    for k in kinds:
+        if isinstance(k, str):
+            if k not in groups:
+                raise ValueError(f"unsupported kind: {k!r}")
+            if groups[k](d):
+                return True
+        elif dtype(k) == d:
+            return True
+    return False
+
+
+def result_type_(*args):
+    return result_type(*args)
 
 
 # --------------------------------------------------------------------------
@@ -311,48 +396,24 @@ def _flat_values(a):
     return out
 
 
-def sum(a, axis=None, dtype=None):
-    """Whole-array sum only. Axis-wise reductions arrive in M4."""
-    if axis is not None:
-        raise NotImplementedError("axis= reductions are not implemented yet")
-    return _builtins.sum(_flat_values(a))
-
-
-def prod(a, axis=None):
-    if axis is not None:
-        raise NotImplementedError("axis= reductions are not implemented yet")
-    acc = 1
-    for v in _flat_values(a):
-        acc *= v
-    return acc
-
-
-def max(a, axis=None):
-    if axis is not None:
-        raise NotImplementedError("axis= reductions are not implemented yet")
-    return _builtins.max(_flat_values(a))
-
-
-def min(a, axis=None):
-    if axis is not None:
-        raise NotImplementedError("axis= reductions are not implemented yet")
-    return _builtins.min(_flat_values(a))
-
-
-amax = max
-amin = min
+# `sum`, `prod`, `mean`, `amin`/`amax`, `argmin`/`argmax` are native Rust
+# reductions imported from `_rnp` at the top of this module. numpy also
+# exposes the builtins-shadowing aliases:
+max = amax
+min = amin
 
 
 def all(a, axis=None):
     if axis is not None:
-        raise NotImplementedError("axis= reductions are not implemented yet")
+        raise NotImplementedError("axis= reductions of all() are not implemented yet")
     return _builtins.all(_flat_values(a))
 
 
 def any(a, axis=None):
     if axis is not None:
-        raise NotImplementedError("axis= reductions are not implemented yet")
+        raise NotImplementedError("axis= reductions of any() are not implemented yet")
     return _builtins.any(_flat_values(a))
+
 
 
 def array_equal(a1, a2):
@@ -362,13 +423,14 @@ def array_equal(a1, a2):
     return _builtins.all(_flat_values(equal(a1, a2)))
 
 
+def nextafter(x, y):
+    """Scalar-only `nextafter`; the ufunc version lands with M3."""
+    import math
+    return math.nextafter(_builtins.float(x), _builtins.float(y))
+
+
 def isscalar(x):
     return isinstance(x, (int, float, complex, str, bytes, _builtins.bool))
-
-
-def can_cast(from_, to, casting="safe"):
-    # Placeholder until the real casting table lands in M1.
-    return dtype(to) == promote_types(from_, to)
 
 
 class iinfo:
@@ -399,6 +461,10 @@ class finfo:
     """Machine limits for floating point dtypes."""
 
     _PARAMS = {
+        "float16": dict(bits=16, eps=0.000977, max=65500.0, min=-65500.0,
+                        tiny=6.104e-05, nmant=10, nexp=5, precision=3,
+                        resolution=0.001, epsneg=0.0004885, iexp=5,
+                        machep=-10, negep=-11, maxexp=16, minexp=-14),
         "float32": dict(bits=32, eps=1.1920929e-07, max=3.4028235e+38,
                         min=-3.4028235e+38, tiny=1.1754944e-38, nmant=23,
                         nexp=8, precision=6, resolution=1e-06,
@@ -423,7 +489,9 @@ class finfo:
         for k, v in self._PARAMS[d.name].items():
             setattr(self, k, v)
         self.smallest_normal = self.tiny
-        self.smallest_subnormal = 1e-45 if d.name == "float32" else 5e-324
+        self.smallest_subnormal = {
+            "float16": 6e-08, "float32": 1e-45, "float64": 5e-324,
+        }[d.name]
 
     def __repr__(self):
         return f"finfo(resolution={self.resolution}, dtype={self.dtype.name})"

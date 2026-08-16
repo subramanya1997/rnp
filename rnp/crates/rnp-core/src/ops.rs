@@ -2,7 +2,7 @@
 
 use crate::array::NdArray;
 use crate::dtype::{promote, promote_for_division, DType};
-use crate::element::{Element, NpBool, C32, C64v};
+use crate::element::{Element, NpBool, C32, C64v, F16};
 use crate::error::{Error, Result};
 use crate::iter::{broadcast_shapes, broadcast_to, offsets};
 
@@ -99,6 +99,42 @@ macro_rules! impl_float_ops {
 
 impl_float_ops!(f32, f64);
 
+// numpy performs every half-precision operation in `float` and converts the
+// result back (`npy_half_add` etc. in `halffloat.c`).
+impl Arith for F16 {
+    #[inline]
+    fn a_add(self, o: Self) -> Self {
+        F16::from_f32(self.to_f32() + o.to_f32())
+    }
+    #[inline]
+    fn a_sub(self, o: Self) -> Self {
+        F16::from_f32(self.to_f32() - o.to_f32())
+    }
+    #[inline]
+    fn a_mul(self, o: Self) -> Self {
+        F16::from_f32(self.to_f32() * o.to_f32())
+    }
+    #[inline]
+    fn a_div(self, o: Self) -> Self {
+        F16::from_f32(self.to_f32() / o.to_f32())
+    }
+}
+
+impl Cmp for F16 {
+    #[inline]
+    fn c_eq(self, o: Self) -> bool {
+        self.to_f32() == o.to_f32()
+    }
+    #[inline]
+    fn c_lt(self, o: Self) -> bool {
+        self.to_f32() < o.to_f32()
+    }
+    #[inline]
+    fn c_le(self, o: Self) -> bool {
+        self.to_f32() <= o.to_f32()
+    }
+}
+
 /// Smith's algorithm, transcribed from numpy's `@TYPE@_divide` inner loop in
 /// `umath/loops.c.src`.
 ///
@@ -136,7 +172,17 @@ macro_rules! impl_complex_ops {
         impl Arith for $t {
             #[inline] fn a_add(self, o: Self) -> Self { self + o }
             #[inline] fn a_sub(self, o: Self) -> Self { self - o }
-            #[inline] fn a_mul(self, o: Self) -> Self { self * o }
+            // numpy's `@TYPE@_multiply` inner loop is
+            //   out.re = a.re*b.re - a.im*b.im;
+            //   out.im = a.re*b.im + a.im*b.re;
+            // which clang contracts into an FMA per statement on aarch64.
+            // Plain `*` on num_complex rounds twice and differs by an ULP.
+            #[inline] fn a_mul(self, o: Self) -> Self {
+                <$t>::new(
+                    self.re.mul_add(o.re, -(self.im * o.im)),
+                    self.re.mul_add(o.im, self.im * o.re),
+                )
+            }
             complex_div!($t, $f);
         }
         // numpy orders complex lexicographically: real part first, then imag.
@@ -190,6 +236,74 @@ impl Cmp for NpBool {
     }
 }
 
+/// Comparisons between flexible (`S`/`U`) arrays.
+///
+/// Only the comparison ufuncs are defined for strings at M1; arithmetic on
+/// them is a later milestone. Both operands are promoted to the wider width
+/// of the same kind and compared on their *logical* value, i.e. with the
+/// trailing NUL padding numpy uses stripped off.
+pub fn binary_flexible(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
+    if !op.is_comparison() {
+        return Err(Error::NotImplemented(format!(
+            "ufunc '{}' is not supported for dtypes ({}, {})",
+            op.name(),
+            a.dtype,
+            b.dtype
+        )));
+    }
+    let same_kind = a.dtype.category() == b.dtype.category();
+    if !same_kind || !matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+    {
+        return Err(Error::NotImplemented(format!(
+            "comparing {} with {} is not implemented yet",
+            a.dtype, b.dtype
+        )));
+    }
+    let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
+    let av = broadcast_to(a, &out_shape)?;
+    let bv = broadcast_to(b, &out_shape)?;
+    let out = NdArray::empty(out_shape, DType::Bool)?;
+
+    let a_offs: Vec<isize> = offsets(&av.shape, &av.strides, av.byte_offset).collect();
+    let b_offs: Vec<isize> = offsets(&bv.shape, &bv.strides, bv.byte_offset).collect();
+    let o_offs: Vec<isize> = offsets(&out.shape, &out.strides, out.byte_offset).collect();
+
+    for k in 0..o_offs.len() {
+        let x = logical_bytes(&av, a_offs[k]);
+        let y = logical_bytes(&bv, b_offs[k]);
+        let ord = x.cmp(&y);
+        let r = match op {
+            BinOp::Eq => ord.is_eq(),
+            BinOp::Ne => ord.is_ne(),
+            BinOp::Lt => ord.is_lt(),
+            BinOp::Le => ord.is_le(),
+            BinOp::Gt => ord.is_gt(),
+            _ => ord.is_ge(),
+        };
+        out.write_at(o_offs[k], crate::element::Scalar::Bool(r));
+    }
+    Ok(out)
+}
+
+/// An element's code units with numpy's trailing-NUL padding removed, so
+/// that `S3` `b"ab\0"` equals `S5` `b"ab\0\0\0"`. `U` elements are decoded
+/// from UCS4 so that ordering compares code points, not their little-endian
+/// bytes.
+fn logical_bytes(arr: &NdArray, off: isize) -> Vec<u32> {
+    let raw = arr.raw_bytes_at(off);
+    let mut v: Vec<u32> = match arr.dtype {
+        DType::Str(_) => raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        _ => raw.iter().map(|&b| b as u32).collect(),
+    };
+    while v.last() == Some(&0) {
+        v.pop();
+    }
+    v
+}
+
 /// The dtype the inner loop runs in, and the dtype of the result.
 pub fn result_dtypes(a: DType, b: DType, op: BinOp) -> Result<(DType, DType)> {
     if op.is_comparison() {
@@ -214,6 +328,9 @@ pub fn result_dtypes(a: DType, b: DType, op: BinOp) -> Result<(DType, DType)> {
 
 /// Element-wise binary op with numpy broadcasting + promotion.
 pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
+    if a.dtype.is_flexible() || b.dtype.is_flexible() {
+        return binary_flexible(a, b, op);
+    }
     let (compute, out_dtype) = result_dtypes(a.dtype, b.dtype, op)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
 

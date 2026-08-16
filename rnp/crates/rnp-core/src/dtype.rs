@@ -1,12 +1,23 @@
 //! NumPy-compatible dtype descriptors and NEP 50 type promotion.
 //!
 //! Every fact encoded here (kind chars, type numbers, `str` codes, and the
-//! full 13x13 promotion table) was probed directly from real numpy 2.5.2 in
+//! full 14x14 promotion table) was probed directly from real numpy 2.5.2 in
 //! `.venv`; see the tests at the bottom of this file for the verbatim table.
+//!
+//! `DType` is the *storage* type of an array element. It stays `Copy` even
+//! for the compound kinds: flexible types carry their size inline, and
+//! structured / subarray types carry an id into the interning registry in
+//! [`crate::descr`], which hands out one id per structurally distinct
+//! definition (so `==` on ids is structural equality, as numpy requires).
+//!
+//! Byte order is *not* part of `DType`; it lives in [`crate::descr::Descr`],
+//! which is what the Python-facing `np.dtype` object is built from.
 
 use std::fmt;
 
-/// The 13 base dtypes supported at M0.
+use crate::descr::registry;
+
+/// The dtype of one array element.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum DType {
     Bool,
@@ -18,23 +29,41 @@ pub enum DType {
     U16,
     U32,
     U64,
+    F16,
     F32,
     F64,
     C64,
     C128,
+    /// `S<n>` — n bytes of zero-padded bytes. `n == 0` is numpy's unsized `S`.
+    Bytes(u32),
+    /// `U<n>` — n UCS4 code points, so `4 * n` bytes.
+    Str(u32),
+    /// `V<n>` — n raw bytes with no interpretation.
+    Void(u32),
+    /// A structured dtype; the payload indexes the struct registry.
+    Struct(u32),
+    /// A subarray dtype (`('f4', (2, 2))`); indexes the subarray registry.
+    SubArray(u32),
 }
 
 /// Broad category of a dtype, used by the promotion lattice.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Bool,
     Int,
     Uint,
     Float,
     Complex,
+    /// `S`
+    Bytes,
+    /// `U`
+    Str,
+    /// `V`, including structured and subarray dtypes.
+    Void,
 }
 
-pub const ALL_DTYPES: [DType; 13] = [
+/// The numeric dtypes, in numpy's own ordering.
+pub const ALL_DTYPES: [DType; 14] = [
     DType::Bool,
     DType::I8,
     DType::I16,
@@ -44,6 +73,7 @@ pub const ALL_DTYPES: [DType; 13] = [
     DType::U16,
     DType::U32,
     DType::U64,
+    DType::F16,
     DType::F32,
     DType::F64,
     DType::C64,
@@ -55,10 +85,17 @@ impl DType {
     pub fn itemsize(self) -> usize {
         match self {
             DType::Bool | DType::I8 | DType::U8 => 1,
-            DType::I16 | DType::U16 => 2,
+            DType::I16 | DType::U16 | DType::F16 => 2,
             DType::I32 | DType::U32 | DType::F32 => 4,
             DType::I64 | DType::U64 | DType::F64 | DType::C64 => 8,
             DType::C128 => 16,
+            DType::Bytes(n) | DType::Void(n) => n as usize,
+            DType::Str(n) => 4 * n as usize,
+            DType::Struct(id) => registry::struct_def(id).itemsize,
+            DType::SubArray(id) => {
+                let d = registry::subarray_def(id);
+                d.base.itemsize() * crate::array::shape_size(&d.shape)
+            }
         }
     }
 
@@ -67,6 +104,10 @@ impl DType {
         match self {
             DType::C64 => 4,
             DType::C128 => 8,
+            DType::Bytes(_) | DType::Void(_) => 1,
+            DType::Str(_) => 4,
+            DType::Struct(id) => registry::struct_def(id).alignment,
+            DType::SubArray(id) => registry::subarray_def(id).base.alignment(),
             other => other.itemsize(),
         }
     }
@@ -76,8 +117,11 @@ impl DType {
             DType::Bool => Kind::Bool,
             DType::I8 | DType::I16 | DType::I32 | DType::I64 => Kind::Int,
             DType::U8 | DType::U16 | DType::U32 | DType::U64 => Kind::Uint,
-            DType::F32 | DType::F64 => Kind::Float,
+            DType::F16 | DType::F32 | DType::F64 => Kind::Float,
             DType::C64 | DType::C128 => Kind::Complex,
+            DType::Bytes(_) => Kind::Bytes,
+            DType::Str(_) => Kind::Str,
+            DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => Kind::Void,
         }
     }
 
@@ -89,6 +133,9 @@ impl DType {
             Kind::Uint => 'u',
             Kind::Float => 'f',
             Kind::Complex => 'c',
+            Kind::Bytes => 'S',
+            Kind::Str => 'U',
+            Kind::Void => 'V',
         }
     }
 
@@ -104,16 +151,20 @@ impl DType {
             DType::U16 => 'H',
             DType::U32 => 'I',
             DType::U64 => 'L',
+            DType::F16 => 'e',
             DType::F32 => 'f',
             DType::F64 => 'd',
             DType::C64 => 'F',
             DType::C128 => 'D',
+            DType::Bytes(_) => 'S',
+            DType::Str(_) => 'U',
+            DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 'V',
         }
     }
 
-    /// numpy's `dtype.name`.
-    pub fn name(self) -> &'static str {
-        match self {
+    /// The `&'static str` name for the numeric dtypes; `None` otherwise.
+    pub fn numeric_name(self) -> Option<&'static str> {
+        Some(match self {
             DType::Bool => "bool",
             DType::I8 => "int8",
             DType::I16 => "int16",
@@ -123,10 +174,31 @@ impl DType {
             DType::U16 => "uint16",
             DType::U32 => "uint32",
             DType::U64 => "uint64",
+            DType::F16 => "float16",
             DType::F32 => "float32",
             DType::F64 => "float64",
             DType::C64 => "complex64",
             DType::C128 => "complex128",
+            _ => return None,
+        })
+    }
+
+    /// numpy's `dtype.name`. Flexible dtypes get a bit-width suffix
+    /// (`bytes40`, `str96`, `void128`), unsized ones just the stem.
+    pub fn name(self) -> String {
+        if let Some(n) = self.numeric_name() {
+            return n.to_string();
+        }
+        let stem = match self.category() {
+            Kind::Bytes => "bytes",
+            Kind::Str => "str",
+            _ => "void",
+        };
+        let bits = self.itemsize() * 8;
+        if bits == 0 {
+            stem.to_string()
+        } else {
+            format!("{}{}", stem, bits)
         }
     }
 
@@ -142,31 +214,48 @@ impl DType {
             DType::U32 => 6,
             DType::I64 => 7,
             DType::U64 => 8,
+            DType::F16 => 23,
             DType::F32 => 11,
             DType::F64 => 12,
             DType::C64 => 14,
             DType::C128 => 15,
+            DType::Bytes(_) => 18,
+            DType::Str(_) => 19,
+            DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 20,
         }
     }
 
-    /// numpy's `dtype.byteorder`: `|` for single-byte types, `=` otherwise.
-    pub fn byteorder(self) -> char {
-        if self.itemsize() == 1 {
-            '|'
-        } else {
-            '='
+    /// True for the 14 dtypes that have a Rust element type behind them.
+    pub fn is_numeric(self) -> bool {
+        self.numeric_name().is_some()
+    }
+
+    /// True when byte order is meaningful for this dtype (numpy's `|` vs
+    /// `<`/`>`/`=` distinction).
+    pub fn byteorder_matters(self) -> bool {
+        match self {
+            DType::Str(_) => true,
+            DType::Bytes(_) | DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => false,
+            other => other.itemsize() > 1,
         }
     }
 
-    /// numpy's `dtype.str`, e.g. `<i8`. Single-byte types use `|`.
-    pub fn str_code(self) -> String {
-        let prefix = if self.itemsize() == 1 { '|' } else { '<' };
-        let kind = if self.category() == Kind::Bool {
+    /// The letter used in `dtype.str` (bool prints as `b`, not `?`).
+    pub fn str_kind(self) -> char {
+        if self.category() == Kind::Bool {
             'b'
         } else {
             self.kind()
-        };
-        format!("{}{}{}", prefix, kind, self.itemsize())
+        }
+    }
+
+    /// The size that appears in `dtype.str`: element count for `U`, bytes
+    /// otherwise.
+    pub fn str_size(self) -> usize {
+        match self {
+            DType::Str(n) => n as usize,
+            other => other.itemsize(),
+        }
     }
 
     /// The struct-module format character used by the buffer protocol.
@@ -181,10 +270,13 @@ impl DType {
             DType::U16 => "H",
             DType::U32 => "I",
             DType::U64 => "Q",
+            // Python's struct module has no half; expose the raw bytes.
+            DType::F16 => "e",
             DType::F32 => "f",
             DType::F64 => "d",
             DType::C64 => "Zf",
             DType::C128 => "Zd",
+            _ => "B",
         }
     }
 
@@ -206,6 +298,9 @@ impl DType {
     pub fn is_complex(self) -> bool {
         self.category() == Kind::Complex
     }
+    pub fn is_flexible(self) -> bool {
+        matches!(self.category(), Kind::Bytes | Kind::Str | Kind::Void)
+    }
     /// True for bool and all integer types (the "not inexact" set).
     pub fn is_exact(self) -> bool {
         matches!(self.category(), Kind::Bool | Kind::Int | Kind::Uint)
@@ -220,59 +315,45 @@ impl DType {
         }
     }
 
-    /// Parse the dtype spellings numpy accepts for these 13 types:
-    /// names (`"int64"`), char codes (`"l"`, `"?"`), sized codes (`"i8"`),
-    /// byte-order-prefixed codes (`"<f8"`, `"=i4"`, `"|b1"`), and the
-    /// platform aliases (`"int"`, `"float"`, `"double"`, ...).
+    /// Parse a dtype spelling that carries no byte-order information beyond
+    /// what [`crate::descr::Descr::parse`] would strip. Kept for the many
+    /// call sites (and tests) that only care about the storage type.
     pub fn from_str(s: &str) -> Option<DType> {
-        let s = s.trim();
-        // Long/alias names first.
-        let by_name = match s {
-            "bool" | "bool_" | "?" | "b1" | "|b1" | "<b1" | ">b1" | "=b1" => Some(DType::Bool),
-            "int8" | "byte" | "b" | "i1" => Some(DType::I8),
-            "int16" | "short" | "h" | "i2" => Some(DType::I16),
-            "int32" | "intc" | "i" | "i4" => Some(DType::I32),
-            "int64" | "int" | "int_" | "long" | "longlong" | "intp" | "l" | "q" | "p" | "i8" => {
-                Some(DType::I64)
-            }
-            "uint8" | "ubyte" | "B" | "u1" => Some(DType::U8),
-            "uint16" | "ushort" | "H" | "u2" => Some(DType::U16),
-            "uint32" | "uintc" | "I" | "u4" => Some(DType::U32),
-            "uint64" | "uint" | "ulong" | "ulonglong" | "uintp" | "L" | "Q" | "P" | "u8" => {
-                Some(DType::U64)
-            }
-            "float32" | "single" | "f" | "f4" => Some(DType::F32),
-            "float64" | "double" | "float" | "float_" | "d" | "f8" => Some(DType::F64),
-            "complex64" | "csingle" | "F" | "c8" => Some(DType::C64),
-            "complex128" | "cdouble" | "complex" | "complex_" | "D" | "c16" => Some(DType::C128),
-            _ => None,
-        };
-        if by_name.is_some() {
-            return by_name;
-        }
-        // Byte-order prefix + code, e.g. "<f8", ">i4", "=u2", "|i1".
-        let mut chars = s.chars();
-        match chars.next() {
-            Some('<') | Some('>') | Some('=') | Some('|') => {
-                let rest: String = chars.collect();
-                // Only native / byte-order-agnostic layouts are supported at M0.
-                if s.starts_with('>') && rest != "b1" && rest.len() > 1 && &rest[1..] != "1" {
-                    return None;
-                }
-                DType::from_str(&rest)
-            }
-            _ => None,
-        }
+        crate::descr::Descr::parse(s).map(|d| d.dt)
+    }
+
+    /// The single-character/short code names numpy accepts for the numeric
+    /// dtypes, e.g. `"int64"`, `"l"`, `"i8"`, `"double"`.
+    pub(crate) fn from_plain_name(s: &str) -> Option<DType> {
+        Some(match s {
+            "bool" | "bool_" | "?" | "b1" => DType::Bool,
+            "int8" | "byte" | "b" | "i1" => DType::I8,
+            "int16" | "short" | "h" | "i2" => DType::I16,
+            "int32" | "intc" | "i" | "i4" => DType::I32,
+            "int64" | "int" | "int_" | "long" | "longlong" | "intp" | "l" | "q" | "p" | "n"
+            | "i8" => DType::I64,
+            "uint8" | "ubyte" | "B" | "u1" => DType::U8,
+            "uint16" | "ushort" | "H" | "u2" => DType::U16,
+            "uint32" | "uintc" | "I" | "u4" => DType::U32,
+            "uint64" | "uint" | "ulong" | "ulonglong" | "uintp" | "L" | "Q" | "P" | "N"
+            | "u8" => DType::U64,
+            "float16" | "half" | "e" | "f2" => DType::F16,
+            "float32" | "single" | "f" | "f4" => DType::F32,
+            "float64" | "double" | "float" | "float_" | "d" | "f8" => DType::F64,
+            "complex64" | "csingle" | "F" | "c8" => DType::C64,
+            "complex128" | "cdouble" | "complex" | "complex_" | "D" | "c16" => DType::C128,
+            _ => return None,
+        })
     }
 }
 
 impl fmt::Display for DType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(&self.name())
     }
 }
 
-/// NEP 50 / numpy 2.x `promote_types` for the 13 base dtypes.
+/// NEP 50 / numpy 2.x `promote_types` for the numeric dtypes.
 ///
 /// The rule set, derived from and verified against the full numpy table:
 ///  * `bool` is the identity element.
@@ -281,12 +362,19 @@ impl fmt::Display for DType {
 ///    operand (`int8 + uint16 -> int32`); `uint64` cannot fit in any signed
 ///    type, so `int* + uint64 -> float64`.
 ///  * anything inexact promotes to a float/complex whose *component* is wide
-///    enough: integers of <= 2 bytes fit in `float32`, wider ones need
-///    `float64`. Complex-ness is sticky.
+///    enough to hold the other operand: a 1-byte integer fits in `float16`,
+///    a 2-byte one in `float32`, anything wider needs `float64`. Complex-ness
+///    is sticky.
 pub fn promote(a: DType, b: DType) -> DType {
     use Kind::*;
     if a == b {
         return a;
+    }
+    // Flexible promotion is only defined for identical kinds; the widest
+    // width wins. (numpy raises for e.g. int + str, which the callers turn
+    // into a DTypePromotionError.)
+    if a.is_flexible() || b.is_flexible() {
+        return promote_flexible(a, b).unwrap_or(DType::Void(0));
     }
     let (ka, kb) = (a.category(), b.category());
     if ka == Bool {
@@ -325,15 +413,38 @@ pub fn promote(a: DType, b: DType) -> DType {
                 component = component.max(d.component_size());
             }
             Float => component = component.max(d.itemsize()),
-            // Integers of 1-2 bytes are exactly representable in float32.
-            _ => component = component.max(if d.itemsize() <= 2 { 4 } else { 8 }),
+            // The smallest float that represents every value of the integer
+            // type exactly: 1 byte -> float16, 2 bytes -> float32, else f64.
+            _ => {
+                component = component.max(match d.itemsize() {
+                    1 => 2,
+                    2 => 4,
+                    _ => 8,
+                })
+            }
         }
     }
     match (complex, component) {
+        (false, 2) => DType::F16,
         (false, 4) => DType::F32,
         (false, _) => DType::F64,
-        (true, 4) => DType::C64,
+        // There is no complex32, so a half component still needs complex64.
+        (true, 2) | (true, 4) => DType::C64,
         (true, _) => DType::C128,
+    }
+}
+
+/// `promote_types` where at least one side is flexible. `None` means numpy
+/// raises (no common type exists).
+pub fn promote_flexible(a: DType, b: DType) -> Option<DType> {
+    use DType::*;
+    match (a, b) {
+        (Bytes(n), Bytes(m)) => Some(Bytes(n.max(m))),
+        (Str(n), Str(m)) => Some(Str(n.max(m))),
+        (Void(n), Void(m)) if n == m => Some(Void(n)),
+        // numpy promotes bytes -> str by widening to the code-point count.
+        (Bytes(n), Str(m)) | (Str(m), Bytes(n)) => Some(Str(n.max(m))),
+        _ => None,
     }
 }
 
@@ -364,19 +475,16 @@ pub fn promote_for_division(a: DType, b: DType) -> DType {
 mod tests {
     use super::*;
 
-    /// The complete `numpy.promote_types` table for the 13 base dtypes,
+    /// The complete `numpy.promote_types` table for the numeric dtypes,
     /// generated from real numpy 2.5.2 (`.venv`) and pasted verbatim.
     const PROMOTION_TABLE: &[(DType, DType, DType)] = &include!("promotion_table.inc");
 
     #[test]
     fn promotion_matches_numpy_exactly() {
-        assert_eq!(PROMOTION_TABLE.len(), 169);
+        assert_eq!(PROMOTION_TABLE.len(), 196);
         for &(a, b, want) in PROMOTION_TABLE {
             let got = promote(a, b);
-            assert_eq!(
-                got, want,
-                "promote({a}, {b}) = {got}, numpy says {want}"
-            );
+            assert_eq!(got, want, "promote({a}, {b}) = {got}, numpy says {want}");
         }
     }
 
@@ -403,29 +511,48 @@ mod tests {
     #[test]
     fn dtype_metadata_matches_numpy() {
         // (name, num, kind, char, str, itemsize) probed from numpy 2.5.2.
-        let expect: &[(DType, &str, i32, char, char, &str, usize)] = &[
-            (DType::Bool, "bool", 0, 'b', '?', "|b1", 1),
-            (DType::I8, "int8", 1, 'i', 'b', "|i1", 1),
-            (DType::I16, "int16", 3, 'i', 'h', "<i2", 2),
-            (DType::I32, "int32", 5, 'i', 'i', "<i4", 4),
-            (DType::I64, "int64", 7, 'i', 'l', "<i8", 8),
-            (DType::U8, "uint8", 2, 'u', 'B', "|u1", 1),
-            (DType::U16, "uint16", 4, 'u', 'H', "<u2", 2),
-            (DType::U32, "uint32", 6, 'u', 'I', "<u4", 4),
-            (DType::U64, "uint64", 8, 'u', 'L', "<u8", 8),
-            (DType::F32, "float32", 11, 'f', 'f', "<f4", 4),
-            (DType::F64, "float64", 12, 'f', 'd', "<f8", 8),
-            (DType::C64, "complex64", 14, 'c', 'F', "<c8", 8),
-            (DType::C128, "complex128", 15, 'c', 'D', "<c16", 16),
+        let expect: &[(DType, &str, i32, char, char, usize)] = &[
+            (DType::Bool, "bool", 0, 'b', '?', 1),
+            (DType::I8, "int8", 1, 'i', 'b', 1),
+            (DType::I16, "int16", 3, 'i', 'h', 2),
+            (DType::I32, "int32", 5, 'i', 'i', 4),
+            (DType::I64, "int64", 7, 'i', 'l', 8),
+            (DType::U8, "uint8", 2, 'u', 'B', 1),
+            (DType::U16, "uint16", 4, 'u', 'H', 2),
+            (DType::U32, "uint32", 6, 'u', 'I', 4),
+            (DType::U64, "uint64", 8, 'u', 'L', 8),
+            (DType::F16, "float16", 23, 'f', 'e', 2),
+            (DType::F32, "float32", 11, 'f', 'f', 4),
+            (DType::F64, "float64", 12, 'f', 'd', 8),
+            (DType::C64, "complex64", 14, 'c', 'F', 8),
+            (DType::C128, "complex128", 15, 'c', 'D', 16),
         ];
-        for &(d, name, num, kind, ch, s, isz) in expect {
+        for &(d, name, num, kind, ch, isz) in expect {
             assert_eq!(d.name(), name);
             assert_eq!(d.num(), num);
             assert_eq!(d.kind(), kind);
             assert_eq!(d.char_code(), ch);
-            assert_eq!(d.str_code(), s);
             assert_eq!(d.itemsize(), isz);
         }
+    }
+
+    #[test]
+    fn flexible_metadata_matches_numpy() {
+        // np.dtype('S5'): itemsize 5, kind S, num 18, name bytes40
+        assert_eq!(DType::Bytes(5).itemsize(), 5);
+        assert_eq!(DType::Bytes(5).name(), "bytes40");
+        assert_eq!(DType::Bytes(0).name(), "bytes");
+        assert_eq!(DType::Bytes(5).num(), 18);
+        assert_eq!(DType::Bytes(5).alignment(), 1);
+        // np.dtype('U3'): itemsize 12, kind U, num 19, name str96
+        assert_eq!(DType::Str(3).itemsize(), 12);
+        assert_eq!(DType::Str(3).name(), "str96");
+        assert_eq!(DType::Str(3).num(), 19);
+        assert_eq!(DType::Str(3).alignment(), 4);
+        // np.dtype('V10'): itemsize 10, kind V, num 20, name void80
+        assert_eq!(DType::Void(10).itemsize(), 10);
+        assert_eq!(DType::Void(10).name(), "void80");
+        assert_eq!(DType::Void(10).num(), 20);
     }
 
     #[test]
@@ -439,12 +566,12 @@ mod tests {
         assert_eq!(DType::from_str("c16"), Some(DType::C128));
         assert_eq!(DType::from_str("uint8"), Some(DType::U8));
         assert_eq!(DType::from_str("=u2"), Some(DType::U16));
+        assert_eq!(DType::from_str("e"), Some(DType::F16));
         assert_eq!(DType::from_str("nonsense"), None);
         // Round-trip every dtype through its own spellings.
         for d in ALL_DTYPES {
-            assert_eq!(DType::from_str(d.name()), Some(d));
+            assert_eq!(DType::from_str(&d.name()), Some(d));
             assert_eq!(DType::from_str(&d.char_code().to_string()), Some(d));
-            assert_eq!(DType::from_str(&d.str_code()), Some(d));
         }
     }
 }

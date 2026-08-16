@@ -601,6 +601,31 @@ impl NdArray {
             .collect()
     }
 
+    /// The raw bytes of the element at `byte_off`.
+    ///
+    /// This is how flexible dtypes (`S`/`U`/`V` and structured records) are
+    /// read and written: they have no `Scalar` representation.
+    pub fn raw_bytes_at(&self, byte_off: isize) -> &[u8] {
+        // SAFETY: `byte_off` addresses one in-bounds element, so `itemsize`
+        // bytes from there lie inside the allocation, and the borrow is tied
+        // to `&self` which keeps the buffer alive.
+        unsafe {
+            std::slice::from_raw_parts(self.buffer.as_ptr().offset(byte_off), self.itemsize())
+        }
+    }
+
+    /// Write raw element bytes, zero-padding or truncating to `itemsize`.
+    pub fn write_raw_at(&self, byte_off: isize, src: &[u8]) {
+        let n = self.itemsize();
+        let k = src.len().min(n);
+        // SAFETY: as `raw_bytes_at`; the destination holds `itemsize` bytes.
+        unsafe {
+            let p = self.buffer.as_mut_ptr().offset(byte_off);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), p, k);
+            std::ptr::write_bytes(p.add(k), 0, n - k);
+        }
+    }
+
     /// Typed contiguous slice, if the array is C-contiguous and matches `T`.
     pub fn as_slice<T: Element>(&self) -> Option<&[T]> {
         if self.dtype != T::DTYPE || !self.flags.c_contiguous {

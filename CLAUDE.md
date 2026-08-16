@@ -18,6 +18,20 @@ unmodified test suite and benchmarked against real NumPy.
   results).
 - Never use Haiku.
 
+## Standing directives (from the user, 2026-08-16)
+
+- **Keep going.** When a milestone lands and is verified, immediately plan and
+  launch the next one. Do not stop to ask permission between milestones.
+- **Performance is a first-class goal.** Match or beat real NumPy on every
+  benchmark row. Use LTO + codegen-units=1, SIMD-friendly inner loops, and
+  rayon parallelism above a size threshold (numpy is single-threaded for
+  elementwise/reductions — beating it there is expected, not aspirational).
+  Bit-exact crosscheck (0 divergences) is the gate before any optimization
+  counts. Scalability (large arrays, multi-core) matters.
+- **Validation is against NumPy's actual GitHub test suite** (`upstream/`,
+  tag v2.5.2), run unmodified. Every milestone ends with a full-suite
+  scoreboard run (`harness/run.py --all`), not just the targeted files.
+
 ## Hard rules
 
 - **`upstream/` is read-only. Never edit anything under `upstream/`, especially

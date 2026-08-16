@@ -4,7 +4,9 @@ use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyTypeError, PyValue
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use rnp_core::{BinOp, DType, NdArray, Scalar};
+use rnp_core::casting::{Casting, TypeArg, WeakKind};
+use rnp_core::reduce::ReduceOp;
+use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod convert;
 mod pyarray;
@@ -12,7 +14,7 @@ mod pydtype;
 
 use convert::{array_from_any, scalar_from_py};
 use pyarray::{dtype_or_default, shape_from_any, ufunc2, PyNdArray};
-use pydtype::{dtype_from_any, PyDType};
+use pydtype::{descr_from_any, dtype_from_any, PyDType};
 
 /// Map a core error onto the Python exception numpy would raise.
 pub(crate) fn err(e: rnp_core::Error) -> PyErr {
@@ -20,6 +22,10 @@ pub(crate) fn err(e: rnp_core::Error) -> PyErr {
         rnp_core::Error::ValueError(m) => PyValueError::new_err(m),
         rnp_core::Error::TypeError(m) => PyTypeError::new_err(m),
         rnp_core::Error::IndexError(m) => PyIndexError::new_err(m),
+        // The shim re-raises these as np.exceptions.AxisError /
+        // DTypePromotionError, both of which numpy derives from ValueError.
+        rnp_core::Error::AxisError(m) => PyValueError::new_err(m),
+        rnp_core::Error::DTypePromotionError(m) => PyValueError::new_err(m),
         rnp_core::Error::NotImplemented(m) => PyNotImplementedError::new_err(m),
     }
 }
@@ -196,11 +202,101 @@ binary_ufunc!(greater_equal, BinOp::Ge);
 
 #[pyfunction]
 fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDType> {
-    Ok(PyDType::new(rnp_core::promote(
-        dtype_from_any(a)?,
-        dtype_from_any(b)?,
-    )))
+    let (da, db) = (descr_from_any(a)?, descr_from_any(b)?);
+    if da.dt.is_flexible() || db.dt.is_flexible() {
+        let p = rnp_core::dtype::promote_flexible(da.dt, db.dt).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "The DType {} could not be promoted by {}.",
+                da.str_code(),
+                db.str_code()
+            ))
+        })?;
+        return Ok(PyDType::from_descr(Descr::native(p)));
+    }
+    Ok(PyDType::new(rnp_core::promote(da.dt, db.dt)))
 }
+
+/// Classify one `result_type` argument under NEP 50.
+fn type_arg(a: &Bound<'_, PyAny>) -> PyResult<TypeArg> {
+    if let Ok(arr) = a.cast::<PyNdArray>() {
+        return Ok(TypeArg::Concrete(arr.borrow().arr.dtype));
+    }
+    // A bare Python number is *weak*: it contributes its kind, not its value.
+    if a.is_instance_of::<pyo3::types::PyBool>() {
+        return Ok(TypeArg::Weak(WeakKind::Bool));
+    }
+    if a.is_instance_of::<pyo3::types::PyInt>() {
+        return Ok(TypeArg::Weak(WeakKind::Int));
+    }
+    if a.is_instance_of::<pyo3::types::PyFloat>() {
+        return Ok(TypeArg::Weak(WeakKind::Float));
+    }
+    if a.is_instance_of::<pyo3::types::PyComplex>() {
+        return Ok(TypeArg::Weak(WeakKind::Complex));
+    }
+    Ok(TypeArg::Concrete(dtype_from_any(a)?))
+}
+
+#[pyfunction]
+#[pyo3(signature = (from_, to, casting = "safe"))]
+fn can_cast(from_: &Bound<'_, PyAny>, to: &Bound<'_, PyAny>, casting: &str) -> PyResult<bool> {
+    // numpy 2.x removed the value-based path, and says so loudly.
+    if from_.is_instance_of::<pyo3::types::PyInt>()
+        || from_.is_instance_of::<pyo3::types::PyFloat>()
+        || from_.is_instance_of::<pyo3::types::PyComplex>()
+    {
+        return Err(PyTypeError::new_err(
+            "can_cast() does not support Python ints, floats, and complex \
+             because the result used to depend on the value.\nThis change \
+             was part of adopting NEP 50, we may explicitly allow them again \
+             in the future.",
+        ));
+    }
+    let kind = Casting::from_str(casting).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "casting must be one of 'no', 'equiv', 'safe', 'same_kind', or \
+             'unsafe' (got '{casting}')"
+        ))
+    })?;
+    let src = if let Ok(arr) = from_.cast::<PyNdArray>() {
+        Descr::native(arr.borrow().arr.dtype)
+    } else {
+        descr_from_any(from_)?
+    };
+    Ok(rnp_core::can_cast(src, descr_from_any(to)?, kind))
+}
+
+#[pyfunction]
+fn min_scalar_type(value: &Bound<'_, PyAny>) -> PyResult<PyDType> {
+    if let Ok(arr) = value.cast::<PyNdArray>() {
+        let a = &arr.borrow().arr;
+        // Only 0-d arrays and scalars get the value-based treatment.
+        if a.ndim() > 0 {
+            return Ok(PyDType::new(a.dtype));
+        }
+        return Ok(PyDType::new(rnp_core::min_scalar_type(a.get_flat(0))));
+    }
+    let s = scalar_from_py(value)
+        .ok_or_else(|| PyTypeError::new_err("min_scalar_type() needs a scalar or an array"))?;
+    Ok(PyDType::new(rnp_core::min_scalar_type(s)))
+}
+
+#[pyfunction]
+#[pyo3(signature = (*arrays))]
+fn common_type(arrays: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
+    let mut dts = Vec::with_capacity(arrays.len());
+    for a in arrays.iter() {
+        let arr = array_from_any(&a, None, false)?;
+        if !arr.dtype.is_numeric() {
+            return Err(PyTypeError::new_err("can't get common type for non-numeric array"));
+        }
+        dts.push(arr.dtype);
+    }
+    rnp_core::common_type(&dts)
+        .map(PyDType::new)
+        .ok_or_else(|| PyTypeError::new_err("can't get common type for non-numeric array"))
+}
+
 
 #[pyfunction]
 #[pyo3(signature = (*shapes))]
@@ -223,23 +319,155 @@ fn shape<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, P
 }
 
 #[pyfunction]
-fn result_type(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
-    let _ = py;
-    let mut acc: Option<DType> = None;
+#[pyo3(signature = (*args))]
+fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
+    let mut parsed = Vec::with_capacity(args.len());
     for a in args.iter() {
-        let d = if let Ok(arr) = a.cast::<PyNdArray>() {
-            arr.borrow().arr.dtype
-        } else if let Some(s) = scalar_from_py(&a) {
-            s.natural_dtype()
-        } else {
-            dtype_from_any(&a)?
-        };
-        acc = Some(match acc {
-            None => d,
-            Some(p) => rnp_core::promote(p, d),
-        });
+        parsed.push(type_arg(&a)?);
     }
-    Ok(PyDType::new(acc.unwrap_or(DType::F64)))
+    let d = rnp_core::result_type(&parsed).ok_or_else(|| {
+        PyValueError::new_err("at least one array or dtype is required")
+    })?;
+    Ok(PyDType::new(d))
+}
+
+/// Reductions as free functions (`np.sum(a, axis=0)`), delegating to the
+/// ndarray methods so there is exactly one implementation.
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, out = None, keepdims = false))]
+fn argmin<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    reduce_free(py, a, ReduceOp::ArgMin, axis, None, out, keepdims)
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, out = None, keepdims = false))]
+fn argmax<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    reduce_free(py, a, ReduceOp::ArgMax, axis, None, out, keepdims)
+}
+
+fn reduce_free<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    op: ReduceOp,
+    axis: Option<&Bound<'py, PyAny>>,
+    dtype: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let arr = PyNdArray::into_py_any(array_from_any(a, None, false)?, py)?;
+    let kwargs = PyDict::new(py);
+    if let Some(x) = axis {
+        kwargs.set_item("axis", x)?;
+    }
+    if let Some(x) = dtype {
+        kwargs.set_item("dtype", x)?;
+    }
+    if let Some(x) = out {
+        kwargs.set_item("out", x)?;
+    }
+    kwargs.set_item("keepdims", keepdims)?;
+    let name = match op {
+        ReduceOp::Sum => "sum",
+        ReduceOp::Prod => "prod",
+        ReduceOp::Min => "min",
+        ReduceOp::Max => "max",
+        ReduceOp::ArgMin => "argmin",
+        ReduceOp::ArgMax => "argmax",
+    };
+    arr.bind(py).call_method(name, (), Some(&kwargs))
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, dtype = None, out = None, keepdims = false))]
+fn sum<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    dtype: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    reduce_free(py, a, ReduceOp::Sum, axis, dtype, out, keepdims)
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, dtype = None, out = None, keepdims = false))]
+fn prod<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    dtype: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    reduce_free(py, a, ReduceOp::Prod, axis, dtype, out, keepdims)
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, out = None, keepdims = false))]
+fn amin<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    reduce_free(py, a, ReduceOp::Min, axis, None, out, keepdims)
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, out = None, keepdims = false))]
+fn amax<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    reduce_free(py, a, ReduceOp::Max, axis, None, out, keepdims)
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, axis = None, dtype = None, out = None, keepdims = false))]
+fn mean<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    axis: Option<&Bound<'py, PyAny>>,
+    dtype: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let arr = PyNdArray::into_py_any(array_from_any(a, None, false)?, py)?;
+    let kwargs = PyDict::new(py);
+    if let Some(x) = axis {
+        kwargs.set_item("axis", x)?;
+    }
+    if let Some(x) = dtype {
+        kwargs.set_item("dtype", x)?;
+    }
+    if let Some(x) = out {
+        kwargs.set_item("out", x)?;
+    }
+    kwargs.set_item("keepdims", keepdims)?;
+    arr.bind(py).call_method("mean", (), Some(&kwargs))
+}
+
+/// Install the shim's `name -> scalar class` map behind `dtype.type`.
+#[pyfunction]
+fn _register_scalar_types(types: &Bound<'_, PyDict>) {
+    pydtype::register_scalar_types(types.clone());
 }
 
 /// A dict of every supported dtype, keyed by name, for the shim to expose as
@@ -280,10 +508,21 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(greater_equal, m)?)?;
 
     m.add_function(wrap_pyfunction!(promote_types, m)?)?;
+    m.add_function(wrap_pyfunction!(can_cast, m)?)?;
+    m.add_function(wrap_pyfunction!(min_scalar_type, m)?)?;
+    m.add_function(wrap_pyfunction!(common_type, m)?)?;
+    m.add_function(wrap_pyfunction!(sum, m)?)?;
+    m.add_function(wrap_pyfunction!(prod, m)?)?;
+    m.add_function(wrap_pyfunction!(amin, m)?)?;
+    m.add_function(wrap_pyfunction!(amax, m)?)?;
+    m.add_function(wrap_pyfunction!(argmin, m)?)?;
+    m.add_function(wrap_pyfunction!(argmax, m)?)?;
+    m.add_function(wrap_pyfunction!(mean, m)?)?;
     m.add_function(wrap_pyfunction!(broadcast_shapes, m)?)?;
     m.add_function(wrap_pyfunction!(shape, m)?)?;
     m.add_function(wrap_pyfunction!(result_type, m)?)?;
     m.add_function(wrap_pyfunction!(_dtype_table, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_scalar_types, m)?)?;
 
     m.add("__version__", "0.1.0")?;
     Ok(())

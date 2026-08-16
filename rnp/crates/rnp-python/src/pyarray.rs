@@ -8,9 +8,11 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PySliceMethods, PyTuple};
 
+use rnp_core::reduce::{mean_dtype, reduce_all, reduce_axis, reduce_dtype, ReduceOp};
+use rnp_core::element::Element;
 use rnp_core::{binary, BinOp, DType, NdArray, Scalar};
 
-use crate::convert::{array_from_any, operand, scalar_from_py, scalar_to_py};
+use crate::convert::{array_from_any, flexible_to_py, operand, scalar_from_py, scalar_to_py};
 use rnp_core::printing;
 use crate::pydtype::{dtype_from_any, PyDType};
 
@@ -138,6 +140,9 @@ fn nested_list<'py>(
     index: &mut Vec<isize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if index.len() == arr.ndim() {
+        if arr.dtype.is_flexible() {
+            return flexible_to_py(py, arr, arr.byte_index(index));
+        }
         let v = arr.get(index).map_err(crate::err)?;
         return scalar_to_py(py, v);
     }
@@ -339,8 +344,17 @@ impl PyNdArray {
         copy: bool,
     ) -> PyResult<Py<PyNdArray>> {
         let d = dtype_from_any(dtype)?;
-        let out = if d == self.arr.dtype && !copy {
-            self.arr.clone()
+        let out = if d == self.arr.dtype {
+            if copy {
+                self.arr.copy()
+            } else {
+                self.arr.clone()
+            }
+        } else if d.is_flexible() || self.arr.dtype.is_flexible() {
+            return Err(PyNotImplementedError::new_err(format!(
+                "astype from {} to {} is not implemented yet",
+                self.arr.dtype, d
+            )));
         } else {
             self.arr.astype(d)
         };
@@ -369,6 +383,14 @@ impl PyNdArray {
 
     #[pyo3(signature = (*args))]
     fn item<'py>(&self, py: Python<'py>, args: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyAny>> {
+        if self.arr.dtype.is_flexible() {
+            if self.arr.size() != 1 || !args.is_empty() {
+                return Err(PyNotImplementedError::new_err(
+                    "item() on flexible dtypes is only implemented for size-1 arrays",
+                ));
+            }
+            return flexible_to_py(py, &self.arr, self.arr.byte_offset);
+        }
         let v = if args.is_empty() {
             if self.arr.size() != 1 {
                 return Err(PyValueError::new_err(
@@ -391,6 +413,175 @@ impl PyNdArray {
         scalar_to_py(py, v)
     }
 
+
+    // ---- reductions ----------------------------------------------------
+
+    #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false))]
+    fn sum<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reduce(py, ReduceOp::Sum, axis, dtype, out, keepdims)
+    }
+
+    #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false))]
+    fn prod<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reduce(py, ReduceOp::Prod, axis, dtype, out, keepdims)
+    }
+
+    #[pyo3(signature = (axis = None, out = None, keepdims = false))]
+    fn min<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reduce(py, ReduceOp::Min, axis, None, out, keepdims)
+    }
+
+    #[pyo3(signature = (axis = None, out = None, keepdims = false))]
+    fn max<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reduce(py, ReduceOp::Max, axis, None, out, keepdims)
+    }
+
+    #[pyo3(signature = (axis = None, out = None, keepdims = false))]
+    fn argmin<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reduce(py, ReduceOp::ArgMin, axis, None, out, keepdims)
+    }
+
+    #[pyo3(signature = (axis = None, out = None, keepdims = false))]
+    fn argmax<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.reduce(py, ReduceOp::ArgMax, axis, None, out, keepdims)
+    }
+
+    /// `a.mean()`.
+    ///
+    /// Transcribed from `numpy/_core/_methods.py::_mean`: bool and integer
+    /// operands accumulate in float64, float16 accumulates in float32 and is
+    /// converted back at the end, and the division happens *in the
+    /// accumulator's own type* (so a complex mean goes through numpy's
+    /// complex divide, not a component-wise one).
+    #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false))]
+    fn mean<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if out.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "mean(out=) is not implemented yet",
+            ));
+        }
+        let is_half = self.arr.dtype == DType::F16;
+        let acc_dt = match dtype {
+            Some(d) if !d.is_none() => dtype_from_any(d)?,
+            _ if is_half => DType::F32,
+            _ => mean_dtype(self.arr.dtype),
+        };
+        let promoted = self.arr.astype(acc_dt);
+        let ax = resolve_axis(&self.arr, axis)?;
+        let n = match ax {
+            None => self.arr.size(),
+            Some(a) => self.arr.shape[a].max(0) as usize,
+        };
+        let out_dt = if is_half { DType::F16 } else { acc_dt };
+        let divide = |total: Scalar| -> Scalar {
+            if n == 0 {
+                // numpy warns and yields NaN (NaN+NaNj for complex).
+                return match acc_dt {
+                    DType::C64 | DType::C128 => Scalar::Complex(
+                        num_complex::Complex::new(f64::NAN, f64::NAN),
+                    ),
+                    d => Scalar::Float(f64::NAN).cast(d),
+                };
+            }
+            #[allow(unused_assignments)]
+            // complex64 is the odd one out: numpy's scalar divide widens to
+            // double and rounds once, so it is a true component-wise
+            // division, while complex128 goes through the complex divide
+            // (multiply by the reciprocal). Both were probed against numpy
+            // over thousands of random values.
+            if acc_dt == DType::C64 {
+                if let Scalar::Complex(c) = total {
+                    let re = (c.re / n as f64) as f32 as f64;
+                    let im = (c.im / n as f64) as f32 as f64;
+                    return Scalar::Complex(num_complex::Complex::new(re, im)).cast(out_dt);
+                }
+            }
+            let mut v = total;
+            rnp_core::dispatch_dtype!(acc_dt, A, {
+                let count = A::from_scalar(Scalar::Float(n as f64));
+                v = rnp_core::ops::Arith::a_div(A::from_scalar(total), count).to_scalar();
+            });
+            v.cast(out_dt)
+        };
+        match ax {
+            None => {
+                let total = if n == 0 {
+                    Scalar::Float(0.0).cast(acc_dt)
+                } else {
+                    reduce_all(&promoted, ReduceOp::Sum).map_err(crate::err)?
+                };
+                let v = divide(total);
+                if keepdims {
+                    let shape = vec![1isize; self.arr.ndim()];
+                    let mut a = NdArray::zeros(shape, out_dt).map_err(crate::err)?;
+                    a.fill(v);
+                    return Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any());
+                }
+                scalar_to_py(py, v)
+            }
+            Some(a) => {
+                let sums = reduce_axis(&promoted, a, ReduceOp::Sum, keepdims)
+                    .map_err(crate::err)?;
+                let res = NdArray::zeros(sums.shape.clone(), out_dt).map_err(crate::err)?;
+                let src: Vec<isize> =
+                    rnp_core::iter::offsets(&sums.shape, &sums.strides, sums.byte_offset)
+                        .collect();
+                let dst: Vec<isize> =
+                    rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset)
+                        .collect();
+                for (&s, &d) in src.iter().zip(dst.iter()) {
+                    res.write_at(d, divide(sums.read_at(s)));
+                }
+                Ok(PyNdArray::into_py_any(res, py)?.into_bound(py).into_any())
+            }
+        }
+    }
+
     fn __len__(&self) -> PyResult<usize> {
         if self.arr.ndim() == 0 {
             return Err(PyTypeError::new_err("len() of unsized object"));
@@ -405,6 +596,9 @@ impl PyNdArray {
     ) -> PyResult<Bound<'py, PyAny>> {
         let (view, scalarize) = index_view(&self.arr, key)?;
         if scalarize {
+            if view.dtype.is_flexible() {
+                return flexible_to_py(py, &view, view.byte_offset);
+            }
             return scalar_to_py(py, view.get(&[]).map_err(crate::err)?);
         }
         Ok(PyNdArray::into_py_any(view, py)?.into_bound(py).into_any())
@@ -416,6 +610,18 @@ impl PyNdArray {
             return Err(PyValueError::new_err(
                 "assignment destination is read-only",
             ));
+        }
+        if view.dtype.is_flexible() {
+            let src = array_from_any(value, Some(view.dtype), false)?;
+            let src = rnp_core::iter::broadcast_to(&src, &view.shape).map_err(crate::err)?;
+            let dst_offsets: Vec<isize> =
+                rnp_core::iter::offsets(&view.shape, &view.strides, view.byte_offset).collect();
+            let src_offsets: Vec<isize> =
+                rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
+            for (&d, &s) in dst_offsets.iter().zip(src_offsets.iter()) {
+                view.write_raw_at(d, src.raw_bytes_at(s));
+            }
+            return Ok(());
         }
         if let Some(s) = scalar_from_py(value) {
             view.fill(s);
@@ -608,7 +814,73 @@ impl PyNdArray {
     }
 }
 
+/// Normalise an `axis=` argument: `None` means "reduce everything".
+fn resolve_axis(arr: &NdArray, axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<usize>> {
+    let a = match axis {
+        None => return Ok(None),
+        Some(o) if o.is_none() => return Ok(None),
+        Some(o) => o,
+    };
+    let i: isize = a.extract().map_err(|_| {
+        PyNotImplementedError::new_err("only a single integer axis= is implemented yet")
+    })?;
+    let nd = arr.ndim() as isize;
+    let i = if i < 0 { i + nd } else { i };
+    if i < 0 || i >= nd {
+        return Err(PyValueError::new_err(format!(
+            "axis {} is out of bounds for array of dimension {}",
+            i, nd
+        )));
+    }
+    Ok(Some(i as usize))
+}
+
 impl PyNdArray {
+    /// The shared body of every reduction method.
+    fn reduce<'py>(
+        &self,
+        py: Python<'py>,
+        op: ReduceOp,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        keepdims: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if out.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "reductions with out= are not implemented yet",
+            ));
+        }
+        // `dtype=` casts the operand first, which is what numpy does for the
+        // accumulation type of sum/prod.
+        let owned;
+        let src = match dtype {
+            Some(d) if !d.is_none() => {
+                let dt = dtype_from_any(d)?;
+                owned = self.arr.astype(dt);
+                &owned
+            }
+            _ => &self.arr,
+        };
+        match resolve_axis(src, axis)? {
+            None => {
+                let v = reduce_all(src, op).map_err(crate::err)?;
+                if keepdims {
+                    let shape = vec![1isize; src.ndim()];
+                    let mut a =
+                        NdArray::zeros(shape, reduce_dtype(op, src.dtype)).map_err(crate::err)?;
+                    a.fill(v);
+                    return Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any());
+                }
+                scalar_to_py(py, v)
+            }
+            Some(ax) => {
+                let a = reduce_axis(src, ax, op, keepdims).map_err(crate::err)?;
+                Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any())
+            }
+        }
+    }
+
     fn binop(
         &self,
         py: Python<'_>,

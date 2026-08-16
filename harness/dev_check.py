@@ -24,8 +24,59 @@ import _rnp
 DTYPES = [
     "bool", "int8", "int16", "int32", "int64",
     "uint8", "uint16", "uint32", "uint64",
-    "float32", "float64", "complex64", "complex128",
+    "float16", "float32", "float64", "complex64", "complex128",
 ]
+
+#: Every dtype spelling the M1 constructor is expected to round-trip.
+DTYPE_SPECS = (
+    DTYPES
+    + ["?", "b", "h", "i", "l", "q", "p", "n", "B", "H", "I", "L", "Q", "P", "N",
+       "e", "f", "d", "F", "D", "c",
+       "b1", "i1", "i2", "i4", "i8", "u1", "u2", "u4", "u8",
+       "f2", "f4", "f8", "c8", "c16",
+       "int", "float", "double", "single", "half", "complex", "bool_",
+       "byte", "short", "intc", "long", "longlong", "intp", "uintp",
+       "ubyte", "ushort", "uintc", "ulong", "ulonglong", "csingle", "cdouble"]
+    # byte-order prefixes
+    + [p + c for p in "<>=|" for c in
+       ["b1", "i1", "i2", "i4", "i8", "u1", "u2", "u4", "u8", "f2", "f4",
+        "f8", "c8", "c16"]]
+    # flexible descriptors
+    + ["S", "U", "V", "a"]
+    + [f"S{n}" for n in (1, 3, 5, 17, 64)]
+    + [f"U{n}" for n in (1, 3, 5, 17, 64)]
+    + [f"V{n}" for n in (1, 3, 5, 16, 100)]
+    + ["<U3", ">U3", "|S5", "|V8"]
+    # comma-separated and subarray format strings
+    + ["i4,f8", "f8,i4,u1", "i4, f8", "S3,U2", "(2,2)f4", "3f8", "2i4",
+       "(3,)f4", "(2,3)i2", "i4,(2,2)f4"]
+)
+
+#: Structured / subarray dtypes given as Python objects.
+DTYPE_OBJECTS = [
+    [("a", "i4"), ("b", "f8")],
+    [("a", "i4"), ("b", "f8"), ("c", "S3")],
+    [("a", "i1"), ("b", "f8")],
+    [("x", [("p", "i4"), ("q", "f4")]), ("y", "f8")],
+    [("a", "f4", (2, 3)), ("b", "i8")],
+    [("a", "f4", (2,))],
+    [(("A", "a"), "i4")],
+    [(("A", "a"), "i4"), ("b", "u2")],
+    [],
+    {"names": ["a", "b"], "formats": ["i4", "f8"]},
+    {"names": ["a", "b"], "formats": ["i4", "f8"], "offsets": [0, 8]},
+    {"names": ["a", "b"], "formats": ["i4", "f8"], "offsets": [0, 8],
+     "itemsize": 32},
+    {"names": ["a"], "formats": ["i4"], "titles": ["A"]},
+    ("f4", (2, 2)),
+    ("i4", 3),
+    (np.dtype(("i4", (2,))), (3,)),
+]
+
+#: Dtype properties compared attribute-by-attribute against real numpy.
+DTYPE_ATTRS = ["str", "kind", "char", "num", "itemsize", "alignment",
+               "byteorder", "name", "isnative", "hasobject", "names",
+               "isalignedstruct", "ndim", "shape"]
 
 FAILURES = []
 CHECKS = 0
@@ -70,8 +121,86 @@ def sample(rng, dtype, size):
 
 
 def to_port(a):
-    """Rebuild a numpy array as a port array through nested lists."""
-    return _rnp.array(a.tolist(), str(a.dtype))
+    """Rebuild a numpy array as a port array through nested lists.
+
+    The bytes are then compared against numpy's own, so any divergence in the
+    element-by-element conversion shows up as a failure rather than hiding.
+    """
+    flat = _rnp.array(a.ravel().tolist(), str(a.dtype)) if a.size else \
+        _rnp.zeros(a.shape, str(a.dtype))
+    return flat.reshape(a.shape) if a.size else flat
+
+
+def _reduction_repr(value, ref_dtype):
+    """Bytes of a reduction result, in a form comparable across libraries.
+
+    Whole-array reductions come back from the port as plain Python numbers
+    (real numpy scalar types are a later milestone), so the *value* is
+    compared bit-exactly after re-encoding it in numpy's result dtype, and
+    the result *dtype* is checked separately through a `keepdims=True` call,
+    where both libraries hand back a real array.
+    """
+    if hasattr(value, "dtype") or isinstance(value, np.ndarray):
+        a = np.asarray(value)
+        return (str(a.dtype), a.shape, a.tobytes())
+    a = np.asarray(value, dtype=ref_dtype)
+    return (str(a.dtype), a.shape, a.tobytes())
+
+
+def _bool_or_exc(fn):
+    """Run `fn`, returning its value or the exception type name."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return type(exc).__name__
+
+
+def _port_spec(spec):
+    """Translate a numpy dtype spec into the equivalent port spec."""
+    if isinstance(spec, np.dtype):
+        if spec.names is not None:
+            return _port_spec([(n, spec.fields[n][0]) for n in spec.names])
+        if spec.subdtype is not None:
+            base, shape = spec.subdtype
+            return (_port_spec(base), shape)
+        return _rnp.dtype(spec.str)
+    if isinstance(spec, list):
+        return [tuple(_port_spec(x) for x in entry) for entry in spec]
+    if isinstance(spec, tuple):
+        return tuple(_port_spec(x) for x in spec)
+    if isinstance(spec, dict):
+        return {k: ([_port_spec(f) for f in v] if k == "formats" else v)
+                for k, v in spec.items()}
+    return spec
+
+
+def _compare_dtype(label, want, got):
+    """Compare every dtype attribute the port models against numpy's."""
+    for attr in DTYPE_ATTRS:
+        w = getattr(want, attr)
+        g = getattr(got, attr)
+        if attr == "shape":
+            w, g = tuple(w), tuple(g)
+        if w != g:
+            FAILURES.append((f"{label}.{attr}", f"{g!r} != numpy's {w!r}"))
+    if repr(want) != repr(got):
+        FAILURES.append((f"{label} repr", f"{got!r} != numpy's {want!r}"))
+    if str(want) != str(got):
+        FAILURES.append((f"{label} str", f"{str(got)!r} != numpy's {str(want)!r}"))
+    if (want.fields is None) != (got.fields is None):
+        FAILURES.append((f"{label}.fields", "presence differs from numpy"))
+    elif want.fields is not None:
+        w = {k: (str(v[0]), v[1]) for k, v in want.fields.items()}
+        g = {k: (str(v[0]), v[1]) for k, v in got.fields.items()}
+        if w != g:
+            FAILURES.append((f"{label}.fields", f"{g!r} != numpy's {w!r}"))
+    if (want.subdtype is None) != (got.subdtype is None):
+        FAILURES.append((f"{label}.subdtype", "presence differs from numpy"))
+    elif want.subdtype is not None:
+        if (repr(want.subdtype[0]), want.subdtype[1]) != (
+                repr(got.subdtype[0]), tuple(got.subdtype[1])):
+            FAILURES.append((f"{label}.subdtype",
+                             f"{got.subdtype!r} != numpy's {want.subdtype!r}"))
 
 
 def main():
@@ -203,6 +332,260 @@ def main():
             FAILURES.append(
                 (f"repr {want.dtype}{want.shape}",
                  f"{repr(port)!r} != numpy's {repr(want)!r}"))
+
+    # ---- dtype constructor round-trips ----------------------------------
+    for spec in DTYPE_SPECS:
+        CHECKS += 1
+        want = _bool_or_exc(lambda: np.dtype(spec))
+        got = _bool_or_exc(lambda: _rnp.dtype(spec))
+        if isinstance(want, str) or isinstance(got, str):
+            if want != got:
+                FAILURES.append((f"dtype({spec!r})",
+                                 f"port {got!r} != numpy {want!r}"))
+            continue
+        _compare_dtype(f"dtype({spec!r})", want, got)
+
+    for spec in DTYPE_OBJECTS:
+        CHECKS += 1
+        port_spec = _port_spec(spec)
+        try:
+            want, got = np.dtype(spec), _rnp.dtype(port_spec)
+        except Exception as exc:  # noqa: BLE001
+            FAILURES.append((f"dtype({spec!r})", f"construction raised {exc!r}"))
+            continue
+        _compare_dtype(f"dtype({spec!r})", want, got)
+        # align=True changes the layout, so check it separately.
+        if isinstance(spec, (list, dict)) and spec:
+            CHECKS += 1
+            try:
+                _compare_dtype(f"dtype({spec!r}, align=True)",
+                               np.dtype(spec, align=True),
+                               _rnp.dtype(port_spec, align=True))
+            except Exception as exc:  # noqa: BLE001
+                FAILURES.append((f"dtype({spec!r}, align=True)", repr(exc)))
+
+    # newbyteorder round-trips
+    for spec in ["i4", "f8", "u2", ">i4", "<f4", "b", "S5", "U3",
+                 "i4,f8"]:
+        for order in [None, "S", "<", ">", "=", "|"]:
+            CHECKS += 1
+            args = () if order is None else (order,)
+            try:
+                want = np.dtype(spec).newbyteorder(*args)
+                got = _rnp.dtype(spec).newbyteorder(*args)
+            except Exception as exc:  # noqa: BLE001
+                FAILURES.append((f"{spec!r}.newbyteorder({order!r})", repr(exc)))
+                continue
+            if repr(want) != repr(got):
+                FAILURES.append((f"{spec!r}.newbyteorder({order!r})",
+                                 f"{got!r} != numpy's {want!r}"))
+
+    # dtype hashing and equality
+    equiv_groups = [["i4", "<i4", "=i4", "int32"], ["f8", "float64", "<f8"],
+                    ["S5", "|S5"], ["U3", "<U3"], ["i4,f8"], ["?", "bool", "b1"]]
+    for group in equiv_groups:
+        for a in group:
+            for b in group:
+                CHECKS += 1
+                want_eq = np.dtype(a) == np.dtype(b)
+                got_eq = _rnp.dtype(a) == _rnp.dtype(b)
+                want_h = hash(np.dtype(a)) == hash(np.dtype(b))
+                got_h = hash(_rnp.dtype(a)) == hash(_rnp.dtype(b))
+                if (want_eq, want_h) != (got_eq, got_h):
+                    FAILURES.append((f"dtype eq/hash {a!r} vs {b!r}",
+                                     f"({got_eq}, {got_h}) != numpy's "
+                                     f"({want_eq}, {want_h})"))
+    for a, b in [("i4", "i8"), ("i4", ">i4"), ("S3", "S5"), ("U3", "S3"),
+                 ("i4,f8", "i4,f4")]:
+        CHECKS += 1
+        if (np.dtype(a) == np.dtype(b)) != (_rnp.dtype(a) == _rnp.dtype(b)):
+            FAILURES.append((f"dtype eq {a!r} vs {b!r}", "differs from numpy"))
+
+    # dtype == string / type comparisons
+    for spec, other in [("i4", "i4"), ("i4", "int32"), ("i4", "f8"),
+                        ("f8", "float64"), ("S5", "S5"), ("S5", "S3")]:
+        CHECKS += 1
+        if (np.dtype(spec) == other) != (_rnp.dtype(spec) == other):
+            FAILURES.append((f"dtype({spec!r}) == {other!r}", "differs"))
+
+    # ---- promotion / casting fixtures -----------------------------------
+    castable = DTYPES + ["S0", "S3", "S5", "U0", "U3", "U5", "V0", "V3", "V8"]
+    for a, b in itertools.product(castable, castable):
+        for casting in ["no", "equiv", "safe", "same_kind", "unsafe"]:
+            CHECKS += 1
+            want = _bool_or_exc(lambda: np.can_cast(a, b, casting))
+            got = _bool_or_exc(lambda: _rnp.can_cast(a, b, casting))
+            if want != got:
+                FAILURES.append((f"can_cast({a}, {b}, {casting})",
+                                 f"{got} != numpy's {want}"))
+    for a, b in itertools.product(DTYPES, DTYPES):
+        CHECKS += 1
+        want = str(np.promote_types(a, b))
+        got = str(_rnp.promote_types(a, b))
+        if want != got:
+            FAILURES.append((f"promote_types({a}, {b})",
+                             f"{got} != numpy's {want}"))
+    for a, b in itertools.product(["S3", "S5", "U3", "U5"], repeat=2):
+        CHECKS += 1
+        want = _bool_or_exc(lambda: str(np.promote_types(a, b)))
+        got = _bool_or_exc(lambda: str(_rnp.promote_types(a, b)))
+        if want != got:
+            FAILURES.append((f"promote_types({a}, {b})",
+                             f"{got} != numpy's {want}"))
+
+    # result_type with NEP 50 weak python scalars
+    weak_values = [0, 1, 300, -5, 2 ** 40, True, 2.5, 1e300, 1 + 1j]
+    for dt in DTYPES:
+        for v in weak_values:
+            CHECKS += 1
+            want = _bool_or_exc(lambda: str(np.result_type(np.dtype(dt), v)))
+            got = _bool_or_exc(lambda: str(_rnp.result_type(_rnp.dtype(dt), v)))
+            if want != got:
+                FAILURES.append((f"result_type({dt}, {v!r})",
+                                 f"{got} != numpy's {want}"))
+    for a, b in itertools.product(DTYPES, DTYPES):
+        CHECKS += 1
+        want = str(np.result_type(np.dtype(a), np.dtype(b)))
+        got = str(_rnp.result_type(_rnp.dtype(a), _rnp.dtype(b)))
+        if want != got:
+            FAILURES.append((f"result_type({a}, {b})", f"{got} != numpy's {want}"))
+    for v in weak_values:
+        for w in weak_values:
+            CHECKS += 1
+            want = str(np.result_type(v, w))
+            got = str(_rnp.result_type(v, w))
+            if want != got:
+                FAILURES.append((f"result_type({v!r}, {w!r})",
+                                 f"{got} != numpy's {want}"))
+
+    # min_scalar_type
+    scalars = [0, 1, 127, 128, 255, 256, 65535, 65536, 2 ** 31, 2 ** 32,
+               2 ** 63, 2 ** 64 - 1, -1, -128, -129, -32768, -32769,
+               -2 ** 31, -2 ** 31 - 1, True, False,
+               0.0, -0.0, 0.1, 3.0, 64999.9, 65000.0, 65504.0, 3.3e38,
+               3.4028235e38, 1e40, 1e300, float("inf"), float("-inf"),
+               float("nan"), 3 + 4j, 1e300 + 0j, 65001 + 0j]
+    for v in scalars:
+        CHECKS += 1
+        want = str(np.min_scalar_type(v))
+        got = str(_rnp.min_scalar_type(v))
+        if want != got:
+            FAILURES.append((f"min_scalar_type({v!r})", f"{got} != numpy's {want}"))
+
+    # common_type
+    for combo in [("i4",), ("f4",), ("f8",), ("c8",), ("f4", "f8"),
+                  ("i4", "f4"), ("f2",), ("c8", "f8"), ("i8", "i4")]:
+        CHECKS += 1
+        arrays_np = [np.ones(3, dt) for dt in combo]
+        arrays_port = [_rnp.ones(3, dt) for dt in combo]
+        want = np.common_type(*arrays_np).__name__
+        got = str(_rnp.common_type(*arrays_port))
+        if want != got:
+            FAILURES.append((f"common_type{combo}", f"{got} != numpy's {want}"))
+
+    # can_cast rejects python numbers under NEP 50
+    for v in [3, 3.0, 3j]:
+        CHECKS += 1
+        want = _bool_or_exc(lambda: np.can_cast(v, "i1"))
+        got = _bool_or_exc(lambda: _rnp.can_cast(v, "i1"))
+        if want != got:
+            FAILURES.append((f"can_cast({v!r}, i1)", f"{got} != numpy's {want}"))
+
+    # ---- reductions, bit for bit ----------------------------------------
+    red_dtypes = ["bool", "int8", "int16", "int32", "int64", "uint8",
+                  "uint16", "uint32", "uint64", "float16", "float32",
+                  "float64", "complex64", "complex128"]
+    for dt in red_dtypes:
+        for size in [0, 1, 2, 7, 8, 9, 16, 100, 127, 128, 129, 200, 1000,
+                     1031, 5000]:
+            data = sample(rng, dt, size)
+            port = to_port(data)
+            for name in ["sum", "prod", "min", "max", "argmin", "argmax",
+                         "mean"]:
+                CHECKS += 1
+                w = _bool_or_exc(lambda: getattr(data, name)())
+                g = _bool_or_exc(lambda: getattr(port, name)())
+                ref = getattr(w, "dtype", None)
+                want = w if isinstance(w, str) else _reduction_repr(w, ref)
+                got = g if isinstance(g, str) else _reduction_repr(g, ref)
+                if want != got:
+                    FAILURES.append((f"{name}({dt}, n={size})",
+                                     f"{got} != numpy's {want}"))
+                # The result dtype, checked where both sides give an array.
+                CHECKS += 1
+                wd = _bool_or_exc(
+                    lambda: str(getattr(data.reshape(1, -1), name)(
+                        axis=1, keepdims=True).dtype))
+                gd = _bool_or_exc(
+                    lambda: str(getattr(port.reshape(1, -1), name)(
+                        axis=1, keepdims=True).dtype))
+                if wd != gd:
+                    FAILURES.append((f"{name}({dt}, n={size}).dtype",
+                                     f"{gd} != numpy's {wd}"))
+
+    # Signed zero and NaN edge cases.
+    for values, dt in [([-0.0, -0.0], "float64"), ([-0.0, 0.0], "float64"),
+                       ([1.0, float("nan"), 3.0], "float64"),
+                       ([float("nan")], "float32"),
+                       ([float("inf"), float("-inf")], "float64")]:
+        data = np.array(values, dt)
+        port = to_port(data)
+        for name in ["sum", "min", "max", "argmin", "argmax"]:
+            CHECKS += 1
+            w = getattr(data, name)()
+            want = _reduction_repr(w, w.dtype)
+            got = _reduction_repr(getattr(port, name)(), w.dtype)
+            if want != got:
+                FAILURES.append((f"{name}({values}, {dt})",
+                                 f"{got} != numpy's {want}"))
+
+    # Axis reductions on 2-D and 3-D arrays, contiguous and strided.
+    for dt in ["int32", "int64", "uint8", "float32", "float64", "complex128"]:
+        for shape in [(3, 5), (4, 6), (2, 3, 4), (17, 9), (1, 130), (130, 1)]:
+            base = sample(rng, dt, int(np.prod(shape))).reshape(shape)
+            pbase = to_port(base.ravel()).reshape(shape)
+            for view_name, view in [("", lambda x: x),
+                                    ("[::2]", lambda x: x[::2]),
+                                    ("[..., ::2]", lambda x: x[..., ::2])]:
+                a, pa = view(base), view(pbase)
+                for axis in range(len(shape)):
+                    for keepdims in (False, True):
+                        for name in ["sum", "min", "max", "argmin", "argmax",
+                                     "mean"]:
+                            CHECKS += 1
+                            kw = {"axis": axis, "keepdims": keepdims}
+                            w = _bool_or_exc(lambda: getattr(a, name)(**kw))
+                            g = _bool_or_exc(lambda: getattr(pa, name)(**kw))
+                            ref = getattr(w, "dtype", None)
+                            want = w if isinstance(w, str) else \
+                                _reduction_repr(w, ref)
+                            got = g if isinstance(g, str) else \
+                                _reduction_repr(g, ref)
+                            if want != got:
+                                FAILURES.append((
+                                    f"{name}({dt}{shape}{view_name}, "
+                                    f"axis={axis}, keepdims={keepdims})",
+                                    f"{got} != numpy's {want}"))
+
+    # ---- flexible (S/U) arrays -------------------------------------------
+    for values in [[b"ab", b"cde"], ["ab", "cde"], ["", "x"],
+                   [b"", b"zzzz"], ["\u00e9", "ab"]]:
+        CHECKS += 1
+        want = np.array(values)
+        got = _rnp.array(values)
+        if str(want.dtype) != str(got.dtype):
+            FAILURES.append((f"array({values!r}).dtype",
+                             f"{got.dtype} != numpy's {want.dtype}"))
+        CHECKS += 1
+        if want.tolist() != got.tolist():
+            FAILURES.append((f"array({values!r}).tolist()",
+                             f"{got.tolist()!r} != numpy's {want.tolist()!r}"))
+        CHECKS += 1
+        want_eq = (want == want).tolist()
+        got_eq = (got == got).tolist()
+        if want_eq != got_eq:
+            FAILURES.append((f"array({values!r}) == itself",
+                             f"{got_eq} != numpy's {want_eq}"))
 
     # ---- error parity ---------------------------------------------------
     error_cases = [

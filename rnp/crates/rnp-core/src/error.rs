@@ -7,6 +7,10 @@ pub enum Error {
     ValueError(String),
     TypeError(String),
     IndexError(String),
+    /// numpy's `np.exceptions.AxisError` (a subclass of ValueError/IndexError).
+    AxisError(String),
+    /// numpy's `np.exceptions.DTypePromotionError`.
+    DTypePromotionError(String),
     NotImplemented(String),
 }
 
@@ -18,6 +22,8 @@ impl Error {
             Error::ValueError(m)
             | Error::TypeError(m)
             | Error::IndexError(m)
+            | Error::AxisError(m)
+            | Error::DTypePromotionError(m)
             | Error::NotImplemented(m) => m,
         }
     }
