@@ -987,28 +987,41 @@ def promote_types(type1, type2):
     (unaligned) struct unless the two dtypes were already equal, in which case
     the dtype itself comes back.
     """
+    from .exceptions import DTypePromotionError
     a, b = dtype(type1), dtype(type2)
     if a.names is None and b.names is None:
         return _promote_types_scalar(a, b)
-    if a == b:
+    # Two identical *native* dtypes come straight back, keeping `align=True`;
+    # a non-native one still gets normalised field by field, which is what
+    # `np.promote_types(d, d)` does for a dtype holding a '>i4'.
+    if a == b and a.isnative:
         return a
     if a.names is None or b.names is None:
-        from .exceptions import DTypePromotionError
         raise DTypePromotionError(
             f"The DTypes {_dtype_class_repr(a)} and {_dtype_class_repr(b)} do "
             "not have a common DType. For example they cannot be stored in a "
             "single array unless the dtype is `object`.")
     if a.names != b.names:
-        from .exceptions import DTypePromotionError
         raise DTypePromotionError(
             f"field names `{a.names}` and `{b.names}` mismatch.")
     fields = []
     for name in a.names:
         fa, fb = a[name], b[name]
-        shape = fa.shape or fb.shape
+        ta = a.fields[name][2] if len(a.fields[name]) > 2 else None
+        tb = b.fields[name][2] if len(b.fields[name]) > 2 else None
+        if ta != tb:
+            raise DTypePromotionError(
+                f"field titles of field '{name}' mismatch")
+        if fa.shape != fb.shape:
+            # A subarray field and a scalar field never share a DType.
+            raise DTypePromotionError(
+                f"The DTypes {_dtype_class_repr(a)} and "
+                f"{_dtype_class_repr(b)} do not have a common DType. For "
+                "example they cannot be stored in a single array unless the "
+                "dtype is `object`.")
         base = promote_types(fa.base if fa.shape else fa,
                              fb.base if fb.shape else fb)
-        fields.append((name, base, shape) if shape else (name, base))
+        fields.append((name, base, fa.shape) if fa.shape else (name, base))
     return dtype(fields)
 
 

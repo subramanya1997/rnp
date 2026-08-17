@@ -47,8 +47,16 @@ def _void_key(v):
     elementwise. Equality is defined on the values, so the arrays are
     flattened to lists first.
     """
-    return tuple(x.tolist() if hasattr(x, "tolist") and hasattr(x, "shape")
-                 else x for x in v.item())
+    def flat(x):
+        if hasattr(x, "shape") and hasattr(x, "tolist") and x.shape != ():
+            return x.tolist()
+        if isinstance(x, tuple):
+            # A *nested* structured field arrives as a tuple that may itself
+            # hold subarray ndarrays.
+            return tuple(flat(y) for y in x)
+        return x
+
+    return tuple(flat(x) for x in v.item())
 
 
 def _raw_bytes(arr):
