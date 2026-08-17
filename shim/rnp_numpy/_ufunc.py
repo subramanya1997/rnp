@@ -214,12 +214,18 @@ def _object_gufunc(name, a, b, out):
     """`matmul` and friends over `object` arrays.
 
     numpy's `OBJECT_matmul_inner_noblas` builds each output element as
-    ``a[i,0]*b[0,j]`` and then repeatedly ``+=`` the remaining products, i.e.
-    it goes through Python's own `__mul__`/`__add__` in `k` order. Doing the
-    same with whole-array slices reproduces that exactly, and reuses the
-    engine's object-dtype elementwise loops rather than duplicating them.
+    ``a[i,0]*b[0,j]`` and then repeatedly ``+=`` the remaining products, so
+    every operation goes through the *elements'* own `__mul__`/`__add__`, in
+    `k` order, and an empty `k` yields the integer 0. That is reproduced here
+    literally, element by element: the engine has no object-dtype elementwise
+    loops to delegate to, and even if it did, whole-array slicing would not
+    guarantee this exact left-to-right association for user-defined types.
+
+    The dimension algebra (which optional core dimensions survive, what the
+    loop shape is) is the same as for every other dtype, so it is asked of
+    the Rust planner rather than duplicated.
     """
-    from . import asarray, broadcast_to, empty, zeros
+    from . import array, asarray, broadcast_to
 
     aa, bb = asarray(a), asarray(b)
     loop, out_shape, rows, inner, cols, a_rowless, b_colless = _rnp._matmul_plan(
@@ -230,15 +236,26 @@ def _object_gufunc(name, a, b, out):
     b2 = bb.reshape(bb.shape + (1,)) if b_colless else bb
     a2 = broadcast_to(a2, loop + (rows, inner))
     b2 = broadcast_to(b2, loop + (inner, cols))
-    if inner == 0:
-        res = zeros(loop + (rows, cols), dtype="object")
-        res[...] = 0
-    else:
-        res = None
-        for t in range(inner):
-            term = a2[..., :, t:t + 1] * b2[..., t:t + 1, :]
-            res = term if res is None else res + term
-    res = res.reshape(out_shape)
+
+    nbatch = 1
+    for d in loop:
+        nbatch *= d
+    flat = []
+    for batch in range(nbatch):
+        rem, prefix = batch, []
+        for d in reversed(loop):
+            prefix.append(rem % d)
+            rem //= d
+        prefix = tuple(reversed(prefix))
+        for i in range(rows):
+            for j in range(cols):
+                acc = 0
+                for t in range(inner):
+                    term = a2[prefix + (i, t)] * b2[prefix + (t, j)]
+                    acc = term if t == 0 else acc + term
+                flat.append(acc)
+    res = array(flat, dtype=object).reshape(out_shape) if flat else \
+        array([], dtype=object).reshape(out_shape)
     if out is not None:
         out[...] = res
         return out

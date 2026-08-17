@@ -230,6 +230,7 @@ pub fn imatmul(slf: &Bound<'_, PyNdArray>, other: &Bound<'_, PyAny>) -> PyResult
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(_matmul_dtype, m)?)?;
+    m.add_function(wrap_pyfunction!(_matmul_plan, m)?)?;
     m.add_function(wrap_pyfunction!(_dot, m)?)?;
     m.add_function(wrap_pyfunction!(_inner, m)?)?;
     Ok(())

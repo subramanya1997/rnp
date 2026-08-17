@@ -24,11 +24,24 @@ failure.
 
 For float32/float64/complex64/complex128 numpy dispatches contiguous 2-D
 products to BLAS (`cblas_?gemm` / `?gemv` / `?dot`), whose blocked, vectorised
-summation is *not* a left-to-right sum. The port cannot match it bit for bit
-without linking BLAS, so those dtypes are compared by ULP distance and the
-worst distance actually observed is reported per dtype. The assertion bound
-below is deliberately generous relative to the observed maximum; the number
-that matters is the measured one printed in the report.
+summation is *not* a left-to-right sum. Without linking BLAS the port cannot
+match those bit for bit, so the two answers are held to the *accumulated
+rounding bound* that any summation order satisfies:
+
+    |port - numpy|  <=  TOL_FACTOR * eps(dtype) * sum_k |a_k| * |b_k|
+
+with the right-hand sum computed as `f(abs(a), abs(b))` -- the same product
+with every operand made non-negative, so no cancellation can shrink it. The
+textbook bound for one ordering is `k * eps * sum|a_k b_k|`; `TOL_FACTOR` is
+128, which covers both orderings for every `k` this file uses (<= 32) with
+room to spare. Crucially the bound does *not* depend on the observed answer,
+so a genuinely wrong result cannot slip through by being wrong consistently.
+
+ULP distance is reported alongside but is *not* the pass criterion: a dot
+product whose terms cancel has a tiny result, so a rounding difference far
+inside the bound above can still be thousands of ULP. The per-dtype worst ULP
+printed at the end is a measurement of how far the port's accumulation order
+lands from BLAS's, not a threshold anything was tuned to.
 
 Usage: .venv/bin/python harness/dev_check_matmul.py [--seed N]
 """
@@ -53,9 +66,13 @@ FAILURES = []
 #: Worst ULP distance seen per dtype, over every float/complex comparison.
 WORST_ULP = {}
 
-#: The bound a float/complex comparison must stay inside. Chosen after
-#: measuring: see the report at the end of a run for what is actually hit.
-ULP_BOUND = 64
+#: Multiplier on `eps * sum|a_k b_k|` (see the module docstring). 128 bounds
+#: the difference between any two summation orders for the products here.
+TOL_FACTOR = 128
+
+#: Fallback ULP bound for the handful of float comparisons where no magnitude
+#: bound is available (results that are exact by construction).
+ULP_BOUND = 4
 
 DTYPES = [
     "bool", "int8", "int16", "int32", "int64",
@@ -138,6 +155,31 @@ def _ulp(w, g):
     return int(d.max())
 
 
+def _isnan_any(x):
+    """NaN mask; for complex, True where either half is NaN (numpy's rule)."""
+    a = np.asarray(x)
+    if a.dtype.kind not in "fc":
+        return np.zeros(a.shape, bool)
+    return np.isnan(a)
+
+
+def magnitude(fn, a, b):
+    """`sum_k |a_k| |b_k|` per output element: the same product with every
+    operand made non-negative, so cancellation cannot shrink it.
+
+    Returns None for products that come out exact (integer and bool loops),
+    where `compare` requires bit equality instead.
+    """
+    a, b = np.asarray(a), np.asarray(b)
+    if np.result_type(a.dtype, b.dtype).kind not in "fc":
+        return None
+    try:
+        return np.asarray(fn(np.abs(a).astype(np.float64),
+                             np.abs(b).astype(np.float64)), dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _record_ulp(dtype, value):
     if value is None:
         return
@@ -145,8 +187,14 @@ def _record_ulp(dtype, value):
         WORST_ULP[dtype] = value
 
 
-def compare(name, want, got):
-    """One result comparison: exact for exact dtypes, ULP for inexact ones."""
+def compare(name, want, got, scale=None):
+    """One result comparison.
+
+    Exact dtypes must be bit-identical. Inexact ones must land inside the
+    accumulated-rounding bound built from `scale` (an upper bound on
+    `sum_k |a_k b_k|` for each output element); the ULP distance is recorded
+    for the report either way.
+    """
     global CHECKS
     CHECKS += 1
     w = np.asarray(want)
@@ -182,8 +230,36 @@ def compare(name, want, got):
         FAILURES.append((name, "NaN pattern differs from numpy's"))
         return
     _record_ulp(dt, d)
-    if d > ULP_BOUND:
-        FAILURES.append((name, f"max ULP {d} exceeds the {ULP_BOUND} bound"))
+
+    if scale is None:
+        if d > ULP_BOUND:
+            FAILURES.append(
+                (name, f"max ULP {d} exceeds the {ULP_BOUND} bound (no "
+                       f"magnitude bound was available for this call)"))
+        return
+
+    real = np.float32 if w.dtype.itemsize in (4, 8) and w.dtype.kind == "c" \
+        else w.dtype
+    eps = np.finfo(np.float32 if w.dtype == np.complex64 else
+                   np.float64 if w.dtype == np.complex128 else
+                   w.dtype).eps
+    tol = TOL_FACTOR * eps * np.asarray(scale, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        diff = np.abs(np.asarray(w, dtype=np.complex128 if w.dtype.kind == "c"
+                                 else np.float64)
+                      - np.asarray(g, dtype=np.complex128 if w.dtype.kind == "c"
+                                   else np.float64))
+        finite = np.isfinite(diff)
+        over = finite & (diff > tol)
+        # Non-finite results must agree exactly (bit for bit modulo NaN).
+        bad_nonfinite = (~finite) & (np.asarray(w) != np.asarray(g)) \
+            & ~(_isnan_any(w) & _isnan_any(g))
+    del real
+    if np.any(over) or np.any(bad_nonfinite):
+        worst = float(np.max(np.where(finite, diff, 0.0))) if diff.size else 0.0
+        FAILURES.append(
+            (name, f"|port - numpy| = {worst:.3e} exceeds the rounding bound "
+                   f"{TOL_FACTOR}*eps*sum|a||b| (max ULP {d})"))
 
 
 def eq(name, want, got):
@@ -321,7 +397,8 @@ def check_products(rng):
                         (f"{kind}{sa}x{sb} {dt} {layout}",
                          f"port raised {got[1][0]}: {got[1][1]}"))
                     continue
-                compare(f"{kind}{sa}x{sb} {dt} {layout}", want, got[1])
+                compare(f"{kind}{sa}x{sb} {dt} {layout}", want, got[1],
+                        magnitude(np_fn, a, b))
 
     # Mixed dtypes exercise the promotion path on both sides.
     for kind, sa, sb in CASES[:12]:
@@ -330,7 +407,8 @@ def check_products(rng):
             da, db = rng.choice(DTYPES), rng.choice(DTYPES)
             a, pa = build(rng, sa, da, "c")
             b, pb = build(rng, sb, db, "c")
-            compare(f"{kind}{sa}x{sb} {da}@{db}", np_fn(a, b), port_fn(pa, pb))
+            compare(f"{kind}{sa}x{sb} {da}@{db}", np_fn(a, b),
+                    port_fn(pa, pb), magnitude(np_fn, a, b))
 
 
 def check_dot_inner(rng):
@@ -341,19 +419,24 @@ def check_dot_inner(rng):
                 a, pa = build(rng, sa, dt, layout)
                 b, pb = build(rng, sb, dt, layout)
                 compare(f"{kind}{sa}x{sb} {dt} {layout}",
-                        np_fn(a, b), port_fn(pa, pb))
+                        np_fn(a, b), port_fn(pa, pb),
+                        magnitude(np_fn, a, b))
     # dot/inner with scalar operands multiply elementwise.
     for dt in ["int32", "float64", "complex128"]:
         a, pa = build(rng, (), dt, "c")
         b, pb = build(rng, (2, 2), dt, "c")
-        compare(f"dot scalar {dt}", np.dot(a, b), rnp.dot(pa, pb))
-        compare(f"dot scalar2 {dt}", np.dot(b, a), rnp.dot(pb, pa))
-        compare(f"inner scalar {dt}", np.inner(a, b), rnp.inner(pa, pb))
+        compare(f"dot scalar {dt}", np.dot(a, b), rnp.dot(pa, pb),
+                magnitude(np.dot, a, b))
+        compare(f"dot scalar2 {dt}", np.dot(b, a), rnp.dot(pb, pa),
+                magnitude(np.dot, b, a))
+        compare(f"inner scalar {dt}", np.inner(a, b), rnp.inner(pa, pb),
+                magnitude(np.inner, a, b))
     # vdot flattens and conjugates.
     for dt in ["int32", "float64", "complex128"]:
         a, pa = build(rng, (2, 3), dt, "c")
         b, pb = build(rng, (3, 2), dt, "c")
-        compare(f"vdot {dt}", np.vdot(a, b), rnp.vdot(pa, pb))
+        compare(f"vdot {dt}", np.vdot(a, b), rnp.vdot(pa, pb),
+                magnitude(np.vdot, a, b))
 
 
 def check_out(rng):
@@ -370,15 +453,17 @@ def check_out(rng):
             o_port = rnp.empty(oshape, dtype=dt)
             r_np = np_fn(a, b, out=o_np)
             r_port = port_fn(pa, pb, out=o_port)
-            compare(f"{kind}{sa}x{sb} {dt} out= return", r_np, r_port)
-            compare(f"{kind}{sa}x{sb} {dt} out= stored", o_np, o_port)
+            mag = magnitude(np_fn, a, b)
+            compare(f"{kind}{sa}x{sb} {dt} out= return", r_np, r_port, mag)
+            compare(f"{kind}{sa}x{sb} {dt} out= stored", o_np, o_port, mag)
 
     # An `out` whose dtype the result can be safe-cast into.
     a, pa = build(rng, (2, 3), "int32", "c")
     b, pb = build(rng, (3, 4), "int32", "c")
     o_np, o_port = np.empty((2, 4), "float64"), rnp.empty((2, 4), dtype="float64")
     compare("matmul out=f8 from i4", np.matmul(a, b, out=o_np),
-            rnp.matmul(pa, pb, out=o_port))
+            rnp.matmul(pa, pb, out=o_port),
+            magnitude(np.matmul, a.astype("float64"), b.astype("float64")))
 
     # `out` with extra leading dimensions of size 1 broadcasts.
     o_np, o_port = np.empty((1, 2, 4), "int32"), rnp.empty((1, 2, 4), dtype="int32")
@@ -388,7 +473,8 @@ def check_out(rng):
     # dtype= forces the loop type.
     for dt in ["float32", "float64", "complex128"]:
         compare(f"matmul dtype={dt}", np.matmul(a, b, dtype=dt),
-                rnp.matmul(pa, pb, dtype=dt))
+                rnp.matmul(pa, pb, dtype=dt),
+                magnitude(np.matmul, a.astype(dt), b.astype(dt)))
 
     # A 0-d result comes back as a scalar, not a 0-d array.
     v, pv = build(rng, (4,), "float64", "c")
@@ -403,21 +489,24 @@ def check_operator(rng):
     for dt in ["int64", "float64", "complex128"]:
         a, pa = build(rng, (3, 4), dt, "c")
         b, pb = build(rng, (4, 3), dt, "c")
-        compare(f"a @ b {dt}", a @ b, pa @ pb)
-        compare(f"b @ a {dt}", b @ a, pb @ pa)
+        compare(f"a @ b {dt}", a @ b, pa @ pb, magnitude(np.matmul, a, b))
+        compare(f"b @ a {dt}", b @ a, pb @ pa, magnitude(np.matmul, b, a))
         v, pv = build(rng, (4,), dt, "c")
-        compare(f"a @ v {dt}", a @ v, pa @ pv)
-        compare(f"v @ b {dt}", v @ b, pv @ pb)
+        compare(f"a @ v {dt}", a @ v, pa @ pv, magnitude(np.matmul, a, v))
+        compare(f"v @ b {dt}", v @ b, pv @ pb, magnitude(np.matmul, v, b))
         # a list on the left goes through __rmatmul__.
-        compare(f"list @ arr {dt}", v.tolist() @ b, pv.tolist() @ pb)
+        compare(f"list @ arr {dt}", v.tolist() @ b, pv.tolist() @ pb,
+                magnitude(np.matmul, v, b))
         # in-place
         sq, psq = build(rng, (3, 3), dt, "c")
+        sq0 = sq.copy()
         eye = np.eye(3, dtype=dt)
         want = sq @ eye
         sq @= eye
         psq @= to_port(eye)
-        compare(f"a @= I {dt}", want, psq)
-        compare(f"a @= I {dt} (numpy in place)", sq, psq)
+        compare(f"a @= I {dt}", want, psq, magnitude(np.matmul, sq0, eye))
+        compare(f"a @= I {dt} (numpy in place)", sq, psq,
+                magnitude(np.matmul, sq0, eye))
 
 
 def check_wraparound(rng):
@@ -449,14 +538,17 @@ def check_object(rng):
             [rng.randrange(-9, 9) for _ in range(int(np.prod(shape_b)))],
             dtype=object).reshape(shape_b)
         want = np.matmul(a, b)
-        got = outcome(lambda: rnp.matmul(rnp.array(a.tolist(), dtype=object),
-                                         rnp.array(b.tolist(), dtype=object)))
+        # `tolist()` loses a zero-length trailing axis, so rebuild flat and
+        # reshape rather than round-tripping the nesting.
+        pa = rnp.array(a.ravel().tolist(), dtype=object).reshape(shape_a)
+        pb = rnp.array(b.ravel().tolist(), dtype=object).reshape(shape_b)
+        got = outcome(lambda: rnp.matmul(pa, pb))
         global CHECKS
         CHECKS += 1
         if got[0] == "exc":
             FAILURES.append((f"object matmul {shape_a}x{shape_b}",
                              f"port raised {got[1][0]}: {got[1][1]}"))
-        elif np.asarray(want).tolist() != np.asarray(got[1]).tolist():
+        elif np.asarray(want).tolist() != got[1].tolist():
             FAILURES.append((f"object matmul {shape_a}x{shape_b}",
                              f"{got[1]!r} != numpy's {want!r}"))
 
@@ -670,11 +762,13 @@ def check_axes(rng):
     for axes in [[(-2, -1), (-1, -2), (1, 2)],
                  [(-2, -1), (-1, -2), (0, 1)]]:
         compare(f"matmul axes={axes}", np.matmul(a, a, axes=axes),
-                rnp.matmul(pa, pa, axes=axes))
+                rnp.matmul(pa, pa, axes=axes),
+                np.matmul(np.abs(a), np.abs(a), axes=axes))
     v = np.arange(3, dtype="float64")
     compare("matmul axes with 1-d",
             np.matmul(a, v, axes=[(1, 0), (0), (0)]),
-            rnp.matmul(pa, to_port(v), axes=[(1, 0), (0), (0)]))
+            rnp.matmul(pa, to_port(v), axes=[(1, 0), (0), (0)]),
+            np.matmul(np.abs(a), np.abs(v), axes=[(1, 0), (0), (0)]))
 
 
 def check_metadata():
@@ -710,8 +804,10 @@ def main():
     for name, msg in FAILURES:
         print(f"  FAIL {name}: {msg}")
     print()
-    print("worst observed ULP distance vs numpy, per dtype "
-          f"(assertion bound {ULP_BOUND}):")
+    print("worst observed ULP distance vs numpy, per dtype -- measured, not "
+          "asserted;")
+    print(f"the pass criterion is |port - numpy| <= {TOL_FACTOR}"
+          "*eps*sum|a||b| (see the module docstring):")
     for dt in ["float16", "float32", "float64", "complex64", "complex128"]:
         seen = WORST_ULP.get(dt)
         print(f"  {dt:<12} {'(none seen)' if seen is None else seen}")

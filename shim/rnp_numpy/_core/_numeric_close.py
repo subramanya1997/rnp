@@ -96,23 +96,23 @@ def allclose(a, b, rtol=1.e-5, atol=1.e-8, equal_nan=False):
 # question is asked of `broadcast_shapes`.
 # --------------------------------------------------------------------------
 
-#: The dtype *classes* numpy considers incapable of holding a NaN, so
-#: `array_equal(..., equal_nan=True)` can skip the isnan pass. Upstream lists
-#: exactly bool and the four signed integer widths (not the unsigned ones --
-#: see the comment on `_no_nan_types` in numeric.py).
-def _no_nan_types():
-    from .. import dtype as _dtype
-    return {
-        type(_dtype("bool")),
-        type(_dtype("int8")),
-        type(_dtype("int16")),
-        type(_dtype("int32")),
-        type(_dtype("int64")),
-    }
+#: The dtypes numpy considers incapable of holding a NaN, letting
+#: `array_equal(..., equal_nan=True)` skip the isnan pass. Upstream spells
+#: this as a set of dtype *classes* (`type(np.dtype(nt.int8))` and friends,
+#: which in numpy are distinct `numpy.dtypes.*DType` subclasses) and lists
+#: exactly bool plus the four signed integer widths -- not the unsigned ones,
+#: which is a quirk of upstream's list, not of the arithmetic.
+#:
+#: The port has a single `dtype` class for every dtype, so `type(dt)` cannot
+#: discriminate; the same set is spelled by name instead. Since this only
+#: selects between two routes to the same answer, matching upstream's exact
+#: membership (unsigned excluded) keeps the behaviour identical either way.
+_NO_NAN_DTYPE_NAMES = frozenset(
+    ["bool", "int8", "int16", "int32", "int64"])
 
 
 def _dtype_cannot_hold_nan(dtype):
-    return type(dtype) in _no_nan_types()
+    return getattr(dtype, "name", None) in _NO_NAN_DTYPE_NAMES
 
 
 def array_equal(a1, a2, equal_nan=False):
