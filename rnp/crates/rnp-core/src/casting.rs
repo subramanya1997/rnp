@@ -131,32 +131,67 @@ fn cast_ok(from: DType, to: DType, same_kind: bool) -> bool {
     }
 }
 
-/// The datetime half of the casting lattice, from numpy's
-/// `can_cast_datetime64_metadata` / `can_cast_timedelta64_metadata` plus the
-/// cross-kind rules in `PyArray_CanCastTypeTo`.
+/// The datetime half of the casting lattice.
+///
+/// This is numpy's `time_to_time_resolve_descriptors`
+/// (`multiarray/datetime.c`), not `can_cast_datetime64_metadata`: the
+/// resolver is what `PyArray_CanCastTypeTo` actually consults, and it knows
+/// about the "same duration spelled with a metric prefix" cases -- `M8[7s]`
+/// and `M8[7000ms]` are *equivalent*, so the cast is safe in both directions
+/// even though `ms` is the finer base.
 fn datetime_cast_ok(from: DType, to: DType, casting: Casting) -> bool {
-    use crate::datetime::meta_of;
+    use crate::datetime::{meta_of, metadata_divides, UNIT_M};
     match (from.is_datetime_like(), to.is_datetime_like()) {
         (true, true) => {
             if from.is_datetime() != to.is_datetime() {
                 // datetime64 <-> timedelta64 is `unsafe` only.
                 return false;
             }
-            crate::datetime::can_cast_meta(
-                meta_of(from).unwrap(),
-                meta_of(to).unwrap(),
-                from.is_timedelta(),
-                casting,
-            )
+            let (m1, m2) = (meta_of(from).unwrap(), meta_of(to).unwrap());
+            let is_td = from.is_timedelta();
+            // Equal metadata, or one of the 10^3 / 10^6 / 10^9 metric-prefix
+            // pairs, which denote exactly the same duration.
+            let step = m1.base as i32 - m2.base as i32;
+            let prefix_equiv = m2.base >= crate::datetime::UNIT_S
+                && (1..=3).contains(&step)
+                && m2.num != 0
+                && m1.num % m2.num == 0
+                && (m1.num / m2.num) as u64 == 1000u64.pow(step as u32);
+            if (m1.base == m2.base && m1.num == m2.num) || prefix_equiv {
+                return true;
+            }
+            if m1.is_generic() {
+                // A generic source is only ever NaT, so it fits anywhere.
+                return true;
+            }
+            if m2.is_generic() {
+                // Converting *to* generic is an error, not a cast.
+                return false;
+            }
+            // A timedelta may not cross the nonlinear-unit barrier at all.
+            if is_td && ((m1.base <= UNIT_M) != (m2.base <= UNIT_M)) {
+                return false;
+            }
+            if m1.base <= m2.base && metadata_divides(m1, m2, is_td) {
+                return true; // safe
+            }
+            casting == Casting::SameKind
         }
         // Probed: datetime64/timedelta64 -> S/U and -> any numeric dtype is
         // `unsafe` only, in both directions.
         (true, false) => false,
         (false, true) => {
-            // Integers (and bool) cast *safely* into timedelta64; nothing
-            // casts into datetime64 short of `unsafe`.
-            let _ = casting;
-            to.is_timedelta() && (from.is_integer() || from.is_bool())
+            if !to.is_timedelta() {
+                // Nothing casts into datetime64 short of `unsafe`.
+                return false;
+            }
+            if casting == Casting::SameKind {
+                return from.is_integer() || from.is_bool();
+            }
+            // A *safe* cast needs the integer to fit in the int64 storage,
+            // which `uint64` does not (probed: can_cast('u8', 'm8') is False
+            // while can_cast('u4', 'm8') is True).
+            cast_ok(from, DType::I64, false)
         }
         (false, false) => unreachable!(),
     }
