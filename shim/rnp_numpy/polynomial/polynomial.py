@@ -6,7 +6,7 @@
 #   L84: import numpy as np
 #      -> import rnp_numpy as np
 #   L85: from numpy._core.overrides import array_function_dispatch as _array_function_dispatch
-#      -> from rnp_numpy.lib._rnp_compat import array_function_dispatch as _array_function_dispatch
+#      -> from ._rnp_compat import array_function_dispatch as _array_function_dispatch
 # ---------------------------------------------------------------------------
 """
 =================================================
