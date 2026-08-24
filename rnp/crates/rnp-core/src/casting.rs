@@ -595,6 +595,92 @@ mod tests {
     }
 
     #[test]
+    fn result_type_promotes_the_whole_sequence() {
+        use TypeArg::Concrete as C;
+        let d = |s: &str| Descr::parse(s).unwrap().dt;
+        // Every one of these differs from `promote(promote(a, b), c)`, and
+        // every one was probed from numpy 2.5.2. The left fold is given in
+        // the comment.
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["uint8", "int8", "float16"], "float16", "float32"),
+            (&["int8", "uint16", "float16"], "float32", "float64"),
+            (&["uint16", "int8", "float16"], "float32", "float64"),
+            (&["int16", "uint16", "float32"], "float32", "float64"),
+            (&["int32", "uint32", "float16"], "float64", "float64"),
+            (&["float16", "int64", "uint64"], "float64", "float64"),
+            (&["int8", "uint8", "int8"], "int16", "int16"),
+        ];
+        for (args, want, left_fold) in cases {
+            let parts: Vec<TypeArg> = args.iter().map(|s| C(d(s))).collect();
+            assert_eq!(
+                result_type(&parts),
+                Some(d(want)),
+                "result_type{args:?}"
+            );
+            let mut fold = d(args[0]);
+            for a in &args[1..] {
+                fold = crate::dtype::promote(fold, d(a));
+            }
+            assert_eq!(fold, d(left_fold), "left fold of {args:?} moved");
+        }
+    }
+
+    #[test]
+    fn result_type_is_order_independent_for_the_probed_sets() {
+        use TypeArg::Concrete as C;
+        let d = |s: &str| Descr::parse(s).unwrap().dt;
+        // numpy guarantees a stable answer whatever the argument order; the
+        // reduction is what buys that, so assert it directly.
+        for set in [
+            ["uint8", "int8", "float16"],
+            ["int8", "uint16", "float16"],
+            ["int16", "uint16", "float32"],
+        ] {
+            let want = result_type(&set.map(|s| C(d(s))));
+            for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+                let mut p = set;
+                p.swap(i, j);
+                assert_eq!(result_type(&p.map(|s| C(d(s)))), want, "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn result_type_weak_int_is_value_based_only_when_alone() {
+        use TypeArg::*;
+        // Probed: np.result_type(2**63) is uint64, np.result_type(2**100) is
+        // object, but as soon as anything else joins in they are plain weak
+        // integers again.
+        assert_eq!(result_type(&[WeakInt(DType::U64)]), Some(DType::U64));
+        assert_eq!(result_type(&[WeakInt(DType::Object)]), Some(DType::Object));
+        assert_eq!(
+            result_type(&[Concrete(DType::I8), WeakInt(DType::Object)]),
+            Some(DType::I8)
+        );
+        assert_eq!(
+            result_type(&[WeakInt(DType::Object), WeakInt(DType::U64)]),
+            Some(DType::I64)
+        );
+    }
+
+    #[test]
+    fn result_type_object_swallows_everything() {
+        use TypeArg::*;
+        for d in ALL_DTYPES {
+            assert_eq!(
+                result_type(&[Concrete(d), Concrete(DType::Object)]),
+                Some(DType::Object),
+                "{d} + object"
+            );
+            assert_eq!(
+                result_type(&[Concrete(DType::Object), Concrete(d)]),
+                Some(DType::Object),
+                "object + {d}"
+            );
+        }
+    }
+
+    #[test]
     fn safe_casting_agrees_with_promotion() {
         // numpy's definition: a safe cast is one that promotion already
         // reaches, for the numeric lattice.
