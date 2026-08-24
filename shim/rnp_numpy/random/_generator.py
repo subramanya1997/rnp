@@ -19,6 +19,7 @@ from .. import (
 from .._arraycompat import broadcast_arrays
 from ..exceptions import AxisError
 from ._bit_generators import BitGenerator
+from ._distributions import DistributionKernels
 
 
 _MASK32 = (1 << 32) - 1
@@ -79,6 +80,7 @@ class Generator:
         if not isinstance(bit_generator, BitGenerator):
             raise TypeError("Generator requires a BitGenerator instance")
         self._bit_generator = bit_generator
+        self._distributions = DistributionKernels(bit_generator)
 
     def __getattr__(self, name):
         # Keep the complete public surface collectable while distribution
@@ -490,17 +492,349 @@ class Generator:
         return source.take(index_array, axis=axis)
 
     def uniform(self, low=0.0, high=1.0, size=None):
-        low = float(low)
-        high = float(high)
-        span = high - low
-        if not math.isfinite(span):
-            raise OverflowError("high - low range exceeds valid bounds")
-        if span < 0:
-            raise ValueError("high - low < 0")
+        def validate(values):
+            span = values[1] - values[0]
+            if not math.isfinite(span):
+                raise OverflowError("high - low range exceeds valid bounds")
+            if span < 0.0:
+                raise ValueError("high - low < 0")
+
+        return self._broadcast_kernel(
+            (low, high), size, validate,
+            lambda v: math.fma(v[1] - v[0], self.random(), v[0]),
+        )
+
+    def _broadcast_kernel(self, params, size, validate, draw, dtype=float64):
+        arrays = [asarray(value) for value in params]
+        scalar = all(value.ndim == 0 for value in arrays)
+        arrays = list(broadcast_arrays(*arrays))
+        shape = tuple(arrays[0].shape) if size is None else _shape(size)
+        try:
+            arrays = [broadcast_to(value, shape) for value in arrays]
+        except ValueError:
+            raise ValueError("shape mismatch: objects cannot be broadcast to a single shape") from None
+        rows = [tuple(float(value.flat[i]) for value in arrays)
+                for i in range(_count(shape))]
+        for values in rows:
+            validate(values)
+        results = [draw(values) for values in rows]
+        if scalar and size is None:
+            return results[0]
+        return array(results, dtype=dtype).reshape(shape)
+
+    def _continuous(self, draw, size=None, dtype=float64, out=None):
+        name = _dtype_name(dtype)
+        if name not in ("float64", "float32"):
+            raise TypeError(f"Unsupported dtype {str(_dtype(dtype))!r} for distribution")
+        if size is None and out is None:
+            return draw()
+        shape = tuple(out.shape) if out is not None and size is None else _shape(size)
+        if out is not None:
+            if tuple(out.shape) != shape or str(out.dtype) != name:
+                raise ValueError("size must match out.shape when used together")
+            target = out
+        else:
+            target = empty(shape, dtype=dtype)
+        for i in range(_count(shape)):
+            target.flat[i] = draw()
+        return target
+
+    def standard_normal(self, size=None, dtype=float64, out=None):
+        draw = (self._distributions.standard_normal_f
+                if _dtype_name(dtype) == "float32"
+                else self._distributions.standard_normal)
+        return self._continuous(
+            draw, size=size, dtype=dtype, out=out
+        )
+
+    def standard_exponential(self, size=None, dtype=float64, method="zig", out=None):
+        if method not in ("zig", "inv"):
+            raise ValueError(f"Method {method} is not supported")
+        if method == "inv":
+            if _dtype_name(dtype) == "float32":
+                raise TypeError("Unsupported dtype float32 for method inv")
+            draw = lambda: -math.log1p(-self._bit_generator.next_double())
+        else:
+            draw = (self._distributions.standard_exponential_f
+                    if _dtype_name(dtype) == "float32"
+                    else self._distributions.standard_exponential)
+        return self._continuous(draw, size=size, dtype=dtype, out=out)
+
+    def standard_gamma(self, shape, size=None, dtype=float64, out=None):
+        shape_value = float(shape)
+        if (math.isnan(shape_value) or shape_value < 0.0
+                or (shape_value == 0.0 and math.copysign(1.0, shape_value) < 0.0)):
+            raise ValueError("shape < 0")
+        if _dtype_name(dtype) == "float32":
+            draw = lambda: self._distributions.standard_gamma_f(shape_value)
+        else:
+            draw = lambda: self._distributions.standard_gamma(shape_value)
+        return self._continuous(
+            draw,
+            size=size, dtype=dtype, out=out,
+        )
+
+    def normal(self, loc=0.0, scale=1.0, size=None):
+        loc = float(loc)
+        scale = float(scale)
+        if (scale < 0.0 or math.isnan(scale)
+                or (scale == 0.0 and math.copysign(1.0, scale) < 0.0)):
+            raise ValueError("scale < 0")
+        return self._continuous(lambda: math.fma(
+            scale, self._distributions.standard_normal(), loc
+        ), size=size)
+
+    def exponential(self, scale=1.0, size=None):
+        scale = float(scale)
+        if (scale < 0.0 or math.isnan(scale)
+                or (scale == 0.0 and math.copysign(1.0, scale) < 0.0)):
+            raise ValueError("scale < 0")
+        return self._continuous(
+            lambda: scale * self._distributions.standard_exponential(), size=size
+        )
+
+    def gamma(self, shape, scale=1.0, size=None):
+        shape = float(shape)
+        scale = float(scale)
+        if (shape < 0.0 or math.isnan(shape)
+                or (shape == 0.0 and math.copysign(1.0, shape) < 0.0)):
+            raise ValueError("shape < 0")
+        if (scale < 0.0 or math.isnan(scale)
+                or (scale == 0.0 and math.copysign(1.0, scale) < 0.0)):
+            raise ValueError("scale < 0")
+        return self._continuous(
+            lambda: scale * self._distributions.standard_gamma(shape), size=size
+        )
+
+    def beta(self, a, b, size=None):
+        a = float(a)
+        b = float(b)
+        if a <= 0.0 or math.isnan(a):
+            raise ValueError("a <= 0")
+        if b <= 0.0 or math.isnan(b):
+            raise ValueError("b <= 0")
+        return self._continuous(lambda: self._distributions.beta(a, b), size=size)
+
+    @staticmethod
+    def _positive(value, name, allow_zero=False):
+        value = float(value)
+        bad = value < 0.0 if allow_zero else value <= 0.0
+        if allow_zero and value == 0.0 and math.copysign(1.0, value) < 0.0:
+            bad = True
+        if bad or math.isnan(value):
+            raise ValueError(f"{name} <= 0" if not allow_zero else f"{name} < 0")
+        return value
+
+    def chisquare(self, df, size=None):
+        df = self._positive(df, "df")
+        return self._continuous(lambda: self._distributions.chisquare(df), size=size)
+
+    def f(self, dfnum, dfden, size=None):
+        dfnum = self._positive(dfnum, "dfnum")
+        dfden = self._positive(dfden, "dfden")
+        return self._continuous(lambda: self._distributions.f(dfnum, dfden), size=size)
+
+    def standard_cauchy(self, size=None):
+        return self._continuous(self._distributions.standard_cauchy, size=size)
+
+    def pareto(self, a, size=None):
+        a = self._positive(a, "a")
+        return self._continuous(lambda: self._distributions.pareto(a), size=size)
+
+    def weibull(self, a, size=None):
+        a = self._positive(a, "a", allow_zero=True)
+        return self._continuous(lambda: self._distributions.weibull(a), size=size)
+
+    def power(self, a, size=None):
+        a = self._positive(a, "a")
+        return self._continuous(lambda: self._distributions.power(a), size=size)
+
+    def laplace(self, loc=0.0, scale=1.0, size=None):
+        loc = float(loc)
+        scale = self._positive(scale, "scale", allow_zero=True)
+        return self._continuous(lambda: self._distributions.laplace(loc, scale), size=size)
+
+    def gumbel(self, loc=0.0, scale=1.0, size=None):
+        loc = float(loc)
+        scale = self._positive(scale, "scale", allow_zero=True)
+        return self._continuous(lambda: self._distributions.gumbel(loc, scale), size=size)
+
+    def logistic(self, loc=0.0, scale=1.0, size=None):
+        loc = float(loc)
+        scale = self._positive(scale, "scale", allow_zero=True)
+        return self._continuous(lambda: self._distributions.logistic(loc, scale), size=size)
+
+    def lognormal(self, mean=0.0, sigma=1.0, size=None):
+        mean = float(mean)
+        sigma = self._positive(sigma, "sigma", allow_zero=True)
+        return self._continuous(lambda: self._distributions.lognormal(mean, sigma), size=size)
+
+    def rayleigh(self, scale=1.0, size=None):
+        scale = self._positive(scale, "scale", allow_zero=True)
+        return self._continuous(lambda: self._distributions.rayleigh(scale), size=size)
+
+    def standard_t(self, df, size=None):
+        df = self._positive(df, "df")
+        return self._continuous(lambda: self._distributions.standard_t(df), size=size)
+
+    def triangular(self, left, mode, right, size=None):
+        left, mode, right = float(left), float(mode), float(right)
+        if left > mode:
+            raise ValueError("left > mode")
+        if mode > right:
+            raise ValueError("mode > right")
+        if left == right:
+            raise ValueError("left == right")
+        return self._continuous(
+            lambda: self._distributions.triangular(left, mode, right), size=size
+        )
+
+    def _discrete(self, draw, size=None):
         if size is None:
-            return low + span * self.random()
-        values = [low + span * self.random() for _ in range(_count(_shape(size)))]
-        return array(values, dtype=float64).reshape(_shape(size))
+            return int(draw())
+        shape = _shape(size)
+        values = [draw() for _ in range(_count(shape))]
+        return array(values, dtype=int64).reshape(shape)
+
+    def geometric(self, p, size=None):
+        p = float(p)
+        if p <= 0.0 or p > 1.0 or math.isnan(p):
+            raise ValueError("p <= 0, p > 1 or p contains NaNs")
+        return self._discrete(lambda: self._distributions.geometric(p), size=size)
+
+    def logseries(self, p, size=None):
+        p = float(p)
+        if p < 0.0 or p >= 1.0 or math.isnan(p):
+            raise ValueError("p < 0, p >= 1 or p is NaN")
+        return self._discrete(lambda: self._distributions.logseries(p), size=size)
+
+    def zipf(self, a, size=None):
+        a = float(a)
+        if a <= 1.0 or math.isnan(a):
+            raise ValueError("a <= 1 or a is NaN")
+        return self._discrete(lambda: self._distributions.zipf(a), size=size)
+
+    def poisson(self, lam=1.0, size=None):
+        lam = float(lam)
+        if lam < 0.0 or math.isnan(lam) or lam > self._poisson_lam_max:
+            raise ValueError("lam < 0 or lam is too large")
+        return self._discrete(lambda: self._distributions.poisson(lam), size=size)
+
+    def binomial(self, n, p, size=None):
+        n = int(float(n))
+        p = float(p)
+        if n < 0:
+            raise ValueError("n < 0")
+        if p < 0.0 or p > 1.0 or math.isnan(p):
+            raise ValueError("p < 0, p > 1 or p is NaN")
+        return self._discrete(lambda: self._distributions.binomial(n, p), size=size)
+
+    def negative_binomial(self, n, p, size=None):
+        n = float(n)
+        p = float(p)
+        if n <= 0.0 or math.isnan(n):
+            raise ValueError("n <= 0")
+        if p <= 0.0 or p > 1.0 or math.isnan(p):
+            raise ValueError("p <= 0, p > 1 or p contains NaNs")
+        return self._discrete(
+            lambda: self._distributions.negative_binomial(n, p), size=size
+        )
+
+    def multinomial(self, n, pvals, size=None):
+        n = operator.index(n)
+        probs = [float(v) for v in asarray(pvals).flat]
+        if n < 0:
+            raise ValueError("n < 0")
+        if not probs:
+            raise ValueError("pvals must have at least 1 dimension")
+        if any(v < 0.0 or math.isnan(v) for v in probs):
+            raise ValueError("pvals < 0, pvals > 1 or pvals contains NaNs")
+        if math.fsum(probs[:-1]) > 1.0 + math.sqrt(2.220446049250313e-16):
+            raise ValueError("sum(pvals[:-1]) > 1.0")
+        shape = _shape(size) + (len(probs),)
+        rows = 1 if size is None else _count(_shape(size))
+        values = []
+        for _ in range(rows):
+            remaining = n
+            remaining_p = 1.0
+            for p in probs[:-1]:
+                if remaining <= 0:
+                    draw = 0
+                else:
+                    draw = self._distributions.binomial(remaining, p / remaining_p)
+                values.append(draw)
+                remaining -= draw
+                remaining_p -= p
+            values.append(remaining)
+        return array(values, dtype=int64).reshape(shape)
+
+    def noncentral_chisquare(self, df, nonc, size=None):
+        df = self._positive(df, "df")
+        nonc = float(nonc)
+        if nonc < 0.0:
+            raise ValueError("nonc < 0")
+        return self._continuous(
+            lambda: self._distributions.noncentral_chisquare(df, nonc), size=size
+        )
+
+    def noncentral_f(self, dfnum, dfden, nonc, size=None):
+        dfnum = self._positive(dfnum, "dfnum")
+        dfden = self._positive(dfden, "dfden")
+        nonc = float(nonc)
+        if nonc < 0.0:
+            raise ValueError("nonc < 0")
+        return self._continuous(
+            lambda: self._distributions.noncentral_f(dfnum, dfden, nonc), size=size
+        )
+
+    def wald(self, mean, scale, size=None):
+        mean = self._positive(mean, "mean")
+        scale = self._positive(scale, "scale")
+        return self._continuous(lambda: self._distributions.wald(mean, scale), size=size)
+
+    def vonmises(self, mu, kappa, size=None):
+        mu = float(mu)
+        kappa = float(kappa)
+        if kappa < 0.0:
+            raise ValueError("kappa < 0")
+        return self._continuous(lambda: self._distributions.vonmises(mu, kappa), size=size)
+
+    def dirichlet(self, alpha, size=None):
+        values = [float(v) for v in asarray(alpha).flat]
+        if asarray(alpha).ndim != 1:
+            raise ValueError("alpha must be 1-dimensional")
+        if any(v < 0.0 or math.isnan(v) for v in values):
+            raise ValueError("alpha < 0")
+        rows = 1 if size is None else _count(_shape(size))
+        result = []
+        if values and max(values) < 0.1:
+            cumulative = [0.0] * len(values)
+            total = 0.0
+            for j in range(len(values) - 1, -1, -1):
+                total += values[j]
+                cumulative[j] = total
+            for _ in range(rows):
+                row = [0.0] * len(values)
+                acc = 1.0
+                if total > 0.0:
+                    for j in range(len(values) - 1):
+                        v = self._distributions.beta(values[j], cumulative[j + 1])
+                        row[j] = acc * v
+                        acc *= 1.0 - v
+                        if cumulative[j + 1] == 0.0:
+                            break
+                    row[-1] = acc
+                result.extend(row)
+        else:
+            for _ in range(rows):
+                row = [self._distributions.standard_gamma(v) for v in values]
+                total = 0.0
+                for v in row:
+                    total += v
+                invtotal = 1.0 / total
+                result.extend(v * invtotal for v in row)
+        shape = _shape(size) + (len(values),)
+        return array(result, dtype=float64).reshape(shape)
 
 
 __all__ = ["Generator"]
