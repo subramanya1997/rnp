@@ -1453,8 +1453,7 @@ fn try_gemm<T: MatElem>(
 }
 
 /// Transcribe numpy's generated float/complex routing for one gufunc outer
-/// iteration. Cluster 1 intentionally limits this to a single batch; cluster
-/// 2 extends the same inner call over the broadcast batch loop.
+/// iteration.
 #[allow(clippy::too_many_arguments)]
 fn try_plain_blas_single<T: MatElem>(
     kind: MatKind,
@@ -1641,11 +1640,18 @@ fn kernel<T: MatElem>(
         )
     };
 
-    if !conj_a
-        && nbatch == 1
-        && try_plain_blas_single(kind, a, b, p, a_batch[0], b_batch[0], out_slice)
-    {
-        return;
+    if !conj_a {
+        let mut all_blas = true;
+        for bi in 0..nbatch {
+            let dst = &mut out_slice[bi * r * c..(bi + 1) * r * c];
+            if !try_plain_blas_single(kind, a, b, p, a_batch[bi], b_batch[bi], dst) {
+                all_blas = false;
+                break;
+            }
+        }
+        if all_blas {
+            return;
+        }
     }
 
     // Packed copies of the two tiles, so the innermost loop walks contiguous
@@ -2239,6 +2245,59 @@ mod tests {
             )
         };
         assert_eq!(floats(&got_dot)[0].to_bits(), expected_dot.to_bits());
+
+        let batches = 5usize;
+        let side = 8usize;
+        let batch_av: Vec<f64> = (0..batches * side * side)
+            .map(|i| ((i * 31 % 113) as f64 - 56.0) / 9.0)
+            .collect();
+        let batch_bv: Vec<f64> = (0..batches * side * side)
+            .map(|i| ((i * 47 % 127) as f64 - 63.0) / 13.0)
+            .collect();
+        let batch_a = arr(&[batches as isize, side as isize, side as isize], &batch_av);
+        let batch_b = arr(&[batches as isize, side as isize, side as isize], &batch_bv);
+        let got_batch = matmul(MatKind::MatMul, &batch_a, &batch_b, None, None).unwrap();
+        let got_batch_bits = floats(&got_batch)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>();
+        for bi in 0..batches {
+            let byte_offset = (bi * side * side * std::mem::size_of::<f64>()) as isize;
+            // SAFETY: every offset identifies a dense, disjoint `side`-by-`side`
+            // tile in the two inputs and output. The output addresses are reused
+            // so Accelerate sees the same alignment as the routed implementation.
+            unsafe {
+                crate::blas::dgemm(
+                    batch_a
+                        .buffer
+                        .as_ptr()
+                        .wrapping_offset(batch_a.byte_offset + byte_offset),
+                    false,
+                    side as i64,
+                    batch_b
+                        .buffer
+                        .as_ptr()
+                        .wrapping_offset(batch_b.byte_offset + byte_offset),
+                    false,
+                    side as i64,
+                    got_batch
+                        .buffer
+                        .as_mut_ptr()
+                        .offset(got_batch.byte_offset + byte_offset),
+                    side as i64,
+                    side,
+                    side,
+                    side,
+                );
+            }
+        }
+        assert_eq!(
+            got_batch_bits,
+            floats(&got_batch)
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
