@@ -91,6 +91,9 @@ def _flat(x):
     if _is_array(x):
         if not isinstance(x, np.ndarray):
             x = np.asarray(x.__array__())
+        if getattr(x.dtype, "names", None):
+            flat = x.reshape(-1)
+            return [flat[i] for i in range(flat.size)], tuple(x.shape)
         return np._flat_values(x), tuple(x.shape)
     if isinstance(x, (list, tuple)):
         a = np.asarray(x)
@@ -102,6 +105,22 @@ def _values_equal(a, b):
     """Elementwise equality with numpy's NaN-equals-NaN testing semantics."""
     if a is b:
         return True
+    names = getattr(getattr(a, "dtype", None), "names", None)
+    if names is not None and names == getattr(getattr(b, "dtype", None), "names", None):
+        return all(_values_equal(a[name], b[name]) for name in names)
+    if _is_array(a) or _is_array(b):
+        af, ashape = _flat(a)
+        bf, bshape = _flat(b)
+        return ashape == bshape and all(_values_equal(x, y) for x, y in zip(af, bf))
+    # NumPy compares an integer array against an inexact sequence after
+    # applying the array comparison's common dtype.  This matters for Python
+    # integer lists containing values above INT64_MAX: ``asarray`` discovers
+    # float64, and uint64-vs-float64 equality is performed in float64.  The
+    # lightweight testing shim flattens to Python scalars, so reproduce that
+    # coercion here instead of using Python's exact int/float comparison.
+    if ((isinstance(a, int) and isinstance(b, float)) or
+            (isinstance(a, float) and isinstance(b, int))):
+        return float(a) == float(b)
     if isinstance(a, float) and isinstance(b, float):
         if a != a and b != b:
             return True
@@ -277,12 +296,21 @@ def assert_warns(warning_class, *args, **kwargs):
 
 
 @contextlib.contextmanager
-def assert_no_warnings():
+def _assert_no_warnings_context():
     with warnings.catch_warnings(record=True) as log:
         warnings.simplefilter("always")
         yield
     if len(log) > 0:
         raise AssertionError(f"Got warnings: {log}")
+
+
+def assert_no_warnings(*args, **kwargs):
+    """Assert that a callable, or a context block, emits no warnings."""
+    if not args:
+        return _assert_no_warnings_context()
+    func, *rest = args
+    with _assert_no_warnings_context():
+        return func(*rest, **kwargs)
 
 
 @contextlib.contextmanager
