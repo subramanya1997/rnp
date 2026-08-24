@@ -140,7 +140,8 @@ def matmul_cases(np_mod):
     yield "vecdot_float64_1e6", lambda: np_mod.vecdot(v, w)
     mv, vv = sq(512, np_mod.float64)[0], np_mod.arange(512, dtype=np_mod.float64)
     yield "matvec_float64_512", lambda: np_mod.matvec(mv, vv)
-    yield "dot_float64_256", lambda: np_mod.dot(*sq(256, np_mod.float64))
+    dot_a, dot_b = sq(256, np_mod.float64)
+    yield "dot_float64_256", lambda: np_mod.dot(dot_a, dot_b)
 
 
 def main():

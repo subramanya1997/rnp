@@ -35,7 +35,7 @@ use std::borrow::Cow;
 use crate::array::{shape_size, NdArray};
 use crate::descr::Descr;
 use crate::dtype::{promote, DType};
-use crate::element::{Element, NpBool, C32, C64v, F16};
+use crate::element::{C64v, Element, NpBool, C32, F16};
 use crate::error::{ufunc_no_loop, Error, Result};
 
 /// Which member of the family is being evaluated.
@@ -297,8 +297,15 @@ pub fn plan(
         }
     }
     if conflict {
-        return Err(broadcast_error(sig, &ndim, &shapes, &op_core, &sizes, &missing,
-                                   broadcast_ndim));
+        return Err(broadcast_error(
+            sig,
+            &ndim,
+            &shapes,
+            &op_core,
+            &sizes,
+            &missing,
+            broadcast_ndim,
+        ));
     }
 
     // The output's core dimensions, in signature order, skipping the ones the
@@ -436,6 +443,9 @@ pub fn result_dtype(kind: MatKind, a: DType, b: DType) -> Result<DType> {
 /// synthesising it from `conj()` matters for both the low bits of a
 /// `complex64` result and the sign bits of NaNs.
 trait MatElem: Element + Copy {
+    /// Whether numpy compiles this dtype's matmul family with `USEBLAS`.
+    const HAS_BLAS: bool = false;
+
     type Acc: Copy;
     fn acc_zero() -> Self::Acc;
     fn acc_add(acc: Self::Acc, x: Self, y: Self) -> Self::Acc;
@@ -447,6 +457,61 @@ trait MatElem: Element + Copy {
     fn conj_zero() -> Self::ConjAcc;
     fn conj_add(acc: Self::ConjAcc, x: Self, y: Self) -> Self::ConjAcc;
     fn conj_finish(acc: Self::ConjAcc) -> Self;
+
+    /// `@TYPE@_dot`'s CBLAS branch. `None` means this dtype has no BLAS loop.
+    ///
+    /// # Safety
+    /// `x` and `y` must each address `n` in-bounds elements of `Self` spaced
+    /// by the positive element strides `incx` and `incy`.
+    unsafe fn dot_blas(
+        _x: *const u8,
+        _incx: i64,
+        _y: *const u8,
+        _incy: i64,
+        _n: usize,
+    ) -> Option<Self> {
+        None
+    }
+
+    /// `@TYPE@_gemv`'s CBLAS branch.
+    ///
+    /// # Safety
+    /// The pointers must describe the complete BLAS extents encoded by the
+    /// dimensions, leading dimension, and positive increments.
+    unsafe fn gemv_blas(
+        _matrix: *const u8,
+        _matrix_col_major: bool,
+        _lda: i64,
+        _vector: *const u8,
+        _incx: i64,
+        _out: *mut u8,
+        _incy: i64,
+        _m: usize,
+        _n: usize,
+    ) -> Option<()> {
+        None
+    }
+
+    /// `@TYPE@_matmul_matrixmatrix`'s CBLAS branch.
+    ///
+    /// # Safety
+    /// The pointers must describe the complete BLAS matrix extents encoded by
+    /// the dimensions, transpose flags, and leading dimensions.
+    unsafe fn gemm_blas(
+        _a: *const u8,
+        _transpose_a: bool,
+        _lda: i64,
+        _b: *const u8,
+        _transpose_b: bool,
+        _ldb: i64,
+        _out: *mut u8,
+        _ldc: i64,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Option<()> {
+        None
+    }
 
     /// True for the dtypes whose loop numpy leaves the FP status flags of.
     ///
@@ -610,8 +675,10 @@ int_elem!(u32);
 int_elem!(u64);
 
 macro_rules! float_elem {
-    ($t:ty) => {
+    ($t:ty, $dot:ident, $gemv:ident, $gemm:ident) => {
         impl MatElem for $t {
+            const HAS_BLAS: bool = true;
+
             type Acc = $t;
             #[inline]
             fn acc_zero() -> $t {
@@ -626,12 +693,76 @@ macro_rules! float_elem {
                 acc
             }
             conj_is_plain!();
+
+            #[inline]
+            unsafe fn dot_blas(
+                x: *const u8,
+                incx: i64,
+                y: *const u8,
+                incy: i64,
+                n: usize,
+            ) -> Option<Self> {
+                if !crate::blas::HAVE_CBLAS {
+                    return None;
+                }
+                // SAFETY: forwarded from this method's own strided-run
+                // contract.
+                Some(unsafe { crate::blas::$dot(x, incx, y, incy, n) })
+            }
+
+            #[inline]
+            unsafe fn gemv_blas(
+                matrix: *const u8,
+                matrix_col_major: bool,
+                lda: i64,
+                vector: *const u8,
+                incx: i64,
+                out: *mut u8,
+                incy: i64,
+                m: usize,
+                n: usize,
+            ) -> Option<()> {
+                if !crate::blas::HAVE_CBLAS {
+                    return None;
+                }
+                // SAFETY: forwarded from this method's own matrix/vector
+                // extent contract.
+                unsafe {
+                    crate::blas::$gemv(matrix, matrix_col_major, lda, vector, incx, out, incy, m, n)
+                };
+                Some(())
+            }
+
+            #[inline]
+            unsafe fn gemm_blas(
+                a: *const u8,
+                transpose_a: bool,
+                lda: i64,
+                b: *const u8,
+                transpose_b: bool,
+                ldb: i64,
+                out: *mut u8,
+                ldc: i64,
+                m: usize,
+                n: usize,
+                k: usize,
+            ) -> Option<()> {
+                if !crate::blas::HAVE_CBLAS {
+                    return None;
+                }
+                // SAFETY: forwarded from this method's own matrix-extent
+                // contract.
+                unsafe {
+                    crate::blas::$gemm(a, transpose_a, lda, b, transpose_b, ldb, out, ldc, m, n, k)
+                };
+                Some(())
+            }
         }
     };
 }
 
-float_elem!(f32);
-float_elem!(f64);
+float_elem!(f32, sdot, sgemv, sgemm);
+float_elem!(f64, ddot, dgemv, dgemm);
 
 impl MatElem for NpBool {
     type Acc = bool;
@@ -708,6 +839,8 @@ impl MatElem for F16 {
 }
 
 impl MatElem for C32 {
+    const HAS_BLAS: bool = true;
+
     type Acc = C32;
     #[inline]
     fn acc_zero() -> C32 {
@@ -747,7 +880,64 @@ impl MatElem for C32 {
     }
 
     #[inline]
-    unsafe fn dotc_cblas(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> Option<C32> {
+    unsafe fn dot_blas(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> Option<C32> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own strided-run contract.
+        Some(unsafe { crate::blas::cdotu(x, incx, y, incy, n) })
+    }
+
+    #[inline]
+    unsafe fn gemv_blas(
+        matrix: *const u8,
+        matrix_col_major: bool,
+        lda: i64,
+        vector: *const u8,
+        incx: i64,
+        out: *mut u8,
+        incy: i64,
+        m: usize,
+        n: usize,
+    ) -> Option<()> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own matrix/vector contract.
+        unsafe { crate::blas::cgemv(matrix, matrix_col_major, lda, vector, incx, out, incy, m, n) };
+        Some(())
+    }
+
+    #[inline]
+    unsafe fn gemm_blas(
+        a: *const u8,
+        transpose_a: bool,
+        lda: i64,
+        b: *const u8,
+        transpose_b: bool,
+        ldb: i64,
+        out: *mut u8,
+        ldc: i64,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Option<()> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own matrix-extent contract.
+        unsafe { crate::blas::cgemm(a, transpose_a, lda, b, transpose_b, ldb, out, ldc, m, n, k) };
+        Some(())
+    }
+
+    #[inline]
+    unsafe fn dotc_cblas(
+        x: *const u8,
+        incx: i64,
+        y: *const u8,
+        incy: i64,
+        n: usize,
+    ) -> Option<C32> {
         if !crate::blas::HAVE_CBLAS {
             return None;
         }
@@ -776,6 +966,8 @@ impl MatElem for C32 {
 }
 
 impl MatElem for C64v {
+    const HAS_BLAS: bool = true;
+
     type Acc = C64v;
     #[inline]
     fn acc_zero() -> C64v {
@@ -809,6 +1001,57 @@ impl MatElem for C64v {
     #[inline]
     fn conj_finish(acc: C64v) -> C64v {
         acc
+    }
+
+    #[inline]
+    unsafe fn dot_blas(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> Option<C64v> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own strided-run contract.
+        Some(unsafe { crate::blas::zdotu(x, incx, y, incy, n) })
+    }
+
+    #[inline]
+    unsafe fn gemv_blas(
+        matrix: *const u8,
+        matrix_col_major: bool,
+        lda: i64,
+        vector: *const u8,
+        incx: i64,
+        out: *mut u8,
+        incy: i64,
+        m: usize,
+        n: usize,
+    ) -> Option<()> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own matrix/vector contract.
+        unsafe { crate::blas::zgemv(matrix, matrix_col_major, lda, vector, incx, out, incy, m, n) };
+        Some(())
+    }
+
+    #[inline]
+    unsafe fn gemm_blas(
+        a: *const u8,
+        transpose_a: bool,
+        lda: i64,
+        b: *const u8,
+        transpose_b: bool,
+        ldb: i64,
+        out: *mut u8,
+        ldc: i64,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Option<()> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own matrix-extent contract.
+        unsafe { crate::blas::zgemm(a, transpose_a, lda, b, transpose_b, ldb, out, ldc, m, n, k) };
+        Some(())
     }
 
     #[inline]
@@ -881,9 +1124,7 @@ fn is_blasable2d(
         return false;
     }
     let unit_stride1 = byte_stride1 / isz;
-    byte_stride1 % isz == 0
-        && unit_stride1 >= d2
-        && unit_stride1 <= blas_max
+    byte_stride1 % isz == 0 && unit_stride1 >= d2 && unit_stride1 <= blas_max
 }
 
 /// The gufunc iterator normalises a size-1 core axis to stride zero. These are
@@ -891,7 +1132,11 @@ fn is_blasable2d(
 /// `blas_stride`, not the source ndarray's cosmetic stride for that axis.
 #[inline]
 fn gufunc_core_stride(byte_stride: isize, dim: isize) -> isize {
-    if dim == 1 { 0 } else { byte_stride }
+    if dim == 1 {
+        0
+    } else {
+        byte_stride
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -945,7 +1190,425 @@ fn conjugating_route(
     }
 }
 
+/// Run the `@TYPE@_dot` CBLAS branch for an `r`-by-`c` grid of dot products.
+/// This is the fallback used by standalone `vecdot`, `matvec`, and `vecmat`,
+/// and by `matmul`'s scalar-output special case.
+#[allow(clippy::too_many_arguments)]
+fn try_plain_dot_grid<T: MatElem>(
+    a_base: *const u8,
+    ao: isize,
+    sa_r: isize,
+    sa_k: isize,
+    b_base: *const u8,
+    bo: isize,
+    sb_k: isize,
+    sb_c: isize,
+    dst: &mut [T],
+    r: usize,
+    k: usize,
+    c: usize,
+    itemsize: usize,
+) -> bool {
+    if k == 0 {
+        return false;
+    }
+    let is1 = gufunc_core_stride(sa_k, k as isize);
+    let is2 = gufunc_core_stride(sb_k, k as isize);
+    let (Some(incx), Some(incy)) = (
+        crate::blas::blas_stride(is1, itemsize),
+        crate::blas::blas_stride(is2, itemsize),
+    ) else {
+        return false;
+    };
+    for i in 0..r {
+        for j in 0..c {
+            // SAFETY: `ao`/`bo` start this batch; the row/column offsets stay
+            // inside the logical matrices, and `blas_stride` validated both
+            // complete positive-stride runs of `k` elements.
+            let got = unsafe {
+                T::dot_blas(
+                    a_base.offset(ao + i as isize * sa_r),
+                    incx,
+                    b_base.offset(bo + j as isize * sb_c),
+                    incy,
+                    k,
+                )
+            };
+            let Some(value) = got else {
+                return false;
+            };
+            dst[i * c + j] = value;
+        }
+    }
+    true
+}
+
+/// Run numpy's `_gemv` wrapper after the caller has selected the same logical
+/// matrix/vector orientation as the generated C loop.
+#[allow(clippy::too_many_arguments)]
+fn try_gemv<T: MatElem>(
+    matrix_base: *const u8,
+    matrix_offset: isize,
+    matrix_stride_m: isize,
+    matrix_stride_n: isize,
+    vector_base: *const u8,
+    vector_offset: isize,
+    vector_stride_n: isize,
+    out: *mut u8,
+    out_stride_m: isize,
+    m: usize,
+    n: usize,
+    itemsize: usize,
+) -> bool {
+    let c_blasable = is_blasable2d(
+        matrix_stride_m,
+        matrix_stride_n,
+        m as isize,
+        n as isize,
+        itemsize,
+    );
+    let f_blasable = is_blasable2d(
+        matrix_stride_n,
+        matrix_stride_m,
+        n as isize,
+        m as isize,
+        itemsize,
+    );
+    let Some(incx) = crate::blas::blas_stride(vector_stride_n, itemsize) else {
+        return false;
+    };
+    let Some(incy) = crate::blas::blas_stride(out_stride_m, itemsize) else {
+        return false;
+    };
+    if !(c_blasable || f_blasable) {
+        return false;
+    }
+    let lda = if c_blasable {
+        matrix_stride_m / itemsize as isize
+    } else {
+        matrix_stride_n / itemsize as isize
+    } as i64;
+    // SAFETY: the two `is_blasable2d` predicates and both `blas_stride`
+    // conversions validate the full matrix/vector/output extents; offsets are
+    // the in-bounds starts of this batch.
+    unsafe {
+        T::gemv_blas(
+            matrix_base.offset(matrix_offset),
+            c_blasable,
+            lda,
+            vector_base.offset(vector_offset),
+            incx,
+            out,
+            incy,
+            m,
+            n,
+        )
+    }
+    .is_some()
+}
+
+/// Copy one logical matrix into the C- or Fortran-contiguous temporary numpy
+/// chooses when the original strides are not BLASable.
+#[allow(clippy::too_many_arguments)]
+fn copy_blas_matrix<T: Copy>(
+    base: *const u8,
+    offset: isize,
+    stride_row: isize,
+    stride_col: isize,
+    rows: usize,
+    cols: usize,
+    transpose: bool,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows * cols);
+    if transpose {
+        for j in 0..cols {
+            for i in 0..rows {
+                // SAFETY: `offset` is the in-bounds matrix start and both
+                // indices stay inside its logical extent.
+                out.push(unsafe {
+                    read(
+                        base,
+                        offset + i as isize * stride_row + j as isize * stride_col,
+                    )
+                });
+            }
+        }
+    } else {
+        for i in 0..rows {
+            for j in 0..cols {
+                // SAFETY: as above, in row-major temporary order.
+                out.push(unsafe {
+                    read(
+                        base,
+                        offset + i as isize * stride_row + j as isize * stride_col,
+                    )
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Matrix-matrix BLAS routing, including numpy's exact C/F layout tests and
+/// its copy orientation for non-BLASable operands.
+#[allow(clippy::too_many_arguments)]
+fn try_gemm<T: MatElem>(
+    a_base: *const u8,
+    ao: isize,
+    sa_r: isize,
+    sa_k: isize,
+    b_base: *const u8,
+    bo: isize,
+    sb_k: isize,
+    sb_c: isize,
+    out: *mut u8,
+    r: usize,
+    k: usize,
+    c: usize,
+    itemsize: usize,
+) -> bool {
+    let a_c = is_blasable2d(sa_r, sa_k, r as isize, k as isize, itemsize);
+    let a_f = is_blasable2d(sa_k, sa_r, k as isize, r as isize, itemsize);
+    let b_c = is_blasable2d(sb_k, sb_c, k as isize, c as isize, itemsize);
+    let b_f = is_blasable2d(sb_c, sb_k, c as isize, k as isize, itemsize);
+
+    let mut a_copy: Option<Vec<T>> = None;
+    let (a_ptr, transpose_a, lda) = if a_c {
+        // SAFETY: `ao` is the in-bounds start of this batch.
+        (
+            unsafe { a_base.offset(ao) },
+            false,
+            (sa_r / itemsize as isize) as i64,
+        )
+    } else if a_f {
+        // SAFETY: `ao` is the in-bounds start of this batch.
+        (
+            unsafe { a_base.offset(ao) },
+            true,
+            (sa_k / itemsize as isize) as i64,
+        )
+    } else {
+        let transpose = sa_r.unsigned_abs() < sa_k.unsigned_abs();
+        a_copy = Some(copy_blas_matrix::<T>(
+            a_base, ao, sa_r, sa_k, r, k, transpose,
+        ));
+        let copy = a_copy.as_ref().expect("matrix copy was just initialized");
+        (
+            copy.as_ptr() as *const u8,
+            transpose,
+            if transpose { r as i64 } else { k as i64 },
+        )
+    };
+
+    let mut b_copy: Option<Vec<T>> = None;
+    let (b_ptr, transpose_b, ldb) = if b_c {
+        // SAFETY: `bo` is the in-bounds start of this batch.
+        (
+            unsafe { b_base.offset(bo) },
+            false,
+            (sb_k / itemsize as isize) as i64,
+        )
+    } else if b_f {
+        // SAFETY: `bo` is the in-bounds start of this batch.
+        (
+            unsafe { b_base.offset(bo) },
+            true,
+            (sb_c / itemsize as isize) as i64,
+        )
+    } else {
+        let transpose = sb_k.unsigned_abs() < sb_c.unsigned_abs();
+        b_copy = Some(copy_blas_matrix::<T>(
+            b_base, bo, sb_k, sb_c, k, c, transpose,
+        ));
+        let copy = b_copy.as_ref().expect("matrix copy was just initialized");
+        (
+            copy.as_ptr() as *const u8,
+            transpose,
+            if transpose { k as i64 } else { c as i64 },
+        )
+    };
+
+    // Keep the backing temporary matrices alive across the FFI call.
+    let _keep_alive = (&a_copy, &b_copy);
+    // SAFETY: direct operands passed `is_blasable2d`; copied operands are
+    // densely laid out in the exact orientation represented by their
+    // transpose flag and leading dimension. `out` holds `r*c` writable
+    // elements in row-major order.
+    unsafe {
+        T::gemm_blas(
+            a_ptr,
+            transpose_a,
+            lda,
+            b_ptr,
+            transpose_b,
+            ldb,
+            out,
+            c as i64,
+            r,
+            c,
+            k,
+        )
+    }
+    .is_some()
+}
+
+/// Transcribe numpy's generated float/complex routing for one gufunc outer
+/// iteration. Cluster 1 intentionally limits this to a single batch; cluster
+/// 2 extends the same inner call over the broadcast batch loop.
+#[allow(clippy::too_many_arguments)]
+fn try_plain_blas_single<T: MatElem>(
+    kind: MatKind,
+    a: &NdArray,
+    b: &NdArray,
+    p: &Plan,
+    ao: isize,
+    bo: isize,
+    dst: &mut [T],
+) -> bool {
+    if !crate::blas::HAVE_CBLAS || !T::HAS_BLAS {
+        return false;
+    }
+    let (r, k, c) = (p.rows as usize, p.inner as usize, p.cols as usize);
+    let nl = p.loop_shape.len();
+    let itemsize = a.itemsize();
+    let is1_m = gufunc_core_stride(a.strides[nl], p.rows);
+    let is1_n = gufunc_core_stride(a.strides[nl + 1], p.inner);
+    let is2_n = gufunc_core_stride(b.strides[nl], p.inner);
+    let is2_p = gufunc_core_stride(b.strides[nl + 1], p.cols);
+    let a_base = a.buffer.as_ptr();
+    let b_base = b.buffer.as_ptr();
+    let out = dst.as_mut_ptr() as *mut u8;
+    let blas_max = if isize::BITS == 64 {
+        isize::MAX - 1
+    } else {
+        isize::MAX
+    };
+
+    match kind {
+        MatKind::VecDot => try_plain_dot_grid(
+            a_base, ao, is1_m, is1_n, b_base, bo, is2_n, is2_p, dst, r, k, c, itemsize,
+        ),
+        MatKind::MatVec => {
+            let too_big = p.rows > blas_max || p.inner > blas_max;
+            let matrix_blasable = is_blasable2d(is1_m, is1_n, p.rows, p.inner, itemsize)
+                || is_blasable2d(is1_n, is1_m, p.inner, p.rows, itemsize);
+            let vector_blasable = is_blasable2d(is2_n, itemsize as isize, p.inner, 1, itemsize);
+            if matrix_blasable && vector_blasable && !too_big && p.inner > 1 && p.rows > 1 {
+                try_gemv::<T>(
+                    a_base,
+                    ao,
+                    is1_m,
+                    is1_n,
+                    b_base,
+                    bo,
+                    is2_n,
+                    out,
+                    itemsize as isize,
+                    r,
+                    k,
+                    itemsize,
+                )
+            } else {
+                try_plain_dot_grid(
+                    a_base, ao, is1_m, is1_n, b_base, bo, is2_n, is2_p, dst, r, k, c, itemsize,
+                )
+            }
+        }
+        MatKind::VecMat => {
+            let too_big = p.cols > blas_max || p.inner > blas_max;
+            let vector_blasable = is_blasable2d(is1_n, itemsize as isize, p.inner, 1, itemsize);
+            let matrix_blasable = is_blasable2d(is2_n, is2_p, p.inner, p.cols, itemsize)
+                || is_blasable2d(is2_p, is2_n, p.cols, p.inner, itemsize);
+            if vector_blasable && matrix_blasable && !too_big && p.inner > 1 && p.cols > 1 {
+                try_gemv::<T>(
+                    b_base,
+                    bo,
+                    is2_p,
+                    is2_n,
+                    a_base,
+                    ao,
+                    is1_n,
+                    out,
+                    itemsize as isize,
+                    c,
+                    k,
+                    itemsize,
+                )
+            } else {
+                try_plain_dot_grid(
+                    a_base, ao, is1_m, is1_n, b_base, bo, is2_n, is2_p, dst, r, k, c, itemsize,
+                )
+            }
+        }
+        MatKind::MatMul => {
+            let special_case = p.rows == 1 || p.inner == 1 || p.cols == 1;
+            let any_zero = p.rows == 0 || p.inner == 0 || p.cols == 0;
+            let too_big = p.rows > blas_max || p.inner > blas_max || p.cols > blas_max;
+            if any_zero || too_big {
+                return false;
+            }
+            if !special_case {
+                return try_gemm::<T>(
+                    a_base, ao, is1_m, is1_n, b_base, bo, is2_n, is2_p, out, r, k, c, itemsize,
+                );
+            }
+            if p.rows == 1 && p.cols == 1 {
+                return try_plain_dot_grid(
+                    a_base, ao, is1_m, is1_n, b_base, bo, is2_n, is2_p, dst, r, k, c, itemsize,
+                );
+            }
+            if p.inner == 1 && (p.cols == 1 || p.rows == 1) {
+                return false;
+            }
+            let i1_blasable = is_blasable2d(is1_m, is1_n, p.rows, p.inner, itemsize)
+                || is_blasable2d(is1_n, is1_m, p.inner, p.rows, itemsize);
+            let i2_blasable = is_blasable2d(is2_n, is2_p, p.inner, p.cols, itemsize)
+                || is_blasable2d(is2_p, is2_n, p.cols, p.inner, itemsize);
+            let vector_matrix = p.rows == 1
+                && i2_blasable
+                && is_blasable2d(is1_n, itemsize as isize, p.inner, 1, itemsize);
+            if vector_matrix {
+                return try_gemv::<T>(
+                    b_base,
+                    bo,
+                    is2_p,
+                    is2_n,
+                    a_base,
+                    ao,
+                    is1_n,
+                    out,
+                    itemsize as isize,
+                    c,
+                    k,
+                    itemsize,
+                );
+            }
+            let matrix_vector = p.cols == 1
+                && i1_blasable
+                && is_blasable2d(is2_n, itemsize as isize, p.inner, 1, itemsize);
+            if matrix_vector {
+                return try_gemv::<T>(
+                    a_base,
+                    ao,
+                    is1_m,
+                    is1_n,
+                    b_base,
+                    bo,
+                    is2_n,
+                    out,
+                    itemsize as isize,
+                    r,
+                    k,
+                    itemsize,
+                );
+            }
+            false
+        }
+    }
+}
+
 fn kernel<T: MatElem>(
+    kind: MatKind,
     a: &NdArray,
     b: &NdArray,
     out: &mut NdArray,
@@ -977,6 +1640,13 @@ fn kernel<T: MatElem>(
             nbatch * r * c,
         )
     };
+
+    if !conj_a
+        && nbatch == 1
+        && try_plain_blas_single(kind, a, b, p, a_batch[0], b_batch[0], out_slice)
+    {
+        return;
+    }
 
     // Packed copies of the two tiles, so the innermost loop walks contiguous
     // memory whatever the operands' strides were.
@@ -1183,19 +1853,20 @@ pub fn matmul(
         ConjRoute::Scalar
     };
     match dt {
-        DType::Bool => kernel::<NpBool>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::I8 => kernel::<i8>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::I16 => kernel::<i16>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::I32 => kernel::<i32>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::I64 => kernel::<i64>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::U8 => kernel::<u8>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::U16 => kernel::<u16>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::U32 => kernel::<u32>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::U64 => kernel::<u64>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::F16 => kernel::<F16>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::F32 => kernel::<f32>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
-        DType::F64 => kernel::<f64>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::Bool => kernel::<NpBool>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I8 => kernel::<i8>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I16 => kernel::<i16>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I32 => kernel::<i32>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I64 => kernel::<i64>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U8 => kernel::<u8>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U16 => kernel::<u16>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U32 => kernel::<u32>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U64 => kernel::<u64>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F16 => kernel::<F16>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F32 => kernel::<f32>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F64 => kernel::<f64>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
         DType::C64 => kernel::<C32>(
+            kind,
             &av,
             &bv,
             &mut out,
@@ -1204,6 +1875,7 @@ pub fn matmul(
             &p,
         ),
         DType::C128 => kernel::<C64v>(
+            kind,
             &av,
             &bv,
             &mut out,
@@ -1272,7 +1944,11 @@ pub fn dot(a: &NdArray, b: &NdArray) -> Result<NdArray> {
         axes.extend((0..nd - 2).chain(std::iter::once(nd - 1)));
         let bt = b.permute(&axes)?;
         let rest: isize = bt.shape[1..].iter().product();
-        let btc = if bt.is_c_contiguous() { bt.clone() } else { bt.copy() };
+        let btc = if bt.is_c_contiguous() {
+            bt.clone()
+        } else {
+            bt.copy()
+        };
         (
             btc.reshape(&[kb, rest])?,
             b.shape[..nd - 2]
@@ -1328,7 +2004,10 @@ fn fmt_tuple(s: &[isize]) -> String {
     } else {
         format!(
             "({})",
-            s.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+            s.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         )
     }
 }
@@ -1478,6 +2157,90 @@ mod tests {
         assert_eq!(floats(&r), vec![3.]);
     }
 
+    #[cfg(all(target_os = "macos", target_vendor = "apple"))]
+    #[test]
+    fn contiguous_f64_family_matches_direct_accelerate_bits() {
+        let n = 33usize;
+        let av: Vec<f64> = (0..n * n)
+            .map(|i| ((i * 37 % 101) as f64 - 50.0) / 7.0)
+            .collect();
+        let bv: Vec<f64> = (0..n * n)
+            .map(|i| ((i * 53 % 97) as f64 - 48.0) / 11.0)
+            .collect();
+        let a = arr(&[n as isize, n as isize], &av);
+        let b = arr(&[n as isize, n as isize], &bv);
+
+        let got = matmul(MatKind::MatMul, &a, &b, None, None).unwrap();
+        let got_bits = floats(&got).iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        // SAFETY: both inputs and the result are dense `n`-by-`n` matrices.
+        // Reusing the result buffer also holds pointer alignment constant, as
+        // Accelerate may select a different microkernel for another address.
+        unsafe {
+            crate::blas::dgemm(
+                a.buffer.as_ptr().wrapping_offset(a.byte_offset),
+                false,
+                n as i64,
+                b.buffer.as_ptr().wrapping_offset(b.byte_offset),
+                false,
+                n as i64,
+                got.buffer.as_mut_ptr().offset(got.byte_offset),
+                n as i64,
+                n,
+                n,
+                n,
+            );
+        }
+        assert_eq!(
+            got_bits,
+            floats(&got).iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+
+        let vvals: Vec<f64> = (0..n)
+            .map(|i| ((i * 29 % 43) as f64 - 21.0) / 5.0)
+            .collect();
+        let v = arr(&[n as isize], &vvals);
+        let got_mv = matmul(MatKind::MatVec, &a, &v, None, None).unwrap();
+        let got_mv_bits = floats(&got_mv)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>();
+        // SAFETY: `a` is a dense `n`-by-`n` matrix and `v`/`got_mv` are
+        // dense length-`n` vectors. The output address stays unchanged.
+        unsafe {
+            crate::blas::dgemv(
+                a.buffer.as_ptr().wrapping_offset(a.byte_offset),
+                true,
+                n as i64,
+                v.buffer.as_ptr().wrapping_offset(v.byte_offset),
+                1,
+                got_mv.buffer.as_mut_ptr().offset(got_mv.byte_offset),
+                1,
+                n,
+                n,
+            );
+        }
+        assert_eq!(
+            got_mv_bits,
+            floats(&got_mv)
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let got_dot = matmul(MatKind::VecDot, &v, &v, None, None).unwrap();
+        // SAFETY: both arguments are the same live dense length-`n` vector.
+        let expected_dot = unsafe {
+            crate::blas::ddot(
+                v.buffer.as_ptr().wrapping_offset(v.byte_offset),
+                1,
+                v.buffer.as_ptr().wrapping_offset(v.byte_offset),
+                1,
+                n,
+            )
+        };
+        assert_eq!(floats(&got_dot)[0].to_bits(), expected_dot.to_bits());
+    }
+
     #[test]
     fn dotc_is_transcribed_not_synthesised() {
         let one = C64v::new(f64::NAN, 0.0);
@@ -1534,7 +2297,10 @@ mod tests {
         b.set_flat(1, Scalar::Float(0.0));
         crate::fpe::clear();
         let _ = matmul(MatKind::MatMul, &a, &b, None, None).unwrap();
-        assert_eq!(crate::fpe::take() & crate::fpe::INVALID, crate::fpe::INVALID);
+        assert_eq!(
+            crate::fpe::take() & crate::fpe::INVALID,
+            crate::fpe::INVALID
+        );
 
         // A finite float32 accumulator that no longer fits in float16.
         a.set_flat(0, Scalar::Float(60000.0));
@@ -1579,11 +2345,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(
-            format!("{e:?}").contains("core dimension 0"),
-            true,
-            "{e:?}"
-        );
+        assert_eq!(format!("{e:?}").contains("core dimension 0"), true, "{e:?}");
         match e {
             Error::ValueError(m) => assert_eq!(
                 m,
@@ -1663,11 +2425,14 @@ mod tests {
         let a = iarr(&[2, 2], &[1, 2, 3, 4]);
         let r = dot(&a, &a).unwrap();
         assert_eq!(r.dtype(), DType::I64);
-        assert_eq!(r.to_vec(), vec![
-            Scalar::Int(7),
-            Scalar::Int(10),
-            Scalar::Int(15),
-            Scalar::Int(22)
-        ]);
+        assert_eq!(
+            r.to_vec(),
+            vec![
+                Scalar::Int(7),
+                Scalar::Int(10),
+                Scalar::Int(15),
+                Scalar::Int(22)
+            ]
+        );
     }
 }
