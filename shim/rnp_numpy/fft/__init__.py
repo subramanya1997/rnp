@@ -4,7 +4,7 @@ import math as _math
 import warnings as _warnings
 
 from _rnp import _fft_c2c, _fft_c2r, _fft_r2c
-from rnp_numpy import asarray, conjugate
+from rnp_numpy import arange, asarray, conjugate, empty, integer, roll
 
 __all__ = [
     "fft", "ifft", "rfft", "irfft", "hfft", "ihfft", "fftn", "ifftn",
@@ -173,11 +173,59 @@ def irfft2(a, s=None, axes=(-2, -1), norm=None, out=None):
     return irfftn(a, s, axes, norm, out=out)
 
 
-def _pending(*args, **kwargs):
-    raise NotImplementedError("FFT transform cluster not implemented yet")
+_INTEGER_TYPES = (int, integer)
 
 
-fftfreq = rfftfreq = fftshift = ifftshift = _pending
+def fftshift(x, axes=None):
+    x = asarray(x)
+    if axes is None:
+        axes = tuple(range(x.ndim))
+        shift = [dim // 2 for dim in x.shape]
+    elif isinstance(axes, _INTEGER_TYPES):
+        shift = x.shape[axes] // 2
+    else:
+        shift = [x.shape[axis] // 2 for axis in axes]
+    return roll(x, shift, axes)
+
+
+def ifftshift(x, axes=None):
+    x = asarray(x)
+    if axes is None:
+        axes = tuple(range(x.ndim))
+        shift = [-(dim // 2) for dim in x.shape]
+    elif isinstance(axes, _INTEGER_TYPES):
+        shift = -(x.shape[axes] // 2)
+    else:
+        shift = [-(x.shape[axis] // 2) for axis in axes]
+    return roll(x, shift, axes)
+
+
+def _validate_device(device):
+    if device is not None and device != "cpu":
+        raise ValueError(f'Device not understood. Only "cpu" is allowed, but received: {device}')
+
+
+def fftfreq(n, d=1.0, device=None):
+    if not isinstance(n, _INTEGER_TYPES):
+        raise ValueError("n should be an integer")
+    _validate_device(device)
+    val = 1.0 / (n * d)
+    result = empty(n, int)
+    split = (n - 1) // 2 + 1
+    result[:split] = arange(0, split, dtype=int)
+    result[split:] = arange(-(n // 2), 0, dtype=int)
+    return result * val
+
+
+def rfftfreq(n, d=1.0, device=None):
+    if not isinstance(n, _INTEGER_TYPES):
+        raise ValueError("n should be an integer")
+    _validate_device(device)
+    val = 1.0 / (n * d)
+    n = n // 2 + 1
+    result = arange(0, n, dtype=int)
+    return result * val
+
 
 for _name in __all__:
     globals()[_name].__module__ = "numpy.fft"
