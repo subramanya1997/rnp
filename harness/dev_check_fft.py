@@ -27,9 +27,14 @@ def same_bytes(label, expected, actual, failures):
     if (str(expected.dtype), expected.shape, expected_bytes) != (
         str(actual.dtype), actual.shape, actual_bytes
     ):
+        actual_np = np.asarray(actual)
+        word_dtype = np.uint32 if expected.dtype.itemsize <= 8 else np.uint64
+        differing_words = np.count_nonzero(
+            expected.view(word_dtype) != actual_np.view(word_dtype)
+        )
+        max_abs = np.max(np.abs(expected - actual_np), initial=0.0)
         failures.append(
-            f"{label}: expected {expected.dtype}{expected.shape}, "
-            f"got {actual.dtype}{actual.shape}"
+            f"{label}: {differing_words} words differ, max_abs={max_abs!r}"
         )
 
 
