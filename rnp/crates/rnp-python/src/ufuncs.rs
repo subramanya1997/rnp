@@ -638,10 +638,24 @@ pub fn _ufunc_reduce<'py>(
         }
     };
     let mut arr = array_from_any(a, None, false)?;
+    let explicit_dtype = dtype.is_some_and(|d| !d.is_none());
     if let Some(d) = dtype {
         if !d.is_none() {
             let dt = dtype_from_any(d)?;
             arr = from_object(py, &arr, dt)?;
+        }
+    }
+    if !explicit_dtype && !op.is_logical() && !op.is_comparison() {
+        if let Some(o) = out.filter(|o| !o.is_none()) {
+            let cell = o
+                .cast::<PyNdArray>()
+                .map_err(|_| PyTypeError::new_err("output must be an array"))?;
+            // A reduction has one input/output accumulator operand.  With no
+            // explicit dtype, NumPy's ufunc resolver selects the common loop
+            // dtype of the input and supplied output (rather than computing
+            // in the input's default dtype and casting only at the end).
+            let loop_dt = rnp_core::promote(arr.dtype(), cell.borrow().arr.dtype());
+            arr = from_object(py, &arr, loop_dt)?;
         }
     }
     // `where=` replaces the masked-out elements with the identity.
@@ -677,7 +691,8 @@ pub fn _ufunc_reduce<'py>(
     }
     // numpy accumulates `add`/`multiply` over bool and narrow integers in the
     // platform integer, exactly as `np.sum`/`np.prod` do.
-    if dtype.map(|d| d.is_none()).unwrap_or(true)
+    if !explicit_dtype
+        && out.is_none_or(|o| o.is_none())
         && matches!(op, BinOp::Add | BinOp::Mul)
         && arr.dtype().is_exact()
         && arr.dtype().itemsize() < 8

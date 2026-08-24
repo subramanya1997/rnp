@@ -2588,6 +2588,9 @@ pub fn store_or_wrap<'py>(
         .cast::<PyNdArray>()
         .map_err(|_| PyTypeError::new_err("return arrays must be of ArrayType"))?;
     let target = cell.borrow().arr.clone();
+    if !target.flags.writeable {
+        return Err(PyValueError::new_err("output array is read-only"));
+    }
     if target.shape != res.shape {
         return Err(PyValueError::new_err(format!(
             "could not broadcast input array from shape {} into shape {}",
