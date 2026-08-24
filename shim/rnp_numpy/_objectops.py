@@ -237,6 +237,8 @@ def _is_object_dtype(x):
 
 def wrap_promote(orig):
     def promote_types(a, b):
+        if a is b:
+            return orig(a, b)
         if _is_object_dtype(a) or _is_object_dtype(b):
             return _pkg().dtype(object)
         return orig(a, b)

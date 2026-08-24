@@ -6,8 +6,10 @@ use std::hash::{Hash, Hasher};
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use std::sync::OnceLock;
-use pyo3::types::{PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
+use std::sync::{OnceLock, RwLock};
+use pyo3::types::{
+    PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyMappingProxy, PyString, PyTuple, PyType,
+};
 use pyo3::PyTypeInfo;
 
 use rnp_core::descr::{make_struct, make_subarray, FieldSpec};
@@ -17,6 +19,64 @@ use rnp_core::{DType, Descr};
 /// can hand back `np.float64` and friends without rnp-core knowing about
 /// Python classes.
 static SCALAR_TYPES: OnceLock<Py<PyDict>> = OnceLock::new();
+
+/// Python owns dtype metadata values.  Core descriptors carry only a compact
+/// identity, keeping `Descr: Copy` while arrays and views propagate the
+/// decoration with their descriptor.  Entries intentionally live for the
+/// process lifetime, just like the compound-dtype interners in rnp-core.
+static METADATA: OnceLock<RwLock<Vec<Py<PyDict>>>> = OnceLock::new();
+
+fn metadata_store() -> &'static RwLock<Vec<Py<PyDict>>> {
+    METADATA.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn metadata_dict(py: Python<'_>, id: u32) -> Option<Py<PyDict>> {
+    if id == 0 {
+        return None;
+    }
+    metadata_store()
+        .read()
+        .ok()?
+        .get(id as usize - 1)
+        .map(|d| d.clone_ref(py))
+}
+
+fn intern_metadata(py: Python<'_>, source: &Bound<'_, PyDict>) -> PyResult<u32> {
+    let copied = PyDict::new(py);
+    copied.update(source.as_mapping())?;
+    let mut store = metadata_store()
+        .write()
+        .map_err(|_| PyTypeError::new_err("dtype metadata registry is poisoned"))?;
+    store.push(copied.unbind());
+    Ok(store.len() as u32)
+}
+
+/// Compare compound storage recursively while ignoring metadata decoration.
+/// This cannot live in `Descr::Hash`: compound interning hashes definitions
+/// while holding its write lock, so recursively re-entering that registry
+/// would deadlock.
+pub(crate) fn storage_eq(a: Descr, b: Descr) -> bool {
+    match (a.struct_def(), b.struct_def()) {
+        (Some(a), Some(b)) => {
+            a.itemsize == b.itemsize
+                && a.alignment == b.alignment
+                && a.aligned == b.aligned
+                && a.fields.len() == b.fields.len()
+                && a.fields.iter().zip(&b.fields).all(|(a, b)| {
+                    a.name == b.name
+                        && storage_eq(a.descr, b.descr)
+                        && a.offset == b.offset
+                        && a.title == b.title
+                })
+        }
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => match (a.subarray_def(), b.subarray_def()) {
+            (Some(a), Some(b)) => a.shape == b.shape && storage_eq(a.base, b.base),
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => a == b,
+        },
+    }
+}
 
 pub fn register_scalar_types(d: Bound<'_, PyDict>) {
     let _ = SCALAR_TYPES.set(d.unbind());
@@ -206,8 +266,26 @@ fn descr_from_tuple(t: &Bound<'_, PyTuple>, align: bool) -> PyResult<Descr> {
             "a dtype tuple must be (base, shape) or (base, itemsize)",
         ));
     }
-    let base = descr_from_any_aligned(&t.get_item(0)?, align)?;
+    let first = t.get_item(0)?;
     let second = t.get_item(1)?;
+    // `(np.void, dtype)` is NumPy's legacy way to retain a descriptor's
+    // structure/metadata while expressing opaque scalar storage.
+    if first
+        .getattr("__name__")
+        .ok()
+        .and_then(|n| n.extract::<String>().ok())
+        .as_deref()
+        == Some("void")
+    {
+        if let Ok(source) = second.extract::<PyDType>() {
+            if source.d.is_struct() {
+                return Ok(source.d);
+            }
+            return Ok(Descr::native(DType::Void(source.d.itemsize() as u32))
+                .with_metadata(source.d.metadata));
+        }
+    }
+    let base = descr_from_any_aligned(&first, align)?;
     let shape = shape_arg(&second)?;
     if shape.is_empty() {
         return Ok(base);
@@ -313,12 +391,44 @@ fn struct_from_dict(d: &Bound<'_, PyDict>, align: bool) -> PyResult<Descr> {
 #[pymethods]
 impl PyDType {
     #[new]
-    #[pyo3(signature = (obj, align = false, copy = false))]
-    fn py_new(obj: &Bound<'_, PyAny>, align: bool, copy: bool) -> PyResult<Self> {
+    #[pyo3(signature = (obj, align = false, copy = false, **kwargs))]
+    fn py_new(
+        obj: &Bound<'_, PyAny>,
+        align: bool,
+        copy: bool,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let _ = copy;
-        Ok(PyDType {
-            d: descr_from_any_aligned(obj, align)?,
-        })
+        let mut d = descr_from_any_aligned(obj, align)?;
+        if let Some(kwargs) = kwargs {
+            for (key, _) in kwargs.iter() {
+                let key: String = key.extract()?;
+                if key != "metadata" {
+                    return Err(PyTypeError::new_err(format!(
+                        "dtype() got an unexpected keyword argument '{key}'"
+                    )));
+                }
+            }
+            if let Some(value) = kwargs.get_item("metadata")? {
+                let supplied = value.cast::<PyDict>().map_err(|_| {
+                    let type_name = value
+                        .get_type()
+                        .name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "object".into());
+                    PyTypeError::new_err(format!(
+                        "dtype() argument 4 must be dict, not {type_name}"
+                    ))
+                })?;
+                let merged = PyDict::new(obj.py());
+                if let Some(old) = metadata_dict(obj.py(), d.metadata) {
+                    merged.update(old.bind(obj.py()).as_mapping())?;
+                }
+                merged.update(supplied.as_mapping())?;
+                d.metadata = intern_metadata(obj.py(), &merged)?;
+            }
+        }
+        Ok(PyDType { d })
     }
 
     #[getter]
@@ -442,8 +552,13 @@ impl PyDType {
     }
 
     #[getter]
-    fn metadata(&self) -> Option<()> {
-        None
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(dict) = metadata_dict(py, self.d.metadata) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            PyMappingProxy::new(py, dict.bind(py).as_mapping()).into_any(),
+        ))
     }
 
     /// `dtype.fields`: `{name: (dtype, offset[, title])}`, or None.
@@ -557,7 +672,12 @@ impl PyDType {
 
     fn __hash__(&self) -> u64 {
         let mut h = DefaultHasher::new();
-        self.d.hash(&mut h);
+        if self.d.is_struct() || self.d.subarray_def().is_some() {
+            // repr omits metadata but captures compound storage recursively.
+            self.d.repr_string().hash(&mut h);
+        } else {
+            self.d.hash(&mut h);
+        }
         h.finish()
     }
 
@@ -593,7 +713,7 @@ impl PyDType {
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
         let py = other.py();
         let eq = match descr_from_any(other) {
-            Ok(d) => d == self.d,
+            Ok(d) => storage_eq(d, self.d),
             // numpy returns False rather than raising for junk comparisons.
             Err(_) => false,
         };
@@ -608,6 +728,18 @@ impl PyDType {
         let py = slf.py();
         let cls = slf.get_type().into_any();
         let args = PyTuple::new(py, [slf.borrow().d.str_code()])?.into_any();
-        PyTuple::new(py, [cls, args])
+        let metadata = metadata_dict(py, slf.borrow().d.metadata);
+        match metadata {
+            None => PyTuple::new(py, [cls, args]),
+            Some(metadata) => {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("metadata", metadata.bind(py))?;
+                let callable = py
+                    .import("functools")?
+                    .getattr("partial")?
+                    .call((cls,), Some(&kwargs))?;
+                PyTuple::new(py, [callable, args])
+            }
+        }
     }
 }

@@ -493,15 +493,34 @@ binary_ufunc!(greater, BinOp::Gt);
 binary_ufunc!(greater_equal, BinOp::Ge);
 
 #[pyfunction]
-fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDType> {
+fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let (da, db) = (descr_from_any(a)?, descr_from_any(b)?);
-    promote_descr(da, db).map(PyDType::from_descr)
+    let promoted = promote_descr(da, db)?;
+    if promoted.metadata != 0
+        && promoted.metadata == da.metadata
+        && crate::pydtype::storage_eq(promoted, da)
+    {
+        return Ok(a.clone().unbind());
+    }
+    if promoted.metadata != 0
+        && promoted.metadata == db.metadata
+        && crate::pydtype::storage_eq(promoted, db)
+    {
+        return Ok(b.clone().unbind());
+    }
+    Ok(Py::new(a.py(), PyDType::from_descr(promoted))?.into_any())
 }
 
 /// NumPy's descriptor-level common instance operation. Compound dtypes keep
 /// their field/subarray metadata here; reducing them to `DType::Void` loses
 /// the information `_promote_fields` needs.
 fn promote_descr(da: Descr, db: Descr) -> PyResult<Descr> {
+    // Passing the very same native decorated dtype twice preserves it.  A
+    // byte-swapped common instance is canonicalized below and normally loses
+    // metadata (Unicode is NumPy's historical exception).
+    if da == db && da.metadata != 0 && da.metadata == db.metadata && da.isnative() {
+        return Ok(da);
+    }
     match (da.struct_def(), db.struct_def()) {
         (Some(a), Some(b)) => {
             let a_names: Vec<&str> = a.fields.iter().map(|f| f.name.as_str()).collect();
@@ -554,7 +573,15 @@ fn promote_descr(da: Descr, db: Descr) -> PyResult<Descr> {
     if da == db {
         // NumPy's common-instance operation normalizes primitive byte order,
         // including leaves of an otherwise identical structured dtype.
-        return Ok(Descr::native(da.dt));
+        let mut out = Descr::native(da.dt);
+        if da.dt.is_flexible()
+            || (matches!(da.dt, DType::Str(_))
+                && da.metadata != 0
+                && da.metadata == db.metadata)
+        {
+            out.metadata = da.metadata;
+        }
+        return Ok(out);
     }
     if da.dt.is_flexible() || db.dt.is_flexible() {
         let text = match (da.dt, db.dt) {
@@ -577,16 +604,30 @@ fn promote_descr(da: Descr, db: Descr) -> PyResult<Descr> {
                 DType::Str(_) => DType::Str(width),
                 _ => unreachable!(),
             };
-            return Ok(Descr::native(promoted));
+            let mut out = Descr::native(promoted);
+            if width == current {
+                out.metadata = if da.dt.is_flexible() {
+                    da.metadata
+                } else {
+                    db.metadata
+                };
+            }
+            return Ok(out);
         }
         let p = rnp_core::dtype::promote_flexible(da.dt, db.dt).ok_or_else(|| {
-            PyValueError::new_err(format!(
+            dtype_promotion_error(format!(
                 "The DType {} could not be promoted by {}.",
                 da.str_code(),
                 db.str_code()
             ))
         })?;
-        return Ok(Descr::native(p));
+        let mut out = Descr::native(p);
+        if p == da.dt {
+            out.metadata = da.metadata;
+        } else if da.kind() == db.kind() && p == db.dt {
+            out.metadata = db.metadata;
+        }
+        return Ok(out);
     }
     if da.dt.is_datetime_like() || db.dt.is_datetime_like() {
         // Datetime promotion has its own failure modes (nonlinear units,
@@ -794,6 +835,12 @@ fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
         .iter()
         .map(|arg| result_type_descr(&arg))
         .collect::<PyResult<_>>()?;
+    if args.len() == 1 {
+        let arg = args.get_item(0)?;
+        if arg.extract::<PyDType>().is_ok() || arg.cast::<PyNdArray>().is_ok() {
+            return Ok(PyDType::from_descr(descriptors[0]));
+        }
+    }
     if descriptors
         .iter()
         .any(|d| d.is_struct() || d.subarray_def().is_some())

@@ -916,7 +916,10 @@ impl PyNdArray {
         let d = descr_from_any(dtype)?;
         let out = if d == self.arr.descr && d.alias == self.arr.descr.alias {
             if copy {
-                self.arr.copy()
+                // A real copy adopts the requested dtype decoration.  With
+                // copy=False NumPy may return `self`, so its existing
+                // metadata necessarily wins instead.
+                self.arr.copy().into_descr(d)
             } else {
                 self.arr.clone()
             }

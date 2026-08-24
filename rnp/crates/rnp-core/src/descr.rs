@@ -106,12 +106,34 @@ pub enum Alias {
 }
 
 /// One field of a structured dtype.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Field {
     pub name: String,
     pub descr: Descr,
     pub offset: usize,
     pub title: Option<String>,
+}
+
+impl PartialEq for Field {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.descr == other.descr
+            && self.descr.metadata == other.descr.metadata
+            && self.offset == other.offset
+            && self.title == other.title
+    }
+}
+
+impl Eq for Field {}
+
+impl std::hash::Hash for Field {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.descr.hash(state);
+        self.descr.metadata.hash(state);
+        self.offset.hash(state);
+        self.title.hash(state);
+    }
 }
 
 /// The interned body of a structured dtype.
@@ -125,10 +147,28 @@ pub struct StructDef {
 }
 
 /// The interned body of a subarray dtype (`('f4', (2, 2))`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct SubArrayDef {
     pub base: Descr,
     pub shape: Vec<isize>,
+}
+
+impl PartialEq for SubArrayDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base
+            && self.base.metadata == other.base.metadata
+            && self.shape == other.shape
+    }
+}
+
+impl Eq for SubArrayDef {}
+
+impl std::hash::Hash for SubArrayDef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.base.hash(state);
+        self.base.metadata.hash(state);
+        self.shape.hash(state);
+    }
 }
 
 /// Process-wide interning of the compound dtype bodies.
@@ -199,6 +239,10 @@ pub struct Descr {
     /// Only affects `num`/`char`; ignored by equality and hashing, exactly
     /// as numpy's `dtype('q') == dtype('l')` is true with different `num`s.
     pub alias: Alias,
+    /// Opaque front-end metadata identity.  The core deliberately never
+    /// interprets this value and equality/hash ignore it, matching NumPy's
+    /// rule that dtype metadata is a decoration rather than storage layout.
+    pub metadata: u32,
 }
 
 impl PartialEq for Descr {
@@ -232,6 +276,7 @@ impl Descr {
             dt,
             bo,
             alias: Alias::None,
+            metadata: 0,
         }
     }
 
@@ -245,6 +290,12 @@ impl Descr {
 
     pub fn native(dt: DType) -> Descr {
         Descr::new(dt, ByteOrder::Native)
+    }
+
+    /// Return this storage descriptor carrying an opaque metadata identity.
+    pub fn with_metadata(mut self, metadata: u32) -> Descr {
+        self.metadata = metadata;
+        self
     }
 
     pub fn itemsize(&self) -> usize {
@@ -459,13 +510,15 @@ impl Descr {
                 Ok(Descr::new(
                     DType::Struct(registry::intern_struct(new)),
                     ByteOrder::NotApplicable,
-                ))
+                )
+                .with_metadata(self.metadata))
             }
             DType::SubArray(id) => {
                 let def = registry::subarray_def(id);
-                Ok(make_subarray(def.base.newbyteorder(order)?, def.shape.clone()))
+                Ok(make_subarray(def.base.newbyteorder(order)?, def.shape.clone())
+                    .with_metadata(self.metadata))
             }
-            _ => Ok(Descr::new(self.dt, target)),
+            _ => Ok(Descr::new(self.dt, target).with_metadata(self.metadata)),
         }
     }
 
