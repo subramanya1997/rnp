@@ -588,11 +588,12 @@ if not hasattr(_np.ndarray, "tofile"):
 
 def _line_source(fname, encoding, newline_ok=True):
     """Yield decoded lines from a path, file object or iterable of lines."""
+    codec = "latin-1" if encoding == "bytes" else (encoding or "utf-8")
     if isinstance(fname, (str, bytes)) or hasattr(fname, "__fspath__"):
         path = os.fspath(fname)
         if isinstance(path, bytes):
             path = path.decode("latin-1")
-        fh = open(path, encoding=encoding or "utf-8")
+        fh = open(path, encoding=codec)
         try:
             yield from fh
         finally:
@@ -600,7 +601,7 @@ def _line_source(fname, encoding, newline_ok=True):
         return
     for line in fname:
         if isinstance(line, bytes):
-            line = line.decode(encoding or "utf-8")
+            line = line.decode(codec)
         yield line
 
 
@@ -803,9 +804,13 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
         out = []
         for j, field in enumerate(r):
             if allconv is not None:
-                field = allconv(field)
+                argument = (field.encode("latin-1")
+                            if encoding == "bytes" else field)
+                field = allconv(argument)
             elif colconv is not None and j in colconv:
-                field = colconv[j](field)
+                argument = (field.encode("latin-1")
+                            if encoding == "bytes" else field)
+                field = colconv[j](argument)
             out.append(field if not isinstance(field, str) else
                        conv(field.strip()))
         data.append(out)
@@ -939,9 +944,13 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
                 out.append(fill)
                 continue
             if allconv is not None:
-                field = allconv(field)
+                argument = (field.encode("latin-1")
+                            if encoding == "bytes" else field)
+                field = allconv(argument)
             elif colconv is not None and j in colconv:
-                field = colconv[j](field)
+                argument = (field.encode("latin-1")
+                            if encoding == "bytes" else field)
+                field = colconv[j](argument)
             if isinstance(field, str):
                 try:
                     converter = (field_converters[j] if field_converters
