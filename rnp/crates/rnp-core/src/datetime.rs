@@ -1308,12 +1308,12 @@ pub fn make_iso8601(
             )));
         }
     }
+    // numpy formats the year with `%04lld`, which counts the sign toward the
+    // field width -- so year -1 prints as `-001`, not `-0001` (verified with a
+    // C probe: `printf("%04lld", -1LL)` gives `-001`). Rust's `{:04}` has the
+    // same rule, so this needs no special case for negative years; adding one
+    // is what produced `-0001-01-01`.
     let mut s = format!("{:04}", dts.year);
-    if dts.year < 0 {
-        // Rust's `{:04}` counts the sign toward the width; numpy's `%04lld`
-        // does too, so `-0001` needs one more digit than `%04` gives.
-        s = format!("{}{:04}", "-", -dts.year);
-    }
     if base == UNIT_Y {
         return Ok(s);
     }

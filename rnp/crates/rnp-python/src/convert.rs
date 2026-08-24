@@ -106,6 +106,36 @@ pub fn element_to_py<'py>(
     scalar_to_py(py, arr.read_at(off))
 }
 
+/// The Python object `tolist()` (and `item()`) hand back for one element.
+///
+/// This differs from [`element_to_py`] for the datetime-like dtypes *only*.
+/// numpy's `tolist`/`item` convert to the `datetime` module's types, while
+/// iteration and `a[i]` hand back `np.datetime64`/`np.timedelta64` scalars --
+/// so the two conversions genuinely are different functions, and the object
+/// ufunc loops want the scalar one.
+///
+/// Probed from numpy 2.5.2 across all 13 units:
+///   * NaT -> `None`, for every unit and both kinds;
+///   * `M8[Y|M|W|D]` -> `datetime.date`;
+///   * `M8[h|m|s|ms|us]` -> `datetime.datetime`;
+///   * `m8[W|D|h|m|s|ms|us]` -> `datetime.timedelta`;
+///   * `m8[Y]`/`m8[M]` -> plain `int` (they are not commensurate with days);
+///   * everything `ns` and finer -> plain `int`;
+///   * any value the Python type cannot represent -> plain `int`.
+/// The scalar classes already implement exactly that table in `.item()`, so
+/// this defers to them rather than duplicating it.
+pub fn element_to_py_item<'py>(
+    py: Python<'py>,
+    arr: &NdArray,
+    off: isize,
+) -> PyResult<Bound<'py, PyAny>> {
+    if arr.dtype().is_datetime_like() {
+        let sc = npscalar_to_py(py, arr.dtype(), arr.read_at(off))?;
+        return sc.call_method0("item");
+    }
+    element_to_py(py, arr, off)
+}
+
 /// Build the numpy scalar object for one element, falling back to the plain
 /// Python value when the shim has not registered a class for that dtype.
 pub fn npscalar_to_py<'py>(

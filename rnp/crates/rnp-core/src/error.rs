@@ -33,6 +33,24 @@ pub enum Error {
         dtypes: Vec<String>,
         message: String,
     },
+    /// numpy's `_UFuncInputCastingError` (also a `UFuncTypeError`).
+    ///
+    /// The datetime resolvers reach this rather than a metadata error when the
+    /// two units are *incommensurate* -- `M8[D] + m8[Y]`. numpy does not look
+    /// for a common divisor there: it resolves the loop to the datetime
+    /// operand's own unit and then fails casting the other input into it, so
+    /// what surfaces is `Cannot cast ufunc 'add' input 1 from dtype('<m8[Y]')
+    /// to dtype('<m8[D]') with casting rule 'same_kind'`. Probed from 2.5.2.
+    UFuncInputCasting {
+        ufunc: String,
+        /// Which input failed to cast (0-based, as numpy numbers them).
+        index: usize,
+        /// `dtype.str`-style source and target, e.g. `"<m8[Y]"`, `"<m8[D]"`.
+        from: String,
+        to: String,
+        casting: String,
+        message: String,
+    },
     OverflowError(String),
     RuntimeError(String),
     NotImplemented(String),
@@ -53,6 +71,7 @@ impl Error {
             | Error::NotImplemented(m) => m,
             Error::UFuncNoLoop { message, .. } => message,
             Error::UFuncBinaryResolution { message, .. } => message,
+            Error::UFuncInputCasting { message, .. } => message,
         }
     }
 }

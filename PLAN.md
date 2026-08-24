@@ -677,3 +677,33 @@ benchmark run, Fable review, git commit.
     safely in this pass.
   * `memmap`'s last 3 failures need real ndarray subclassing: `_rnp.ndarray`
     has no `tp_new` and `.view()` ignores its type argument.
+
+- 2026-08-23: M5 build ran (Opus lanes: pylib, struct, datetime, objloops,
+  matmul, buf-fix, collect, nep50, straggler). All branches merged into main,
+  but the orchestrating session was cut off (two lanes died on API 529s and
+  their residue was committed as unverified WIP snapshots) before the
+  post-merge rebuild + verification ever ran. Landed per git log: matmul/dot
+  family (numpy's dotc transcribed), datetime64/timedelta64 storage +
+  arithmetic + repr, structured field access, object-dtype ufunc loops,
+  buffer/__array__ adoption fixes, NEP 50 C-conversion bounds (unfinished),
+  harness sharding for oversized files (test_multiarray now measurable),
+  lexsort/tobytes/clip/std/var/pickle/frombuffer/getfield breadth,
+  numpy._core._multiarray_umath, linalg skeleton (WIP residue).
+
+- 2026-08-23: post-merge verification (Fable). Rebuilt in the main venv
+  (the installed extension predated the last two merges). cargo test
+  --release: 150/150 green. dev_check gates are NOT met on the merged tree:
+  dev_check 36504/105 (was 0 pre-M5; ~104 datetime: tolist not returning
+  datetime/timedelta objects or None for NaT, negative-year repr '-0001' vs
+  numpy's '-001', TypeError instead of UFuncTypeError on mismatched-unit
+  M8±m8[Y]; plus 1 vecmat complex-NaN), dev_check_nep50 12094/39
+  (OverflowError message parity — the crashed lane's unfinished work),
+  dev_check_object 2641/4 (dtype('O') vs dtype('object') in messages),
+  dev_check_straggler 1697/3 (getfield message; a REAL tobytes order='F'
+  value bug; std complex128 last-ULP), dev_check_struct 16922/339
+  (multi-field setitem, struct→struct astype, subarray-field construction,
+  VOID sort/argsort ordering). dev_check_buffer 27405/0 and dev_check_matmul
+  3862/0 are green. Three Opus fix lanes launched in fresh worktrees:
+  m5/dt-fix2 (datetime cluster), m5/struct-fix (struct cluster), m5/msgs
+  (nep50 messages + object text + straggler + vecmat). Full-suite scoreboard
+  baseline running in parallel.

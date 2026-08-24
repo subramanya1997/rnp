@@ -78,7 +78,39 @@ pub(crate) fn err(e: rnp_core::Error) -> PyErr {
             dtypes,
             message,
         } => binary_resolution_err(ufunc, dtypes, message),
+        rnp_core::Error::UFuncInputCasting {
+            ufunc,
+            index,
+            from,
+            to,
+            casting,
+            message,
+        } => input_casting_err(ufunc, index, from, to, casting, message),
     }
+}
+
+/// numpy's `_UFuncInputCastingError`, built through the shim's factory so the
+/// exception really is a `UFuncTypeError` subclass and not a bare `TypeError`.
+fn input_casting_err(
+    ufunc: String,
+    index: usize,
+    from: String,
+    to: String,
+    casting: String,
+    fallback: String,
+) -> PyErr {
+    Python::attach(|py| {
+        let Some(d) = ERROR_FACTORIES.get() else {
+            return PyTypeError::new_err(fallback);
+        };
+        match d.bind(py).get_item("ufunc_input_casting") {
+            Ok(Some(f)) => match f.call1((ufunc, casting, from, to, index)) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(e) => e,
+            },
+            _ => PyTypeError::new_err(fallback),
+        }
+    })
 }
 
 /// numpy's `_UFuncBinaryResolutionError`, built through the shim's factory so
@@ -898,38 +930,59 @@ fn _datetime_objects(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>
         }
         if dt.is_timedelta() {
             match dtm::timedelta_parts(meta, v) {
+                // `datetime.timedelta` has a much narrower range than i64
+                // weeks/days/hours do, and it raises OverflowError rather
+                // than saturating. numpy hands back the raw integer for any
+                // value the type cannot hold, so a construction failure is
+                // an expected outcome here, not an error to propagate.
                 Some((days, secs, us)) => {
-                    let td = dtmod.getattr("timedelta")?.call1((days, secs, us))?;
-                    out.append(td)?;
+                    match dtmod.getattr("timedelta")?.call1((days, secs, us)) {
+                        Ok(td) => out.append(td)?,
+                        Err(_) => out.append(v)?,
+                    }
                 }
                 // Y/M and the sub-microsecond units have no `timedelta`
-                // representation, so numpy hands back the raw integer.
+                // representation at all, so those are always the raw integer.
                 None => out.append(v)?,
             }
             continue;
         }
-        // Years and months are out of `datetime`'s range as *offsets*, and
-        // anything finer than microseconds cannot be represented, so numpy
-        // returns the raw integer for those.
-        if meta.base < dtm::UNIT_D || meta.base > dtm::UNIT_US {
+        // A datetime64 converts for every unit from years down to
+        // microseconds: `np.datetime64(0, 'Y').item()` is `date(1970, 1, 1)`,
+        // verified against 2.5.2 for Y/M/W as well as D. (The coarse units
+        // are only unrepresentable for *timedelta*, which is an offset and is
+        // handled above -- conflating the two was costing 3 units x 3 kinds
+        // of check here.) Anything finer than microseconds, and the generic
+        // unit, still come back as the raw integer.
+        if meta.base > dtm::UNIT_US {
             out.append(v)?;
             continue;
         }
-        let dts = dtm::dt64_to_dts(meta, v).map_err(err)?;
+        // Same rule as the timedelta branch: a value `datetime`/`date` cannot
+        // represent comes back as the raw integer rather than raising. That
+        // covers both a calendar conversion that overflows i64 arithmetic and
+        // a year outside 1..=9999.
+        let Ok(dts) = dtm::dt64_to_dts(meta, v) else {
+            out.append(v)?;
+            continue;
+        };
         if dts.year < 1 || dts.year > 9999 {
             out.append(v)?;
             continue;
         }
-        let obj = if meta.base <= dtm::UNIT_D {
+        let built = if meta.base <= dtm::UNIT_D {
             dtmod
                 .getattr("date")?
-                .call1((dts.year, dts.month, dts.day))?
+                .call1((dts.year, dts.month, dts.day))
         } else {
             dtmod.getattr("datetime")?.call1((
                 dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.us,
-            ))?
+            ))
         };
-        out.append(obj)?;
+        match built {
+            Ok(obj) => out.append(obj)?,
+            Err(_) => out.append(v)?,
+        }
     }
     Ok(out.into_any().unbind())
 }

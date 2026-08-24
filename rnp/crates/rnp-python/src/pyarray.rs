@@ -72,7 +72,7 @@ fn nested_list<'py>(
     index: &mut Vec<isize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if index.len() == arr.ndim() {
-        return crate::convert::element_to_py(py, arr, arr.byte_index(index));
+        return crate::convert::element_to_py_item(py, arr, arr.byte_index(index));
     }
     let n = arr.shape[index.len()];
     let mut items = Vec::with_capacity(n.max(0) as usize);
