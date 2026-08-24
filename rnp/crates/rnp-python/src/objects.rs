@@ -10,8 +10,11 @@
 //! upstream test modules construct and inspect these arrays. Dropping to real
 //! per-element refcounting is tracked as an M4 item in PLAN.md.
 
+use std::cmp::Ordering;
 use std::sync::Mutex;
 
+use pyo3::exceptions::PyValueError;
+use pyo3::pyclass::CompareOp;
 use pyo3::prelude::*;
 
 use rnp_core::{DType, NdArray, Scalar};
@@ -51,6 +54,96 @@ pub fn read<'py>(py: Python<'py>, arr: &NdArray, off: isize) -> Bound<'py, PyAny
 /// Store one Python object at a byte offset of an `object` array.
 pub fn write(arr: &NdArray, off: isize, obj: &Bound<'_, PyAny>) {
     arr.write_at(off, Scalar::Uint(intern(obj)));
+}
+
+/// Compare two object-array elements with Python's rich comparison protocol.
+/// NumPy's object comparator asks `a < b`, then `a > b`; equality is the
+/// fallback when both are false.  `rich_compare` preserves Python's reflected
+/// operation and exact TypeError when the pair is unorderable.
+fn compare_at(py: Python<'_>, arr: &NdArray, a: isize, b: isize) -> PyResult<Ordering> {
+    let lhs = read(py, arr, a);
+    let rhs = read(py, arr, b);
+    if lhs.rich_compare(&rhs, CompareOp::Lt)?.is_truthy()? {
+        return Ok(Ordering::Less);
+    }
+    if lhs.rich_compare(&rhs, CompareOp::Gt)?.is_truthy()? {
+        return Ok(Ordering::Greater);
+    }
+    Ok(Ordering::Equal)
+}
+
+fn lanes(arr: &NdArray, axis: usize) -> Vec<Vec<isize>> {
+    if arr.ndim() == 0 && axis == 0 {
+        return vec![vec![arr.byte_offset]];
+    }
+    let n = arr.shape[axis].max(0);
+    let step = arr.strides[axis];
+    let mut shape = arr.shape.clone();
+    let mut strides = arr.strides.clone();
+    shape.remove(axis);
+    strides.remove(axis);
+    rnp_core::iter::offsets(&shape, &strides, arr.byte_offset)
+        .map(|base| (0..n).map(|k| base + k * step).collect())
+        .collect()
+}
+
+/// A stable, fallible ordering of one lane.  Rust's slice sort comparator
+/// cannot propagate a Python exception, so object lanes use insertion sort;
+/// object arrays in NumPy's own tests are small and this preserves the first
+/// rich-comparison failure verbatim.
+fn lane_order(py: Python<'_>, arr: &NdArray, lane: &[isize]) -> PyResult<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lane.len()).collect();
+    for i in 1..order.len() {
+        let mut j = i;
+        while j > 0
+            && compare_at(py, arr, lane[order[j]], lane[order[j - 1]])? == Ordering::Less
+        {
+            order.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    Ok(order)
+}
+
+pub fn sort_inplace(py: Python<'_>, arr: &NdArray, axis: usize) -> PyResult<()> {
+    if !arr.flags.writeable {
+        return Err(PyValueError::new_err(
+            "assignment destination is read-only",
+        ));
+    }
+    for lane in lanes(arr, axis) {
+        let order = lane_order(py, arr, &lane)?;
+        let values: Vec<Scalar> = lane.iter().map(|&off| arr.read_at(off)).collect();
+        for (dst, &src) in lane.iter().zip(order.iter()) {
+            arr.write_at(*dst, values[src]);
+        }
+    }
+    Ok(())
+}
+
+pub fn argsort(py: Python<'_>, arr: &NdArray, axis: usize) -> PyResult<NdArray> {
+    let out = NdArray::zeros(arr.shape.clone(), DType::I64).map_err(crate::err)?;
+    if arr.ndim() == 0 {
+        out.write_at(out.byte_offset, Scalar::Int(0));
+        return Ok(out);
+    }
+    let n = arr.shape[axis].max(0);
+    let mut shape = arr.shape.clone();
+    let mut strides = out.strides.clone();
+    shape.remove(axis);
+    let out_step = strides.remove(axis);
+    let bases: Vec<isize> =
+        rnp_core::iter::offsets(&shape, &strides, out.byte_offset).collect();
+    for (lane, base) in lanes(arr, axis).iter().zip(bases) {
+        let order = lane_order(py, arr, lane)?;
+        for k in 0..n as usize {
+            out.write_at(
+                base + k as isize * out_step,
+                Scalar::Int(order[k] as i64),
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Build an `object` array from nested Python sequences of arbitrary values.

@@ -1034,6 +1034,7 @@ impl PyNdArray {
     #[pyo3(signature = (axis = -1, kind = None, order = None, *, stable = None))]
     fn sort(
         &mut self,
+        py: Python<'_>,
         axis: isize,
         kind: Option<&Bound<'_, PyAny>>,
         order: Option<&Bound<'_, PyAny>>,
@@ -1046,6 +1047,9 @@ impl PyNdArray {
         }
         let stable = sort_stable(kind, stable)?;
         let ax = norm_sort_axis(&self.arr, axis)?;
+        if self.arr.dtype().is_object() {
+            return crate::objects::sort_inplace(py, &self.arr, ax);
+        }
         rnp_core::sort::sort_inplace(&mut self.arr, ax, stable).map_err(crate::err)
     }
 
@@ -1074,6 +1078,10 @@ impl PyNdArray {
                 (self.arr.clone(), ax)
             }
         };
+        if arr.dtype().is_object() {
+            let out = crate::objects::argsort(py, &arr, ax)?;
+            return PyNdArray::into_py_any(out, py);
+        }
         let out = rnp_core::sort::argsort(&arr, ax, stable).map_err(crate::err)?;
         PyNdArray::into_py_any(out, py)
     }
@@ -1082,6 +1090,7 @@ impl PyNdArray {
     #[pyo3(signature = (kth, axis = -1, kind = None, order = None))]
     fn partition(
         &mut self,
+        py: Python<'_>,
         kth: &Bound<'_, PyAny>,
         axis: isize,
         kind: Option<&Bound<'_, PyAny>>,
@@ -1096,6 +1105,11 @@ impl PyNdArray {
         let ax = norm_sort_axis(&self.arr, axis)?;
         let n = axis_len(&self.arr, ax);
         let kths = norm_kths(kth, n)?;
+        if self.arr.dtype().is_object() {
+            // A fully ordered lane is also a valid partition for every kth.
+            // It uses the same rich-comparison path and error propagation.
+            return crate::objects::sort_inplace(py, &self.arr, ax);
+        }
         rnp_core::sort::partition_inplace(&mut self.arr, &kths, ax).map_err(crate::err)
     }
 
@@ -1124,6 +1138,10 @@ impl PyNdArray {
         };
         let n = axis_len(&arr, ax);
         let kths = norm_kths(kth, n)?;
+        if arr.dtype().is_object() {
+            let out = crate::objects::argsort(py, &arr, ax)?;
+            return PyNdArray::into_py_any(out, py);
+        }
         let out = rnp_core::sort::argpartition(&arr, &kths, ax).map_err(crate::err)?;
         PyNdArray::into_py_any(out, py)
     }
