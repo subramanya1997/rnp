@@ -7270,8 +7270,10 @@ def argsort(a, axis=np._NoValue, kind=None, order=None, endwith=True,
         return a.argsort(axis=axis, kind=kind, order=order, endwith=endwith,
                          fill_value=fill_value, stable=stable, descending=descending)
     else:
-        return a.argsort(axis=axis, kind=kind, order=order, stable=stable,
-                         descending=descending)
+        result = a.argsort(axis=axis, kind=kind, order=order, stable=stable)
+        if descending:
+            result = np.flip(result, axis=axis)
+        return result
 
 
 argsort.__doc__ = MaskedArray.argsort.__doc__
@@ -7315,7 +7317,9 @@ def sort(a, axis=-1, kind=None, order=None, endwith=True, fill_value=None, *,
         a.sort(axis=axis, kind=kind, order=order, endwith=endwith,
                fill_value=fill_value, stable=stable, descending=descending)
     else:
-        a.sort(axis=axis, kind=kind, order=order, stable=stable, descending=descending)
+        a.sort(axis=axis, kind=kind, order=order, stable=stable)
+        if descending:
+            a[...] = np.flip(a, axis=axis)
     return a
 
 
@@ -7735,9 +7739,13 @@ def reshape(a, new_shape, order='C'):
     """
     # We can't use 'frommethod', it whine about some parameters. Dmmit.
     try:
+        if order == 'C':
+            return a.reshape(new_shape)
         return a.reshape(new_shape, order=order)
     except AttributeError:
-        _tmp = np.asarray(a).reshape(new_shape, order=order)
+        _tmp = np.asarray(a)
+        _tmp = (_tmp.reshape(new_shape) if order == 'C' else
+                _tmp.reshape(new_shape, order=order))
         return _tmp.view(MaskedArray)
 
 
