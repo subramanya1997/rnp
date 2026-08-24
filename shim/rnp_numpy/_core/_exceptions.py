@@ -202,6 +202,21 @@ def _binary_resolution_error(ufunc_name, dtype_strs):
     return _UFuncBinaryResolutionError(ufunc, tuple(_dtype(s) for s in dtype_strs))
 
 
+def _input_casting_error(ufunc_name, casting, from_, to, i):
+    """Build `_UFuncInputCastingError` from the engine's dtype strings.
+
+    Raised when the type resolver picked a loop but one input cannot reach that
+    loop's dtype under the ufunc's casting rule, e.g.
+    ``np.array([], 'M8[D]') + np.array([], 'm8[Y]')``, which resolves to
+    ``M8[D]`` and then cannot cast the ``m8[Y]`` input to ``m8[D]``.
+    """
+    from .. import dtype as _dtype
+    from .._ufunc import ALL as _UFUNCS
+    ufunc = _UFUNCS[ufunc_name]
+    return _UFuncInputCastingError(
+        ufunc, casting, _dtype(from_), _dtype(to), i)
+
+
 def _install_error_factories():
     # The engine-side hook is optional: an older/mid-rebuild `_rnp` may not
     # export it yet.  Registering is a pure enhancement (it upgrades the
@@ -211,7 +226,8 @@ def _install_error_factories():
     if setter is None:
         return
     setter({"ufunc_no_loop": _no_loop_error,
-            "ufunc_binary_resolution": _binary_resolution_error})
+            "ufunc_binary_resolution": _binary_resolution_error,
+            "ufunc_input_casting": _input_casting_error})
 
 
 _install_error_factories()

@@ -33,6 +33,21 @@ pub enum Error {
         dtypes: Vec<String>,
         message: String,
     },
+    /// numpy's `_UFuncInputCastingError` (also a `UFuncTypeError`): the type
+    /// resolver picked a loop, but one *input* cannot be cast to the dtype that
+    /// loop wants under the ufunc's casting rule.
+    UFuncInputCasting {
+        ufunc: String,
+        /// The casting rule name, e.g. `"same_kind"`.
+        casting: String,
+        /// `dtype.str`-style spelling of the operand's own dtype.
+        from_: String,
+        /// `dtype.str`-style spelling of the dtype the loop needs.
+        to: String,
+        /// Which input (0-based).
+        i: usize,
+        message: String,
+    },
     OverflowError(String),
     RuntimeError(String),
     NotImplemented(String),
@@ -53,7 +68,37 @@ impl Error {
             | Error::NotImplemented(m) => m,
             Error::UFuncNoLoop { message, .. } => message,
             Error::UFuncBinaryResolution { message, .. } => message,
+            Error::UFuncInputCasting { message, .. } => message,
         }
+    }
+}
+
+/// Build numpy's `_UFuncInputCastingError` for input `i` of `ufunc`. `from_`
+/// and `to` are `dtype.str`-style spellings, e.g. `"<m8[Y]"`; `nin` is the
+/// ufunc's input count, because numpy omits the index for unary ufuncs.
+pub fn ufunc_input_casting(
+    ufunc: &str,
+    casting: &str,
+    from_: &str,
+    to: &str,
+    i: usize,
+    nin: usize,
+) -> Error {
+    let i_str = if nin != 1 {
+        format!("{i} ")
+    } else {
+        String::new()
+    };
+    Error::UFuncInputCasting {
+        ufunc: ufunc.to_string(),
+        casting: casting.to_string(),
+        from_: from_.to_string(),
+        to: to.to_string(),
+        i,
+        message: format!(
+            "Cannot cast ufunc {ufunc:?} input {i_str}from dtype({from_:?}) \
+             to dtype({to:?}) with casting rule {casting:?}"
+        ),
     }
 }
 
