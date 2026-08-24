@@ -1628,8 +1628,13 @@ def _time_ufunc(name, a, b):
 
 
 #: The `_TimeScalar` members copied onto each concrete time-scalar class.
+#:
+#: `dtype` is deliberately absent: `_FlexMeta` exposes it as a *metaclass*
+#: property (so that `np.dtype(np.timedelta64)` is `dtype('m8')`), which makes
+#: `setattr(cls, "dtype", ...)` hit that property's missing setter. The two
+#: concrete classes declare their own instance-level `dtype` instead.
 _TIME_SCALAR_MEMBERS = (
-    "__new__", "_from_parts", "dtype", "_unit", "__array__", "astype",
+    "__new__", "_from_parts", "_unit", "__array__", "astype",
     "item", "tolist", "__hash__", "__bool__", "__reduce__", "__format__",
     "_op", "__neg__", "__pos__", "__abs__",
 )
@@ -1682,6 +1687,10 @@ class datetime64(generic, metaclass=_FlexMeta, char="M8"):
     __slots__ = ("_v", "_dtype")
     _char = "M8"
 
+    @property
+    def dtype(self):
+        return self._dtype
+
     def _hash_value(self):
         import datetime as _pydt
         unit, _num = _rnp.datetime_data(self._dtype)
@@ -1721,6 +1730,10 @@ class timedelta64(signedinteger, metaclass=_FlexMeta, char="m8"):
     __module__ = "numpy"
     __slots__ = ("_v", "_dtype")
     _char = "m8"
+
+    @property
+    def dtype(self):
+        return self._dtype
 
     def _hash_value(self):
         import datetime as _pydt

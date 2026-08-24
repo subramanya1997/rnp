@@ -2164,6 +2164,15 @@ impl PyNdArray {
         }
         let me = slf.borrow();
         let arr = &me.arr;
+        if arr.dtype().is_datetime_like() {
+            // PEP 3118 has no datetime code, and numpy refuses the export
+            // rather than lying about the item size:
+            // `memoryview(np.array([1], 'm8[s]'))` is a ValueError.
+            return Err(PyValueError::new_err(format!(
+                "cannot include dtype '{}' in a buffer",
+                arr.dtype().kind()
+            )));
+        }
         if (flags & ffi::PyBUF_WRITABLE) == ffi::PyBUF_WRITABLE && !arr.flags.writeable {
             return Err(PyBufferError::new_err("Object is not writable"));
         }
