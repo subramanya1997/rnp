@@ -281,11 +281,41 @@ fn array_front(
     if let Some(res) = protocol_array(py, obj, d, copy)? {
         return Ok(res);
     }
+    // PEP 3118: anything exporting a buffer is adopted with the dtype the
+    // buffer itself declares (`np.array(bytearray(b"12")).dtype` is uint8,
+    // not the int64 a sequence of ints would produce).
+    if let Some(built) = adopt::from_buffer_protocol(py, obj)? {
+        return finish_adopted(py, built, d, copy);
+    }
     if copy == Some(false) {
         // Nothing below this point can be done without allocating.
         return Err(pyo3::exceptions::PyValueError::new_err(adopt::NO_COPY_MSG));
     }
     wrap(py, array_from_any_descr(obj, d, copy == Some(true))?)
+}
+
+/// Apply the caller's `dtype=`/`copy=` to a freshly adopted array.
+///
+/// A cast or an explicit `copy=True` produces a fresh, owning array (numpy's
+/// `np.array(bytearray(...)).base` is None); otherwise the adoption is handed
+/// back untouched and stays zero-copy.
+fn finish_adopted(
+    py: Python<'_>,
+    built: PyNdArray,
+    d: Option<Descr>,
+    copy: Option<bool>,
+) -> PyResult<Py<PyNdArray>> {
+    let arr = built.arr.clone();
+    match d {
+        Some(want) if want != arr.descr => {
+            if copy == Some(false) {
+                return Err(pyo3::exceptions::PyValueError::new_err(adopt::NO_COPY_MSG));
+            }
+            wrap(py, arr.astype_descr(want))
+        }
+        _ if copy == Some(true) => wrap(py, arr.copy()),
+        _ => Py::new(py, built),
+    }
 }
 
 /// Try the array protocol (`__array__`, then `__array_interface__`) on a
@@ -298,11 +328,22 @@ fn protocol_array(
 ) -> PyResult<Option<Py<PyNdArray>>> {
     if obj.get_type().hasattr("__array__")? {
         if let Some(res) = adopt::call_array_protocol(py, obj, d, copy)? {
-            let cell = res.cast::<PyNdArray>().map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "object __array__ method not producing an array",
-                )
-            })?;
+            // A third-party `__array__` may hand back an array of *another*
+            // library. That is still an array, so adopt it through the buffer
+            // protocol rather than refusing; only a non-array result is the
+            // error numpy reports.
+            let cell = match res.cast::<PyNdArray>() {
+                Ok(c) => c.clone(),
+                Err(_) => {
+                    if let Some(built) = adopt::from_buffer_protocol(py, &res)? {
+                        return Ok(Some(finish_adopted(py, built, d, copy)?));
+                    }
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "object __array__ method not producing an array",
+                    ));
+                }
+            };
+            let cell = &cell;
             let arr = cell.borrow().arr.clone();
             let arr = match d {
                 Some(want) if want != arr.descr => {
