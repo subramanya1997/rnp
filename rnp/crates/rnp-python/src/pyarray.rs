@@ -3,20 +3,23 @@
 use std::ffi::{c_int, CString};
 
 use pyo3::basic::CompareOp;
-use pyo3::exceptions::{PyBufferError, PyIndexError, PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyBufferError, PyIndexError, PyKeyError, PyNotImplementedError, PyTypeError, PyValueError,
+};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PySliceMethods, PyTuple};
 
-use rnp_core::reduce::{mean_dtype, reduce_all, reduce_axis, reduce_dtype, ReduceOp};
 use rnp_core::element::Element;
 use rnp_core::indexing::{Indexed, TakeMode};
+use rnp_core::reduce::{mean_dtype, reduce_all, reduce_axis, reduce_dtype, ReduceOp};
 use rnp_core::{binary, BinOp, DType, NdArray, Scalar};
 
-use crate::convert::{array_from_any, flexible_to_py, npflexible_to_py, npscalar_to_py,
-                     operand_for, scalar_to_py};
-use rnp_core::printing;
+use crate::convert::{
+    array_from_any, flexible_to_py, npflexible_to_py, npscalar_to_py, operand_for, scalar_to_py,
+};
 use crate::pydtype::{descr_from_any, dtype_from_any, PyDType};
+use rnp_core::printing;
 
 #[pyclass(name = "ndarray", module = "_rnp", subclass, weakref)]
 pub struct PyNdArray {
@@ -36,10 +39,7 @@ impl PyNdArray {
     }
 
     /// Wrap a *view* of `parent`, propagating the base chain.
-    pub fn view_of(
-        arr: NdArray,
-        parent: &Bound<'_, PyNdArray>,
-    ) -> PyResult<Py<PyNdArray>> {
+    pub fn view_of(arr: NdArray, parent: &Bound<'_, PyNdArray>) -> PyResult<Py<PyNdArray>> {
         // numpy's base-collapsing rule (`PyArray_SetBaseObject`): walk up the
         // chain only while the next link is *another ndarray of the same
         // type*. An array that adopted foreign memory has a non-array base
@@ -198,7 +198,11 @@ impl PyFlatIter {
         }
         if let Ok(s) = key.cast::<PySlice>() {
             let ind = s.indices(self.n())?;
-            return Ok(FlatKey::Range(ind.start, ind.slicelength as isize, ind.step));
+            return Ok(FlatKey::Range(
+                ind.start,
+                ind.slicelength as isize,
+                ind.step,
+            ));
         }
         // A flatiter used as an index behaves like its underlying array.
         let owned;
@@ -310,7 +314,11 @@ impl PyFlatIter {
         if slf.arr.dtype().is_flexible() || slf.arr.dtype().is_object() {
             return Ok(Some(npflexible_to_py(py, &slf.arr, off)?));
         }
-        Ok(Some(npscalar_to_py(py, slf.arr.dtype(), slf.arr.read_at(off))?))
+        Ok(Some(npscalar_to_py(
+            py,
+            slf.arr.dtype(),
+            slf.arr.read_at(off),
+        )?))
     }
 
     #[getter]
@@ -463,7 +471,10 @@ impl PyFlatIter {
     }
 
     fn __repr__(&self) -> String {
-        format!("<numpy.flatiter object at 0x{:x}>", self as *const _ as usize)
+        format!(
+            "<numpy.flatiter object at 0x{:x}>",
+            self as *const _ as usize
+        )
     }
 }
 
@@ -530,7 +541,9 @@ impl PyFlags {
     }
     #[getter]
     fn farray(&self, py: Python<'_>) -> bool {
-        self.get(py, |f| f.f_contiguous && !f.c_contiguous && f.aligned && f.writeable)
+        self.get(py, |f| {
+            f.f_contiguous && !f.c_contiguous && f.aligned && f.writeable
+        })
     }
     #[getter]
     fn forc(&self, py: Python<'_>) -> bool {
@@ -631,9 +644,9 @@ impl PyFlags {
                 }
                 Ok(())
             }
-            "C_CONTIGUOUS" | "C" | "F_CONTIGUOUS" | "F" | "OWNDATA" | "O" => Err(
-                PyKeyError::new_err(format!("Cannot set flag {key}")),
-            ),
+            "C_CONTIGUOUS" | "C" | "F_CONTIGUOUS" | "F" | "OWNDATA" | "O" => {
+                Err(PyKeyError::new_err(format!("Cannot set flag {key}")))
+            }
             other => Err(PyKeyError::new_err(other.to_string())),
         }
     }
@@ -953,7 +966,8 @@ impl PyNdArray {
         } else if d.dt.is_flexible() || self.arr.dtype().is_flexible() {
             return Err(PyNotImplementedError::new_err(format!(
                 "astype from {} to {} is not implemented yet",
-                self.arr.dtype(), d.dt
+                self.arr.dtype(),
+                d.dt
             )));
         } else if d.dt.is_datetime_like() || self.arr.dtype().is_datetime_like() {
             // A datetime unit conversion can overflow int64, and numpy raises
@@ -992,7 +1006,10 @@ impl PyNdArray {
     #[getter]
     fn __array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
-        d.set_item("shape", PyTuple::new(py, self.arr.shape.iter().map(|&x| x as usize))?)?;
+        d.set_item(
+            "shape",
+            PyTuple::new(py, self.arr.shape.iter().map(|&x| x as usize))?,
+        )?;
         d.set_item("typestr", self.arr.descr.str_code())?;
         d.set_item(
             "descr",
@@ -1001,7 +1018,10 @@ impl PyNdArray {
         if self.arr.flags.c_contiguous {
             d.set_item("strides", py.None())?;
         } else {
-            d.set_item("strides", PyTuple::new(py, self.arr.strides.iter().copied())?)?;
+            d.set_item(
+                "strides",
+                PyTuple::new(py, self.arr.strides.iter().copied())?,
+            )?;
         }
         let ptr = self.arr.buffer.as_ptr() as usize;
         let addr = (ptr as isize + self.arr.byte_offset) as usize;
@@ -1014,6 +1034,7 @@ impl PyNdArray {
     #[pyo3(signature = (axis = -1, kind = None, order = None, *, stable = None))]
     fn sort(
         &mut self,
+        py: Python<'_>,
         axis: isize,
         kind: Option<&Bound<'_, PyAny>>,
         order: Option<&Bound<'_, PyAny>>,
@@ -1026,6 +1047,9 @@ impl PyNdArray {
         }
         let stable = sort_stable(kind, stable)?;
         let ax = norm_sort_axis(&self.arr, axis)?;
+        if self.arr.dtype().is_object() {
+            return crate::objects::sort_inplace(py, &self.arr, ax);
+        }
         rnp_core::sort::sort_inplace(&mut self.arr, ax, stable).map_err(crate::err)
     }
 
@@ -1054,6 +1078,10 @@ impl PyNdArray {
                 (self.arr.clone(), ax)
             }
         };
+        if arr.dtype().is_object() {
+            let out = crate::objects::argsort(py, &arr, ax)?;
+            return PyNdArray::into_py_any(out, py);
+        }
         let out = rnp_core::sort::argsort(&arr, ax, stable).map_err(crate::err)?;
         PyNdArray::into_py_any(out, py)
     }
@@ -1062,6 +1090,7 @@ impl PyNdArray {
     #[pyo3(signature = (kth, axis = -1, kind = None, order = None))]
     fn partition(
         &mut self,
+        py: Python<'_>,
         kth: &Bound<'_, PyAny>,
         axis: isize,
         kind: Option<&Bound<'_, PyAny>>,
@@ -1076,6 +1105,11 @@ impl PyNdArray {
         let ax = norm_sort_axis(&self.arr, axis)?;
         let n = axis_len(&self.arr, ax);
         let kths = norm_kths(kth, n)?;
+        if self.arr.dtype().is_object() {
+            // A fully ordered lane is also a valid partition for every kth.
+            // It uses the same rich-comparison path and error propagation.
+            return crate::objects::sort_inplace(py, &self.arr, ax);
+        }
         rnp_core::sort::partition_inplace(&mut self.arr, &kths, ax).map_err(crate::err)
     }
 
@@ -1104,6 +1138,10 @@ impl PyNdArray {
         };
         let n = axis_len(&arr, ax);
         let kths = norm_kths(kth, n)?;
+        if arr.dtype().is_object() {
+            let out = crate::objects::argsort(py, &arr, ax)?;
+            return PyNdArray::into_py_any(out, py);
+        }
         let out = rnp_core::sort::argpartition(&arr, &kths, ax).map_err(crate::err)?;
         PyNdArray::into_py_any(out, py)
     }
@@ -1171,9 +1209,7 @@ impl PyNdArray {
             {
                 let mut me = slf.borrow_mut();
                 if !me.arr.flags.writeable {
-                    return Err(PyValueError::new_err(
-                        "assignment destination is read-only",
-                    ));
+                    return Err(PyValueError::new_err("assignment destination is read-only"));
                 }
                 me.arr.byteswap_inplace();
             }
@@ -1318,7 +1354,9 @@ impl PyNdArray {
                 )));
             }
         }
-        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, false)
+        crate::straggler::var_impl(
+            py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, false,
+        )
     }
 
     #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
@@ -1351,7 +1389,9 @@ impl PyNdArray {
                 )));
             }
         }
-        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, true)
+        crate::straggler::var_impl(
+            py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, true,
+        )
     }
 
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
@@ -1380,9 +1420,7 @@ impl PyNdArray {
             pickle.call_method1("dump", (slf, file))?;
             return Ok(());
         }
-        let f = py
-            .import("builtins")?
-            .call_method1("open", (file, "wb"))?;
+        let f = py.import("builtins")?.call_method1("open", (file, "wb"))?;
         let res = pickle.call_method1("dump", (slf, &f));
         f.call_method0("close")?;
         res?;
@@ -1420,7 +1458,11 @@ impl PyNdArray {
     }
 
     #[pyo3(signature = (*args))]
-    fn item<'py>(&self, py: Python<'py>, args: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, PyAny>> {
+    fn item<'py>(
+        &self,
+        py: Python<'py>,
+        args: &Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         if self.arr.dtype().is_object() {
             if self.arr.size() != 1 {
                 return Err(PyValueError::new_err(
@@ -1466,7 +1508,6 @@ impl PyNdArray {
         scalar_to_py(py, v)
     }
 
-
     /// `a.getfield(dtype, offset)` — a field-typed view at a byte offset.
     #[pyo3(signature = (dtype, offset = 0))]
     fn getfield<'py>(
@@ -1497,14 +1538,11 @@ impl PyNdArray {
     ) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         // `a.view(SomeSubclass)` may spell the type in either argument.
-        let mut want_type: Option<Bound<'_, PyAny>> = type_
-            .filter(|t| !t.is_none())
-            .map(|t| t.clone());
+        let mut want_type: Option<Bound<'_, PyAny>> =
+            type_.filter(|t| !t.is_none()).map(|t| t.clone());
         let mut dtype = dtype;
         if let Some(o) = dtype {
-            if !o.is_none()
-                && o.cast::<pyo3::types::PyType>().is_ok()
-                && descr_from_any(o).is_err()
+            if !o.is_none() && o.cast::<pyo3::types::PyType>().is_ok() && descr_from_any(o).is_err()
             {
                 want_type = Some(o.clone());
                 dtype = None;
@@ -1521,9 +1559,9 @@ impl PyNdArray {
             let Some(t) = &want_type else {
                 return Ok(v.into_any());
             };
-            let ty = t.cast::<pyo3::types::PyType>().map_err(|_| {
-                PyTypeError::new_err("type must be a sub-type of ndarray type")
-            })?;
+            let ty = t
+                .cast::<pyo3::types::PyType>()
+                .map_err(|_| PyTypeError::new_err("type must be a sub-type of ndarray type"))?;
             let b = v.bind(py);
             let (arr, base) = {
                 let me = b.borrow();
@@ -1630,8 +1668,8 @@ impl PyNdArray {
             }
         }
         let iarr = NdArray::from_scalars(&idx, DType::I64).map_err(crate::err)?;
-        let res = rnp_core::indexing::take(&self.arr, &iarr, ax, TakeMode::Raise)
-            .map_err(crate::err)?;
+        let res =
+            rnp_core::indexing::take(&self.arr, &iarr, ax, TakeMode::Raise).map_err(crate::err)?;
         Ok(PyNdArray::into_py_any(res, py)?.into_bound(py).into_any())
     }
 
@@ -1819,6 +1857,26 @@ impl PyNdArray {
         self.reduce(py, ReduceOp::Sum, axis, dtype, out, keepdims)
     }
 
+    #[pyo3(signature = (axis = None, dtype = None, out = None))]
+    fn cumsum<'py>(
+        slf: &Bound<'py, Self>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::accumulate(slf, "add", axis, dtype, out)
+    }
+
+    #[pyo3(signature = (axis = None, dtype = None, out = None))]
+    fn cumprod<'py>(
+        slf: &Bound<'py, Self>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::accumulate(slf, "multiply", axis, dtype, out)
+    }
+
     #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false))]
     fn prod<'py>(
         &self,
@@ -1896,7 +1954,9 @@ impl PyNdArray {
         // `out=` and `where=` route through the generic accumulator in
         // `straggler.rs`; the path below keeps numpy's exact complex64
         // division for the plain case.
-        if out.is_some_and(|o| !o.is_none()) || r#where.is_some_and(|w| !w.is_none()) {
+        let tuple_axis = axis.is_some_and(|a| !a.is_none() && a.extract::<isize>().is_err());
+        if tuple_axis || out.is_some_and(|o| !o.is_none()) || r#where.is_some_and(|w| !w.is_none())
+        {
             return crate::straggler::mean_impl(py, &self.arr, axis, dtype, out, keepdims, r#where);
         }
         // numpy raises `AxisError`, not a bare `ValueError`, for a bad axis.
@@ -1922,9 +1982,9 @@ impl PyNdArray {
             if n == 0 {
                 // numpy warns and yields NaN (NaN+NaNj for complex).
                 return match acc_dt {
-                    DType::C64 | DType::C128 => Scalar::Complex(
-                        num_complex::Complex::new(f64::NAN, f64::NAN),
-                    ),
+                    DType::C64 | DType::C128 => {
+                        Scalar::Complex(num_complex::Complex::new(f64::NAN, f64::NAN))
+                    }
                     d => Scalar::Float(f64::NAN).cast(d),
                 };
             }
@@ -1966,15 +2026,13 @@ impl PyNdArray {
                 npscalar_to_py(py, out_dt, v)
             }
             Some(a) => {
-                let sums = reduce_axis(&promoted, a, ReduceOp::Sum, keepdims)
-                    .map_err(crate::err)?;
+                let sums =
+                    reduce_axis(&promoted, a, ReduceOp::Sum, keepdims).map_err(crate::err)?;
                 let res = NdArray::zeros(sums.shape.clone(), out_dt).map_err(crate::err)?;
                 let src: Vec<isize> =
-                    rnp_core::iter::offsets(&sums.shape, &sums.strides, sums.byte_offset)
-                        .collect();
+                    rnp_core::iter::offsets(&sums.shape, &sums.strides, sums.byte_offset).collect();
                 let dst: Vec<isize> =
-                    rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset)
-                        .collect();
+                    rnp_core::iter::offsets(&res.shape, &res.strides, res.byte_offset).collect();
                 for (&s, &d) in src.iter().zip(dst.iter()) {
                     res.write_at(d, divide(sums.read_at(s)));
                 }
@@ -2045,7 +2103,10 @@ impl PyNdArray {
         }
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
-            Indexed::View { arr: view, scalarize } => {
+            Indexed::View {
+                arr: view,
+                scalarize,
+            } => {
                 if scalarize {
                     if crate::fields::is_struct_element(view.descr) {
                         return crate::fields::struct_scalar(py, view, slf);
@@ -2084,9 +2145,7 @@ impl PyNdArray {
         // same array (`a[a > 0] = a`).
         let me = slf.borrow().arr.clone();
         if !me.flags.writeable {
-            return Err(PyValueError::new_err(
-                "assignment destination is read-only",
-            ));
+            return Err(PyValueError::new_err("assignment destination is read-only"));
         }
         // Structured field assignment: `a['f0'] = v` / `a[['f0','f1']] = v`.
         if crate::fields::setitem(slf, key, value)? {
@@ -2110,10 +2169,12 @@ impl PyNdArray {
                     } else {
                         rnp_core::iter::broadcast_to(&src, &view.shape).map_err(crate::err)?
                     };
-                    let dst: Vec<isize> = rnp_core::iter::offsets(
-                        &view.shape, &view.strides, view.byte_offset).collect();
-                    let so: Vec<isize> = rnp_core::iter::offsets(
-                        &src.shape, &src.strides, src.byte_offset).collect();
+                    let dst: Vec<isize> =
+                        rnp_core::iter::offsets(&view.shape, &view.strides, view.byte_offset)
+                            .collect();
+                    let so: Vec<isize> =
+                        rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset)
+                            .collect();
                     for (&d, &s) in dst.iter().zip(so.iter()) {
                         view.write_at(d, src.read_at(s));
                     }
@@ -2160,8 +2221,10 @@ impl PyNdArray {
             ));
         }
         if self.arr.dtype().is_object() {
-            return Ok(format!("array({}, dtype=object)",
-                              object_body(py, &self.arr, &mut Vec::new())?));
+            return Ok(format!(
+                "array({}, dtype=object)",
+                object_body(py, &self.arr, &mut Vec::new())?
+            ));
         }
         Ok(printing::repr(&self.arr))
     }
@@ -2575,10 +2638,13 @@ pub fn store_or_wrap<'py>(
         }
         Some(o) => o,
     };
-    let cell = dest.cast::<PyNdArray>().map_err(|_| {
-        PyTypeError::new_err("return arrays must be of ArrayType")
-    })?;
+    let cell = dest
+        .cast::<PyNdArray>()
+        .map_err(|_| PyTypeError::new_err("return arrays must be of ArrayType"))?;
     let target = cell.borrow().arr.clone();
+    if !target.flags.writeable {
+        return Err(PyValueError::new_err("output array is read-only"));
+    }
     if target.shape != res.shape {
         return Err(PyValueError::new_err(format!(
             "could not broadcast input array from shape {} into shape {}",
@@ -2613,11 +2679,7 @@ pub fn store_or_wrap<'py>(
 /// "shape mismatch: value array of shape (S,) could not be broadcast to
 /// indexing result of shape (D,)". Probed on 2.5.2 for `a[...]`, `a[:]`,
 /// `a['f']` (all the first form) against `a[[0, 1]]` (the second).
-fn assignment_source(
-    value: &Bound<'_, PyAny>,
-    shape: &[isize],
-    dtype: DType,
-) -> PyResult<NdArray> {
+fn assignment_source(value: &Bound<'_, PyAny>, shape: &[isize], dtype: DType) -> PyResult<NdArray> {
     let src = array_from_any(value, Some(dtype), false)?;
     rnp_core::iter::broadcast_to(&src, shape).map_err(|_| {
         PyValueError::new_err(format!(
@@ -2652,7 +2714,10 @@ fn fmt_shape(s: &[isize]) -> String {
     } else {
         format!(
             "({})",
-            s.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+            s.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         )
     }
 }
@@ -2689,6 +2754,32 @@ fn as_i64(s: Scalar) -> i64 {
 }
 
 impl PyNdArray {
+    /// Shared native implementation of `cumsum` and `cumprod`.
+    ///
+    /// The ufunc accumulation entry point owns numpy's dtype promotion and
+    /// destination-casting rules. `axis=None` is the ndarray-method special
+    /// case: flatten in C order and accumulate along the resulting axis 0.
+    fn accumulate<'py>(
+        slf: &Bound<'py, Self>,
+        name: &str,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        if axis.is_none_or(|a| a.is_none()) {
+            let arr = slf.borrow().arr.clone();
+            let flat = arr.reshape(&[arr.size() as isize]).map_err(crate::err)?;
+            let flat = PyNdArray::into_py_any(flat, py)?.into_bound(py).into_any();
+            return crate::ufuncs::_ufunc_accumulate(py, name, &flat, 0, dtype, out);
+        }
+        let axis = axis
+            .expect("checked above")
+            .extract::<isize>()
+            .map_err(|_| PyTypeError::new_err("an integer is required for the axis"))?;
+        crate::ufuncs::_ufunc_accumulate(py, name, slf.as_any(), axis, dtype, out)
+    }
+
     /// `all()`/`any()` over the whole array or one axis.
     fn bool_reduce<'py>(
         &self,
@@ -2707,6 +2798,24 @@ impl PyNdArray {
                 Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
             }
         };
+        let tuple_axis = axis.is_some_and(|a| !a.is_none() && a.extract::<isize>().is_err());
+        if tuple_axis {
+            let none = py.None();
+            let axes =
+                crate::ufuncs::resolve_axes(&self.arr, axis.unwrap_or_else(|| none.bind(py)))?;
+            let bools = self.arr.astype(DType::Bool);
+            let op = if want_all {
+                rnp_core::ReduceOp::Min
+            } else {
+                rnp_core::ReduceOp::Max
+            };
+            let res =
+                rnp_core::reduce::reduce_axes(&bools, &axes, op, keepdims).map_err(crate::err)?;
+            if res.ndim() == 0 && out.is_none_or(|o| o.is_none()) {
+                return npscalar_to_py(py, DType::Bool, res.read_at(res.byte_offset));
+            }
+            return store_or_wrap(py, res, out);
+        }
         match resolve_axis(&self.arr, axis)? {
             None => {
                 let mut acc = want_all;
@@ -2773,11 +2882,6 @@ impl PyNdArray {
         out: Option<&Bound<'py, PyAny>>,
         keepdims: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if out.is_some_and(|o| !o.is_none()) {
-            return Err(PyNotImplementedError::new_err(
-                "reductions with out= are not implemented yet",
-            ));
-        }
         // `dtype=` casts the operand first, which is what numpy does for the
         // accumulation type of sum/prod.
         let owned;
@@ -2787,25 +2891,56 @@ impl PyNdArray {
                 owned = self.arr.astype(dt);
                 &owned
             }
+            _ if out.is_some_and(|o| !o.is_none()) => {
+                let cell = out
+                    .expect("checked above")
+                    .cast::<PyNdArray>()
+                    .map_err(|_| PyTypeError::new_err("output must be an array"))?;
+                // With no explicit dtype, a reduction ufunc resolves a loop
+                // against both its input and output operands.  This matters
+                // for mixed-width output (for example, float64 -> float32
+                // still accumulates in float64, while int8 -> float32 uses
+                // the float32 loop).
+                let acc = rnp_core::promote(self.arr.dtype(), cell.borrow().arr.dtype());
+                owned = self.arr.astype(acc);
+                &owned
+            }
             _ => &self.arr,
         };
-        match resolve_axis(src, axis)? {
-            None => {
-                let v = reduce_all(src, op).map_err(crate::err)?;
-                if keepdims {
-                    let shape = vec![1isize; src.ndim()];
-                    let mut a =
-                        NdArray::zeros(shape, reduce_dtype(op, src.dtype())).map_err(crate::err)?;
-                    a.fill(v);
-                    return Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any());
+        if matches!(op, ReduceOp::ArgMin | ReduceOp::ArgMax) {
+            return match resolve_axis(src, axis)? {
+                None => {
+                    let v = reduce_all(src, op).map_err(crate::err)?;
+                    if keepdims {
+                        let shape = vec![1isize; src.ndim()];
+                        let mut a = NdArray::zeros(shape, reduce_dtype(op, src.dtype()))
+                            .map_err(crate::err)?;
+                        a.fill(v);
+                        return store_or_wrap(py, a, out);
+                    }
+                    if out.is_some_and(|o| !o.is_none()) {
+                        let a = NdArray::from_scalars(&[v], reduce_dtype(op, src.dtype()))
+                            .map_err(crate::err)?
+                            .reshape(&[])
+                            .map_err(crate::err)?;
+                        return store_or_wrap(py, a, out);
+                    }
+                    npscalar_to_py(py, reduce_dtype(op, src.dtype()), v)
                 }
-                npscalar_to_py(py, reduce_dtype(op, src.dtype()), v)
-            }
-            Some(ax) => {
-                let a = reduce_axis(src, ax, op, keepdims).map_err(crate::err)?;
-                Ok(PyNdArray::into_py_any(a, py)?.into_bound(py).into_any())
-            }
+                Some(ax) => {
+                    let a = reduce_axis(src, ax, op, keepdims).map_err(crate::err)?;
+                    store_or_wrap(py, a, out)
+                }
+            };
         }
+
+        let none = py.None();
+        let axes = crate::ufuncs::resolve_axes(src, axis.unwrap_or_else(|| none.bind(py)))?;
+        let a = rnp_core::reduce::reduce_axes(src, &axes, op, keepdims).map_err(crate::err)?;
+        if a.ndim() == 0 && out.is_none_or(|o| o.is_none()) {
+            return npscalar_to_py(py, a.dtype(), a.read_at(a.byte_offset));
+        }
+        store_or_wrap(py, a, out)
     }
 
     /// The real (`k == 0`) or imaginary (`k == 1`) component view.
@@ -2819,7 +2954,11 @@ impl PyNdArray {
             let z = NdArray::zeros(a.shape.clone(), a.dtype()).map_err(crate::err)?;
             return PyNdArray::into_py_any(z, slf.py());
         }
-        let comp = if a.dtype() == DType::C64 { DType::F32 } else { DType::F64 };
+        let comp = if a.dtype() == DType::C64 {
+            DType::F32
+        } else {
+            DType::F64
+        };
         let mut v = a.clone();
         // The component view keeps the parent's byte order: a `'>c16'` array
         // has `'>f8'` halves.
@@ -2885,9 +3024,7 @@ impl PyNdArray {
         let py = slf.py();
         let me = slf.borrow().arr.clone();
         if !me.flags.writeable {
-            return Err(PyValueError::new_err(
-                "output array is read-only",
-            ));
+            return Err(PyValueError::new_err("output array is read-only"));
         }
         let rhs = operand_for(other, me.dtype(), false)?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for in-place op"))?;
@@ -2936,7 +3073,12 @@ pub fn shape_from_any(obj: &Bound<'_, PyAny>) -> PyResult<Vec<isize>> {
     if let Ok(a) = obj.cast::<PyNdArray>() {
         let arr = a.borrow().arr.clone();
         if arr.dtype().is_integer() && arr.ndim() <= 1 {
-            return Ok(arr.to_vec().into_iter().map(as_i64).map(|v| v as isize).collect());
+            return Ok(arr
+                .to_vec()
+                .into_iter()
+                .map(as_i64)
+                .map(|v| v as isize)
+                .collect());
         }
     }
     Err(PyTypeError::new_err(

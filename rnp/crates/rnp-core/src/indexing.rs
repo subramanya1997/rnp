@@ -583,7 +583,13 @@ pub fn index(arr: &NdArray, items: &[IndexItem]) -> Result<Indexed> {
             ))
         })?;
     }
-    let bsize = shape_size(&b_shape);
+    // NpyIter represents its element count with `npy_intp` (Py_ssize_t).
+    // A pair of zero-stride index views can broadcast to a product larger
+    // than that without either view owning a large allocation, so reject the
+    // iterator before sizing `outer` or walking either index.
+    let bsize = crate::array::checked_shape_size(&b_shape)
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| Error::ValueError("iterator is too large".into()))?;
 
     // Accumulate the byte offset contributed by every index array.
     let mut outer = vec![0isize; bsize];
@@ -652,6 +658,9 @@ pub fn index(arr: &NdArray, items: &[IndexItem]) -> Result<Indexed> {
     shape.extend_from_slice(&sub_shape[..insert]);
     shape.extend_from_slice(&b_shape);
     shape.extend_from_slice(&sub_shape[insert..]);
+    crate::array::checked_shape_size(&shape)
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| Error::ValueError("iterator is too large".into()))?;
     let scalarize = shape.is_empty() && !has_nonint;
 
     Ok(Indexed::Fancy(FancyPlan {
@@ -1078,6 +1087,28 @@ mod tests {
             ),
             vec![2, 3, 4]
         );
+    }
+
+    #[test]
+    fn oversized_advanced_iterator_is_rejected_before_allocation() {
+        let a = NdArray::zeros(vec![1, 1], DType::I64).unwrap();
+        let mut rows = NdArray::zeros(vec![1], DType::I64).unwrap();
+        rows.shape = vec![isize::MAX, 1];
+        rows.strides = vec![0, 0];
+        rows.update_flags();
+        let mut cols = NdArray::zeros(vec![1], DType::I64).unwrap();
+        cols.shape = vec![1, 2];
+        cols.strides = vec![0, 0];
+        cols.update_flags();
+
+        let err = match index(
+            &a,
+            &[IndexItem::IntArray(rows), IndexItem::IntArray(cols)],
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("oversized iterator unexpectedly succeeded"),
+        };
+        assert_eq!(err.to_string(), "iterator is too large");
     }
 
     #[test]

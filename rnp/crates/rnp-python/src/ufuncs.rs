@@ -115,11 +115,7 @@ fn weak_slot_dtype(f: Ufn, i: usize) -> Option<DType> {
     }
 }
 
-fn resolve_operands(
-    objs: &[Bound<'_, PyAny>],
-    comparison: bool,
-    f: Ufn,
-) -> PyResult<Vec<NdArray>> {
+fn resolve_operands(objs: &[Bound<'_, PyAny>], comparison: bool, f: Ufn) -> PyResult<Vec<NdArray>> {
     let ops: Vec<Operand> = objs.iter().map(coerce).collect::<PyResult<_>>()?;
     let mut strong: Option<DType> = None;
     for o in &ops {
@@ -156,10 +152,7 @@ fn resolve_operands(
 /// `object`), so a single object operand decides the loop -- unless an
 /// explicit non-object `dtype=` overrides it, which is how `np.any` on an
 /// object array still reduces in `bool`.
-fn object_call(
-    objs: &[Bound<'_, PyAny>],
-    dtype: Option<&Bound<'_, PyAny>>,
-) -> PyResult<bool> {
+fn object_call(objs: &[Bound<'_, PyAny>], dtype: Option<&Bound<'_, PyAny>>) -> PyResult<bool> {
     // `__call__` never leaves the object loop: an incompatible `dtype=` is an
     // error there, not a cast (unlike `.reduce`, which does accept one).
     if let Some(d) = dtype {
@@ -172,10 +165,7 @@ fn object_call(
 
 /// As `object_call`, but for `.reduce`/`.accumulate`, where an explicit
 /// non-object `dtype=` *does* take the operand out of the object loop.
-fn wants_object(
-    objs: &[Bound<'_, PyAny>],
-    dtype: Option<&Bound<'_, PyAny>>,
-) -> PyResult<bool> {
+fn wants_object(objs: &[Bound<'_, PyAny>], dtype: Option<&Bound<'_, PyAny>>) -> PyResult<bool> {
     if let Some(d) = dtype {
         if !d.is_none() {
             return Ok(dtype_from_any(d).map(|t| t.is_object()).unwrap_or(false));
@@ -329,7 +319,14 @@ fn apply_where(res: &NdArray, base: &NdArray, mask: &NdArray) -> PyResult<NdArra
     for k in 0..oo.len() {
         let take = matches!(m.read_at(mo[k]), Scalar::Bool(true) | Scalar::Int(1))
             || !matches!(m.read_at(mo[k]), Scalar::Bool(false) | Scalar::Int(0));
-        out.write_at(oo[k], if take { res.read_at(ro[k]) } else { b.read_at(bo[k]) });
+        out.write_at(
+            oo[k],
+            if take {
+                res.read_at(ro[k])
+            } else {
+                b.read_at(bo[k])
+            },
+        );
     }
     Ok(out)
 }
@@ -364,8 +361,7 @@ pub fn _ufunc_call<'py>(
     let f = lookup(name).ok_or_else(|| {
         PyNotImplementedErrorShim::new(format!("ufunc '{name}' is not implemented by rnp yet"))
     })?;
-    let mut inputs =
-        resolve_operands(&objs, matches!(f, Ufn::Bin(b) if b.is_comparison()), f)?;
+    let mut inputs = resolve_operands(&objs, matches!(f, Ufn::Bin(b) if b.is_comparison()), f)?;
     if let Some(d) = dtype {
         if !d.is_none() {
             let dt = dtype_from_any(d)?;
@@ -457,8 +453,8 @@ fn split_pair(a: &NdArray, frexp: bool) -> PyResult<(NdArray, NdArray)> {
     };
     let src = a.astype(dt);
     let first = NdArray::empty(src.shape.clone(), dt).map_err(crate::err)?;
-    let second =
-        NdArray::empty(src.shape.clone(), if frexp { DType::I32 } else { dt }).map_err(crate::err)?;
+    let second = NdArray::empty(src.shape.clone(), if frexp { DType::I32 } else { dt })
+        .map_err(crate::err)?;
     let offs: Vec<isize> =
         rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
     let fo: Vec<isize> =
@@ -562,15 +558,18 @@ fn identity_of(op: BinOp, dt: DType) -> Option<Scalar> {
 fn reduce_along(a: &NdArray, axis: usize, op: BinOp, initial: Option<Scalar>) -> PyResult<NdArray> {
     let n = a.shape[axis];
     if n == 0 {
-        let ident = initial.or_else(|| identity_of(op, a.dtype())).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "zero-size array to reduction operation {} which has no identity",
-                op.name()
-            ))
-        })?;
+        let ident = initial
+            .or_else(|| identity_of(op, a.dtype()))
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "zero-size array to reduction operation {} which has no identity",
+                    op.name()
+                ))
+            })?;
         let mut shape = a.shape.clone();
         shape.remove(axis);
-        let (_, out_dt) = rnp_core::ops::result_dtypes(a.dtype(), a.dtype(), op).map_err(crate::err)?;
+        let (_, out_dt) =
+            rnp_core::ops::result_dtypes(a.dtype(), a.dtype(), op).map_err(crate::err)?;
         let mut z = NdArray::zeros(shape, out_dt).map_err(crate::err)?;
         z.fill(ident.cast(out_dt));
         return Ok(z);
@@ -639,10 +638,24 @@ pub fn _ufunc_reduce<'py>(
         }
     };
     let mut arr = array_from_any(a, None, false)?;
+    let explicit_dtype = dtype.is_some_and(|d| !d.is_none());
     if let Some(d) = dtype {
         if !d.is_none() {
             let dt = dtype_from_any(d)?;
             arr = from_object(py, &arr, dt)?;
+        }
+    }
+    if !explicit_dtype && !op.is_logical() && !op.is_comparison() {
+        if let Some(o) = out.filter(|o| !o.is_none()) {
+            let cell = o
+                .cast::<PyNdArray>()
+                .map_err(|_| PyTypeError::new_err("output must be an array"))?;
+            // A reduction has one input/output accumulator operand.  With no
+            // explicit dtype, NumPy's ufunc resolver selects the common loop
+            // dtype of the input and supplied output (rather than computing
+            // in the input's default dtype and casting only at the end).
+            let loop_dt = rnp_core::promote(arr.dtype(), cell.borrow().arr.dtype());
+            arr = from_object(py, &arr, loop_dt)?;
         }
     }
     // `where=` replaces the masked-out elements with the identity.
@@ -669,9 +682,7 @@ pub fn _ufunc_reduce<'py>(
             let mask = array_from_any(w, Some(DType::Bool), false)?;
             let mut base = NdArray::zeros(arr.shape.clone(), arr.dtype()).map_err(crate::err)?;
             base.fill(ident.cast(arr.dtype()));
-            where_mask = Some(
-                rnp_core::iter::broadcast_to(&mask, &arr.shape).map_err(crate::err)?,
-            );
+            where_mask = Some(rnp_core::iter::broadcast_to(&mask, &arr.shape).map_err(crate::err)?);
             arr = apply_where(&arr, &base, &mask)?;
         }
     }
@@ -680,7 +691,8 @@ pub fn _ufunc_reduce<'py>(
     }
     // numpy accumulates `add`/`multiply` over bool and narrow integers in the
     // platform integer, exactly as `np.sum`/`np.prod` do.
-    if dtype.map(|d| d.is_none()).unwrap_or(true)
+    if !explicit_dtype
+        && out.is_none_or(|o| o.is_none())
         && matches!(op, BinOp::Add | BinOp::Mul)
         && arr.dtype().is_exact()
         && arr.dtype().itemsize() < 8
@@ -707,8 +719,7 @@ pub fn _ufunc_reduce<'py>(
     // with the finished result. A chain of per-axis reductions cannot express
     // that, so the engine is only told about `initial=` when the whole
     // reduction is one collapse; otherwise it stays a post-hoc fold.
-    let one_collapse =
-        native.is_some() && (removed.len() == 1 || removed.len() == arr.ndim());
+    let one_collapse = native.is_some() && (removed.len() == 1 || removed.len() == arr.ndim());
     let ropts = rnp_core::reduce::ReduceOpts {
         mask: where_mask.as_ref(),
         seed: if one_collapse { init } else { None },
@@ -720,10 +731,13 @@ pub fn _ufunc_reduce<'py>(
     // contiguous operand into one run and runs one pairwise tree over it. A
     // chain of per-axis reductions brackets the additions completely
     // differently and diverges in the last bits.
-    let mut cur = if removed.len() == arr.ndim() && native.is_some() {
+    let axes_kernel = native.is_some() && init.is_none() && where_mask.is_none();
+    let mut cur = if axes_kernel {
+        rnp_core::reduce::reduce_axes(&arr, &removed, native.expect("checked above"), keepdims)
+            .map_err(crate::err)?
+    } else if removed.len() == arr.ndim() && native.is_some() {
         let rop = native.expect("checked above");
-        let v = rnp_core::reduce::reduce_all_with(&arr, rop, ropts)
-            .map_err(crate::err)?;
+        let v = rnp_core::reduce::reduce_all_with(&arr, rop, ropts).map_err(crate::err)?;
         let out0 = NdArray::zeros(vec![], rnp_core::reduce::reduce_dtype(rop, arr.dtype()))
             .map_err(crate::err)?;
         out0.write_at(out0.byte_offset, v);
@@ -755,7 +769,7 @@ pub fn _ufunc_reduce<'py>(
         seed.fill(s.cast(cur.dtype()));
         cur = rnp_core::binary(&seed, &cur, op).map_err(crate::err)?;
     }
-    if keepdims {
+    if keepdims && !axes_kernel {
         let mut shape = cur.shape.clone();
         for &ax in removed.iter() {
             shape.insert(ax, 1);
@@ -799,7 +813,7 @@ fn zero_d_reduce<'py>(
     Ok(Some(store_or_wrap(py, arr.clone(), out)?))
 }
 
-fn resolve_axes(arr: &NdArray, axis: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+pub(crate) fn resolve_axes(arr: &NdArray, axis: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
     let nd = arr.ndim() as isize;
     let norm = |i: isize| -> PyResult<usize> {
         let j = if i < 0 { i + nd } else { i };
@@ -817,7 +831,13 @@ fn resolve_axes(arr: &NdArray, axis: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> 
         return Ok(vec![norm(i)?]);
     }
     let t: Vec<isize> = axis.extract()?;
-    t.into_iter().map(norm).collect()
+    let axes: Vec<usize> = t.into_iter().map(norm).collect::<PyResult<_>>()?;
+    let mut sorted = axes.clone();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err(PyValueError::new_err("duplicate value in 'axis'"));
+    }
+    Ok(axes)
 }
 
 #[pyfunction]
@@ -982,14 +1002,9 @@ pub fn _scalar_binop<'py>(
             fpe::clear();
             let (q, r) = rnp_core::ops::scalar_divmod(x.1.cast(dt), y.1.cast(dt), dt);
             let flags = fpe::take();
-            return Ok(PyTuple::new(
-                py,
-                [
-                    triple(py, dt, q, flags)?,
-                    triple(py, dt, r, 0)?,
-                ],
-            )?
-            .into_any());
+            return Ok(
+                PyTuple::new(py, [triple(py, dt, q, flags)?, triple(py, dt, r, 0)?])?.into_any(),
+            );
         }
         _ => {
             return Err(PyValueError::new_err(format!(
@@ -1007,7 +1022,13 @@ pub fn _scalar_binop<'py>(
     let mut flags = fpe::take();
     // numpy reports integer overflow for *scalar* operations only.
     if r.dtype().is_integer() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow) {
-        if int_overflowed(op, x.1.cast(r.dtype()), y.1.cast(r.dtype()), r.get_flat(0), r.dtype()) {
+        if int_overflowed(
+            op,
+            x.1.cast(r.dtype()),
+            y.1.cast(r.dtype()),
+            r.get_flat(0),
+            r.dtype(),
+        ) {
             flags |= fpe::OVER;
         }
     }
@@ -1137,7 +1158,6 @@ fn int_overflowed(op: BinOp, x: Scalar, y: Scalar, r: Scalar, dt: DType) -> bool
     }
     exact != got
 }
-
 
 // ---------------------------------------------------------------------------
 // The allocation-free scalar fast path
@@ -1448,7 +1468,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_scalar_dtype_names, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_class, m)?)?;
     m.add_function(wrap_pyfunction!(_register_generic_class, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::objloops::_register_object_cast_error, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::objloops::_register_object_cast_error,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(crate::objloops::_register_axis_error, m)?)?;
     Ok(())
 }
