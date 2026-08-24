@@ -1641,6 +1641,8 @@ def dtype_short_repr(dtype):
     >>> dt = np.int64([1, 2]).dtype
     >>> assert eval(dtype_short_repr(dt)) == dt
     """
+    if getattr(dtype, "kind", None) == "T":
+        return repr(dtype)
     if not getattr(type(dtype), '_legacy', True):
         # TODO: Custom repr for user DTypes, logic should likely move.
         return repr(dtype)

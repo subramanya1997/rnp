@@ -6,6 +6,7 @@ produces the corresponding `dtype` instance.
 """
 
 from . import _dtype_table, dtype
+from _rnp import _string_dtype
 
 __all__ = []
 
@@ -61,12 +62,41 @@ UIntDType = UInt32DType  # noqa: F821
 ULongDType = UInt64DType  # noqa: F821
 ULongLongDType = UInt64DType  # noqa: F821
 HalfDType = Float16DType  # noqa: F821
+# This port currently models the platform extended-precision aliases with
+# its widest implemented inexact storage types.
+LongDoubleDType = Float64DType  # noqa: F821
+CLongDoubleDType = Complex128DType  # noqa: F821
 
 # The flexible dtypes are parameterised, so their classes take a size.
 _make("BytesDType", dtype("S"))
 _make("StrDType", dtype("U"))
 _make("VoidDType", dtype("V"))
 _make("ObjectDType", dtype("O"))
+
+
+_STRING_NA_UNSET = object()
+
+
+class StringDType(metaclass=_DTypeMeta):
+    """Variable-width UTF-8 string dtype (NEP 55)."""
+
+    dtype = dtype("T")
+    name = "StringDType128"
+    type = str
+
+    def __new__(cls, *, na_object=_STRING_NA_UNSET, coerce=True):
+        has_na = na_object is not _STRING_NA_UNSET
+        return _string_dtype(bool(coerce), has_na,
+                             None if not has_na else na_object)
+
+
+def _reconstruct_string_dtype(coerce, has_na, na_object):
+    if has_na:
+        return StringDType(na_object=na_object, coerce=coerce)
+    return StringDType(coerce=coerce)
+
+
+__all__.append("StringDType")
 # The datetime classes are parameterised by unit, so the class stands for the
 # whole family; the engine reports the family name in its error payloads.
 _make("DateTime64DType", dtype("M8"))

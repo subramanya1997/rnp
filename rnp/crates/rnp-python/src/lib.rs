@@ -26,6 +26,16 @@ use convert::{any_scalar, array_from_any, array_from_any_descr, scalar_from_py};
 use pyarray::{descr_or_default, shape_from_any, ufunc2, PyNdArray};
 use pydtype::{descr_from_any, dtype_from_any, PyDType};
 
+#[pyfunction]
+fn _string_dtype(
+    py: Python<'_>,
+    coerce: bool,
+    has_na: bool,
+    na_object: &Bound<'_, PyAny>,
+) -> PyDType {
+    pydtype::new_string_dtype(py, coerce, has_na.then_some(na_object))
+}
+
 /// Python exception constructors the shim installs at import time, keyed by
 /// the engine error they build. The engine only knows names and dtypes; the
 /// shim owns the classes (`numpy._core._exceptions`) and the ufunc objects.
@@ -176,6 +186,15 @@ fn ones(
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
     let d = descr_or_default(dtype, DType::F64)?;
+    if d.dt.is_string() {
+        let one = pyo3::types::PyString::new(py, "1");
+        let scalar = array_from_any(one.as_any(), Some(d.dt), false)?;
+        let filled = rnp_core::iter::broadcast_to(&scalar, &shape_from_any(shape)?)
+            .map_err(err)?
+            .copy()
+            .into_descr(d);
+        return wrap(py, filled);
+    }
     wrap(py, NdArray::ones_descr(shape_from_any(shape)?, d).map_err(err)?)
 }
 
@@ -198,6 +217,17 @@ fn full(
     fill_value: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
+    if let Some(requested) = dtype.filter(|o| !o.is_none()) {
+        let d = descr_from_any(requested)?;
+        if d.dt.is_string() {
+            let scalar = array_from_any(fill_value, Some(d.dt), false)?;
+            let filled = rnp_core::iter::broadcast_to(&scalar, &shape_from_any(shape)?)
+                .map_err(err)?
+                .copy()
+                .into_descr(d);
+            return wrap(py, filled);
+        }
+    }
     // A Python int too wide for any integer dtype cannot fill an integer
     // array at all: probed, `np.full((2,), 2**100, dtype=np.uint8)` is
     // `OverflowError: Python int too large to convert to C long`.
@@ -515,6 +545,9 @@ fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<Py<PyAn
 /// their field/subarray metadata here; reducing them to `DType::Void` loses
 /// the information `_promote_fields` needs.
 fn promote_descr(da: Descr, db: Descr) -> PyResult<Descr> {
+    if da.dt.is_string() || db.dt.is_string() {
+        return Python::attach(|py| pydtype::promote_string_descr(py, da, db));
+    }
     // Passing the very same native decorated dtype twice preserves it.  A
     // byte-swapped common instance is canonicalized below and normally loses
     // metadata (Unicode is NumPy's historical exception).
@@ -843,7 +876,7 @@ fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
     }
     if descriptors
         .iter()
-        .any(|d| d.is_struct() || d.subarray_def().is_some())
+        .any(|d| d.is_struct() || d.subarray_def().is_some() || d.dt.is_string())
     {
         let Some((&first, rest)) = descriptors.split_first() else {
             return Err(PyValueError::new_err(
@@ -1277,6 +1310,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(datetime_data, m)?)?;
     m.add_function(wrap_pyfunction!(isnat, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_strings, m)?)?;
+    m.add_function(wrap_pyfunction!(_string_dtype, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_string_len, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_objects, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_struct, m)?)?;

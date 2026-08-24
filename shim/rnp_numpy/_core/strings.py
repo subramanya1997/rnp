@@ -16,6 +16,7 @@ import rnp_numpy as np
 
 __all__ = [
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
+    "maximum", "minimum",
     "add", "multiply", "isalpha", "isdigit", "isspace", "isalnum", "islower",
     "isupper", "istitle", "isdecimal", "isnumeric", "str_len", "find",
     "rfind", "index", "rindex", "count", "startswith", "endswith", "lstrip",
@@ -77,6 +78,10 @@ def _elems(arr, shape=None):
     """
     if shape is not None and _shape(arr) != tuple(shape):
         arr = np.broadcast_to(arr, tuple(shape))
+    if arr.dtype.kind == "T":
+        if arr.ndim == 0:
+            return [arr.tolist()]
+        return arr.reshape(-1).tolist()
     if arr.dtype.kind in "SU":
         return _string_elems(arr)
     if arr.ndim == 0:
@@ -127,11 +132,13 @@ def _num_chars(a):
     """Number of characters (not bytes) an element of ``a`` can hold."""
     if a.dtype.kind == "U":
         return a.dtype.itemsize // 4
+    if a.dtype.kind == "T":
+        return max((len(v) for v in _elems(a) if isinstance(v, str)), default=0)
     return a.dtype.itemsize
 
 
 def _check_string(a, name="a"):
-    if a.dtype.kind not in "SU":
+    if a.dtype.kind not in "SUT":
         raise TypeError(
             f"string operation on non-string array")
     return a
@@ -191,7 +198,7 @@ def _no_loop_unless_string(a, ufunc_name):
     say "string operation on non-string array", while `expandtabs`, `str_len`
     and `multiply` are ufunc-backed and surface a `_UFuncNoLoopError`.
     """
-    if a.dtype.kind not in "SU":
+    if a.dtype.kind not in "SUT":
         raise _STRING_UFUNCS[ufunc_name]._no_loop((a,))
     return a
 
@@ -202,6 +209,9 @@ def _string_dtype(kind, nchars):
 
 def _make_string(flat, shape, kind, nchars):
     """Build an ``S``/``U`` array of exactly ``nchars`` characters."""
+    if getattr(kind, "kind", kind) == "T":
+        return _make(flat, shape, kind)
+    kind = getattr(kind, "kind", kind)
     dt = _string_dtype(kind, nchars)
     shape = tuple(shape)
     if _size(shape) == 0:
@@ -285,6 +295,8 @@ def _to_bytes_or_str_array(flat, shape, like):
     """
     like = asarray(like)
     kind = like.dtype.kind
+    if kind == "T":
+        return _make(flat, shape, like.dtype)
     if kind not in "SU":
         kind = "U"
     if _size(tuple(shape)) == 0:
@@ -304,7 +316,7 @@ def _vec_string(char_array, dtype, method, args=()):
     arr = _unwrap(char_array)
     if type(arr) is not _ND:
         arr = np.array(arr)
-    if arr.dtype.kind not in "SU":
+    if arr.dtype.kind not in "SUT":
         raise TypeError("string operation on non-string array")
 
     if not isinstance(args, (list, tuple)):
@@ -321,11 +333,13 @@ def _vec_string(char_array, dtype, method, args=()):
             shapes.append(_shape(a))
     shape = tuple(np.broadcast_shapes(*shapes))  # ValueError on mismatch
 
-    if out_dtype.kind not in "SUO":
+    if out_dtype.kind not in "SUTO":
         raise TypeError(
             "return array must be of type string, unicode or object")
 
     base = _elems(arr, shape)
+    if arr.dtype.kind == "T" and any(not isinstance(v, str) for v in base):
+        raise ValueError("Cannot apply string operation to non-string NA")
     cols = []
     for a in arg_arrays:
         cols.append(None if a is None else _elems(a, shape))
@@ -362,15 +376,39 @@ def _clean_args(*args):
 
 def _unary(a, fn, kind_of_result):
     a = _check_string(asarray(a))
-    vals = [fn(v) for v in _elems(a)]
+    vals = []
+    for v in _elems(a):
+        if a.dtype.kind == "T" and not isinstance(v, str):
+            raise ValueError("Cannot apply string operation to non-string NA")
+        vals.append(fn(v))
     return _make(vals, _shape(a), kind_of_result)
 
 
 def _same_shape_string(a, fn):
     """Elementwise op that keeps ``a``'s dtype exactly."""
     a = _check_string(asarray(a))
-    vals = [fn(v) for v in _elems(a)]
-    return _make_string(vals, _shape(a), a.dtype.kind, _num_chars(a))
+    vals = []
+    for v in _elems(a):
+        if a.dtype.kind == "T" and not isinstance(v, str):
+            raise ValueError("Cannot apply string operation to non-string NA")
+        vals.append(fn(v))
+    return _make_string(vals, _shape(a), a.dtype, _num_chars(a))
+
+
+def _is_nan_na(arr, value):
+    """Whether *value* is this StringDType's floating-NaN sentinel."""
+    if arr.dtype.kind != "T" or not hasattr(arr.dtype, "na_object"):
+        return False
+    na = arr.dtype.na_object
+    if value is not na:
+        return False
+    if isinstance(na, float) and na != na:
+        return True
+    try:
+        bool(na)
+    except TypeError:
+        return True
+    return False
 
 
 def _int_arg(x, name):
@@ -395,10 +433,28 @@ def _coerce_like(value, kind):
 # ---------------------------------------------------------------------------
 
 def _cmp(x1, x2, op):
-    a = _check_string(asarray(x1))
-    b = _check_string(asarray(x2))
+    a = asarray(x1)
+    b = asarray(x2)
+    if a.dtype.kind not in "SUTO" or b.dtype.kind not in "SUTO":
+        raise TypeError("string operation on non-string array")
+    if a.dtype.kind == b.dtype.kind == "T":
+        has_a = hasattr(a.dtype, "na_object")
+        has_b = hasattr(b.dtype, "na_object")
+        if has_a and has_b:
+            na, nb = a.dtype.na_object, b.dtype.na_object
+            same_nan_class = (isinstance(na, float) and na != na
+                              and isinstance(nb, float) and nb != nb)
+            if na is not nb and not same_nan_class:
+                try:
+                    compatible = bool(na == nb)
+                except (TypeError, ValueError):
+                    compatible = False
+                if not compatible:
+                    raise TypeError(
+                        "StringDType instances have incompatible missing values")
     shape = _bcast(a, b)
-    kind = "U" if "U" in (a.dtype.kind, b.dtype.kind) else "S"
+    kind = "U" if "T" in (a.dtype.kind, b.dtype.kind) or "U" in (
+        a.dtype.kind, b.dtype.kind) else "S"
     va = [_coerce_like(v, kind) for v in _elems(a, shape)]
     vb = [_coerce_like(v, kind) for v in _elems(b, shape)]
     return _make([op(x, y) for x, y in zip(va, vb)], shape, np.bool_)
@@ -428,6 +484,29 @@ def greater_equal(x1, x2):
     return _cmp(x1, x2, lambda a, b: a >= b)
 
 
+def _extreme(x1, x2, take_greater):
+    a = _check_string(asarray(x1))
+    b = _check_string(asarray(x2))
+    shape = _bcast(a, b)
+    va = _elems(a, shape)
+    vb = _elems(b, shape)
+    vals = [x if (x >= y if take_greater else x <= y) else y
+            for x, y in zip(va, vb)]
+    out_dtype = (np.promote_types(a.dtype, b.dtype)
+                 if "T" in (a.dtype.kind, b.dtype.kind)
+                 else "U" if "U" in (a.dtype.kind, b.dtype.kind) else "S")
+    return _make_string(vals, shape, out_dtype,
+                        max(_num_chars(a), _num_chars(b)))
+
+
+def maximum(x1, x2):
+    return _extreme(x1, x2, True)
+
+
+def minimum(x1, x2):
+    return _extreme(x1, x2, False)
+
+
 # ---------------------------------------------------------------------------
 # size / search
 # ---------------------------------------------------------------------------
@@ -443,8 +522,13 @@ def _search(a, sub, start, end, name):
     start = _int_arg(0 if start is None else start, "start")
     end = _int_arg(MAX if end is None else end, "end")
     shape = _bcast(arr, subarr, start, end)
-    kind = "U" if "U" in (arr.dtype.kind, subarr.dtype.kind) else "S"
-    va = [_coerce_like(v, kind) for v in _elems(arr, shape)]
+    kind = "U" if "T" in (arr.dtype.kind, subarr.dtype.kind) or "U" in (
+        arr.dtype.kind, subarr.dtype.kind) else "S"
+    raw_a = _elems(arr, shape)
+    if arr.dtype.kind == "T" and any(
+            not isinstance(v, str) for v in raw_a):
+        raise ValueError("Cannot apply string operation to non-string NA")
+    va = [_coerce_like(v, kind) for v in raw_a]
     vb = [_coerce_like(v, kind) for v in _elems(subarr, shape)]
     vs = _elems(start, shape)
     ve = _elems(end, shape)
@@ -486,13 +570,20 @@ def _affix(a, affix, start, end, name):
     start = _int_arg(0 if start is None else start, "start")
     end = _int_arg(MAX if end is None else end, "end")
     shape = _bcast(arr, other, start, end)
-    kind = "U" if "U" in (arr.dtype.kind, other.dtype.kind) else "S"
-    va = [_coerce_like(v, kind) for v in _elems(arr, shape)]
+    kind = "U" if "T" in (arr.dtype.kind, other.dtype.kind) or "U" in (
+        arr.dtype.kind, other.dtype.kind) else "S"
+    raw_a = _elems(arr, shape)
     vb = [_coerce_like(v, kind) for v in _elems(other, shape)]
     vs = _elems(start, shape)
     ve = _elems(end, shape)
-    vals = [getattr(x, name)(y, int(s), int(e))
-            for x, y, s, e in zip(va, vb, vs, ve)]
+    vals = []
+    for raw, y, s, e in zip(raw_a, vb, vs, ve):
+        if arr.dtype.kind == "T" and not isinstance(raw, str):
+            if _is_nan_na(arr, raw):
+                vals.append(False)
+                continue
+            raise ValueError("Cannot apply string operation to non-string NA")
+        vals.append(getattr(_coerce_like(raw, kind), name)(y, int(s), int(e)))
     return _make(vals, shape, np.bool_)
 
 
@@ -510,12 +601,19 @@ def endswith(a, suffix, start=0, end=None):
 
 def _predicate(a, name, unicode_only=False):
     arr = _check_string(asarray(a))
-    if unicode_only and arr.dtype.kind != "U":
+    if unicode_only and arr.dtype.kind not in "UT":
         raise TypeError(
             f"'{name}' is not supported for the input types, and the inputs "
             "could not be safely coerced to any supported types")
-    return _make([getattr(v, name)() for v in _elems(arr)],
-                 _shape(arr), np.bool_)
+    vals = []
+    for v in _elems(arr):
+        if arr.dtype.kind == "T" and not isinstance(v, str):
+            if _is_nan_na(arr, v):
+                vals.append(False)
+                continue
+            raise ValueError("Cannot apply string operation to non-string NA")
+        vals.append(getattr(v, name)())
+    return _make(vals, _shape(arr), np.bool_)
 
 
 def isalpha(a):
@@ -585,21 +683,38 @@ def title(a):
 # The trailing NUL of a fixed-width string element is padding, so numpy's
 # whitespace-stripping loops trim NULs alongside real whitespace.
 _WS = " \t\n\r\v\f\0"
+_WS_VARIABLE = " \t\n\r\v\f"
 
 
 def _strip(a, chars, name):
     arr = _check_string(asarray(a))
     if chars is None:
-        ws = _WS.encode("ascii") if arr.dtype.kind == "S" else _WS
-        vals = [getattr(v, name)(ws) for v in _elems(arr)]
-        return _make_string(vals, _shape(arr), arr.dtype.kind, _num_chars(arr))
+        ws = (_WS.encode("ascii") if arr.dtype.kind == "S" else
+              _WS_VARIABLE if arr.dtype.kind == "T" else _WS)
+        vals = []
+        for v in _elems(arr):
+            if arr.dtype.kind == "T" and not isinstance(v, str):
+                if _is_nan_na(arr, v):
+                    vals.append(v)
+                    continue
+                raise ValueError(
+                    "Cannot apply string operation to non-string NA")
+            vals.append(getattr(v, name)(ws))
+        return _make_string(vals, _shape(arr), arr.dtype, _num_chars(arr))
     ch = _check_string(asarray(chars))
     shape = _bcast(arr, ch)
-    kind = arr.dtype.kind
-    va = [_coerce_like(v, kind) for v in _elems(arr, shape)]
+    kind = "U" if arr.dtype.kind == "T" else arr.dtype.kind
+    raw_a = _elems(arr, shape)
     vb = [_coerce_like(v, kind) for v in _elems(ch, shape)]
-    vals = [getattr(x, name)(y) for x, y in zip(va, vb)]
-    return _make_string(vals, shape, kind, _num_chars(arr))
+    vals = []
+    for raw, y in zip(raw_a, vb):
+        if arr.dtype.kind == "T" and not isinstance(raw, str):
+            if _is_nan_na(arr, raw):
+                vals.append(raw)
+                continue
+            raise ValueError("Cannot apply string operation to non-string NA")
+        vals.append(getattr(_coerce_like(raw, kind), name)(y))
+    return _make_string(vals, shape, arr.dtype, _num_chars(arr))
 
 
 def lstrip(a, chars=None):
@@ -621,12 +736,26 @@ def strip(a, chars=None):
 def add(x1, x2):
     a = _check_string(asarray(x1))
     b = _check_string(asarray(x2))
-    kind = "U" if "U" in (a.dtype.kind, b.dtype.kind) else "S"
+    kind = "U" if "T" in (a.dtype.kind, b.dtype.kind) or "U" in (
+        a.dtype.kind, b.dtype.kind) else "S"
+    out_dtype = (np.promote_types(a.dtype, b.dtype)
+                 if "T" in (a.dtype.kind, b.dtype.kind) else kind)
     shape = _bcast(a, b)
-    va = [_coerce_like(v, kind) for v in _elems(a, shape)]
-    vb = [_coerce_like(v, kind) for v in _elems(b, shape)]
+    raw_a = _elems(a, shape)
+    raw_b = _elems(b, shape)
     nchars = _num_chars(a) + _num_chars(b)
-    return _make_string([x + y for x, y in zip(va, vb)], shape, kind, nchars)
+    vals = []
+    for x, y in zip(raw_a, raw_b):
+        bad_x = a.dtype.kind == "T" and not isinstance(x, str)
+        bad_y = b.dtype.kind == "T" and not isinstance(y, str)
+        if bad_x or bad_y:
+            if ((not bad_x or _is_nan_na(a, x))
+                    and (not bad_y or _is_nan_na(b, y))):
+                vals.append(x if bad_x else y)
+                continue
+            raise ValueError("Cannot apply string operation to non-string NA")
+        vals.append(_coerce_like(x, kind) + _coerce_like(y, kind))
+    return _make_string(vals, shape, out_dtype, nchars)
 
 
 def multiply(a, i):
@@ -640,14 +769,20 @@ def multiply(a, i):
     shape = _bcast(arr, iarr)
     va = _elems(arr, shape)
     vi = [max(int(v), 0) for v in _elems(iarr, shape)]
-    lengths = [len(x) * n for x, n in zip(va, vi)]
+    for x in va:
+        if arr.dtype.kind == "T" and not isinstance(x, str):
+            if not _is_nan_na(arr, x):
+                raise TypeError(
+                    "Cannot apply string operation to non-string NA")
+    lengths = [(len(x) if isinstance(x, (str, bytes)) else 0) * n
+               for x, n in zip(va, vi)]
     nchars = max(lengths) if lengths else 0
     # Checked before the strings are built: the product is what overflows,
     # and materialising it first would exhaust memory rather than raise.
     if nchars > MAX:
         raise OverflowError("Overflow encountered in string multiply")
-    return _make_string([x * n for x, n in zip(va, vi)], shape,
-                        arr.dtype.kind, nchars)
+    vals = [x if _is_nan_na(arr, x) else x * n for x, n in zip(va, vi)]
+    return _make_string(vals, shape, arr.dtype, nchars)
 
 
 def mod(a, values):
@@ -666,15 +801,22 @@ def _just(a, width, fillchar, name):
     fill = _check_string(asarray(fillchar))
     if any(len(v) != 1 for v in _elems(fill)):
         raise TypeError("The fill character must be exactly one character long")
-    kind = arr.dtype.kind
+    kind = "U" if arr.dtype.kind == "T" else arr.dtype.kind
     shape = _bcast(arr, warr, fill)
     va = _elems(arr, shape)
     vw = [int(v) for v in _elems(warr, shape)]
     vf = [_coerce_like(v, kind) for v in _elems(fill, shape)]
-    widths = [max(len(s), w) for s, w in zip(va, vw)]
+    for s in va:
+        if arr.dtype.kind == "T" and not isinstance(s, str):
+            if not _is_nan_na(arr, s):
+                raise ValueError(
+                    "Cannot apply string operation to non-string NA")
+    widths = [max(len(s) if isinstance(s, (str, bytes)) else 0, w)
+              for s, w in zip(va, vw)]
     nchars = max(widths) if widths else 0
-    vals = [getattr(s, name)(w, f) for s, w, f in zip(va, widths, vf)]
-    return _make_string(vals, shape, kind, nchars)
+    vals = [s if _is_nan_na(arr, s) else getattr(s, name)(w, f)
+            for s, w, f in zip(va, widths, vf)]
+    return _make_string(vals, shape, arr.dtype, nchars)
 
 
 def center(a, width, fillchar=' '):
@@ -695,10 +837,17 @@ def zfill(a, width):
     shape = _bcast(arr, warr)
     va = _elems(arr, shape)
     vw = [int(v) for v in _elems(warr, shape)]
-    widths = [max(len(s), w) for s, w in zip(va, vw)]
+    for s in va:
+        if arr.dtype.kind == "T" and not isinstance(s, str):
+            if not _is_nan_na(arr, s):
+                raise ValueError(
+                    "Cannot apply string operation to non-string NA")
+    widths = [max(len(s) if isinstance(s, (str, bytes)) else 0, w)
+              for s, w in zip(va, vw)]
     nchars = max(widths) if widths else 0
-    return _make_string([s.zfill(w) for s, w in zip(va, widths)], shape,
-                        arr.dtype.kind, nchars)
+    return _make_string([s if _is_nan_na(arr, s) else s.zfill(w)
+                         for s, w in zip(va, widths)], shape,
+                        arr.dtype, nchars)
 
 
 def expandtabs(a, tabsize=8):
@@ -706,6 +855,8 @@ def expandtabs(a, tabsize=8):
     tarr = _int_arg(tabsize, "tabsize")
     shape = _bcast(arr, tarr)
     va = _elems(arr, shape)
+    if arr.dtype.kind == "T" and any(not isinstance(v, str) for v in va):
+        raise ValueError("Cannot apply string operation to non-string NA")
     vt = [int(v) for v in _elems(tarr, shape)]
     try:
         vals = [s.expandtabs(t) for s, t in zip(va, vt)]
@@ -714,7 +865,7 @@ def expandtabs(a, tabsize=8):
         # same condition as a statement about the result.
         raise OverflowError("new string is too long") from None
     nchars = max((len(v) for v in vals), default=0)
-    return _make_string(vals, shape, arr.dtype.kind, nchars)
+    return _make_string(vals, shape, arr.dtype, nchars)
 
 
 # ---------------------------------------------------------------------------
@@ -726,22 +877,31 @@ def replace(a, old, new, count=-1):
     arr = _check_string(asarray(a))
     oldarr = _check_string(asarray(old))
     newarr = _check_string(asarray(new))
-    kind = arr.dtype.kind
+    kind = "U" if arr.dtype.kind == "T" else arr.dtype.kind
     shape = _bcast(arr, oldarr, newarr, carr)
-    va = [_coerce_like(v, kind) for v in _elems(arr, shape)]
+    raw_a = _elems(arr, shape)
+    for value in raw_a:
+        if arr.dtype.kind == "T" and not isinstance(value, str):
+            if not _is_nan_na(arr, value):
+                raise ValueError(
+                    "Cannot apply string operation to non-string NA")
+    va = [_coerce_like(v, kind) if isinstance(v, (str, bytes)) else v
+          for v in raw_a]
     vo = [_coerce_like(v, kind) for v in _elems(oldarr, shape)]
     vn = [_coerce_like(v, kind) for v in _elems(newarr, shape)]
     vc = [int(v) for v in _elems(carr, shape)]
 
     counts = []
     for s, o, c in zip(va, vo, vc):
-        n = s.count(o)
+        n = 0 if _is_nan_na(arr, s) else s.count(o)
         counts.append(n if c < 0 else min(n, c))
-    buffersizes = [len(s) + n * (len(x) - len(o))
+    buffersizes = [(len(s) if isinstance(s, (str, bytes)) else 0)
+                   + n * (len(x) - len(o))
                    for s, n, o, x in zip(va, counts, vo, vn)]
     nchars = max(buffersizes) if buffersizes else 0
-    vals = [s.replace(o, x, n) for s, o, x, n in zip(va, vo, vn, counts)]
-    return _make_string(vals, shape, kind, nchars)
+    vals = [s if _is_nan_na(arr, s) else s.replace(o, x, n)
+            for s, o, x, n in zip(va, vo, vn, counts)]
+    return _make_string(vals, shape, arr.dtype, nchars)
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +911,7 @@ def replace(a, old, new, count=-1):
 def _partition(a, sep, right):
     arr = _check_string(asarray(a))
     sarr = _check_string(asarray(sep))
-    kind = arr.dtype.kind
+    kind = "U" if arr.dtype.kind == "T" else arr.dtype.kind
     shape = _bcast(arr, sarr)
     va = [_coerce_like(v, kind) for v in _elems(arr, shape)]
     vs = [_coerce_like(v, kind) for v in _elems(sarr, shape)]
@@ -761,9 +921,9 @@ def _partition(a, sep, right):
     n1 = max((len(p[0]) for p in parts), default=0)
     n3 = max((len(p[2]) for p in parts), default=0)
     n2 = 1 if not any(found) else max((len(p) for p in vs), default=1)
-    return (_make_string([p[0] for p in parts], shape, kind, n1),
-            _make_string([p[1] for p in parts], shape, kind, n2),
-            _make_string([p[2] for p in parts], shape, kind, n3))
+    return (_make_string([p[0] for p in parts], shape, arr.dtype, n1),
+            _make_string([p[1] for p in parts], shape, arr.dtype, n2),
+            _make_string([p[2] for p in parts], shape, arr.dtype, n3))
 
 
 def partition(a, sep):
@@ -843,7 +1003,7 @@ def slice(a, start=None, stop=_NO_VALUE, step=None, /):
     import builtins
     vals = [s[builtins.slice(b, e, t)]
             for s, b, e, t in zip(va, vstart, vstop, vstep)]
-    return _make_string(vals, shape, arr.dtype.kind, _num_chars(arr))
+    return _make_string(vals, shape, arr.dtype, _num_chars(arr))
 
 
 # ---------------------------------------------------------------------------

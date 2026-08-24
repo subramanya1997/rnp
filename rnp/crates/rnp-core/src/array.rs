@@ -167,7 +167,7 @@ pub fn swap_layout(dt: DType) -> Option<(usize, usize)> {
                 Some((4, n as usize))
             }
         }
-        DType::Bytes(_) | DType::Void(_) | DType::Object => None,
+        DType::Bytes(_) | DType::String(_) | DType::Void(_) | DType::Object => None,
         DType::Struct(_) | DType::SubArray(_) => None,
     }
 }

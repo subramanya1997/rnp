@@ -38,6 +38,10 @@ pub enum DType {
     Bytes(u32),
     /// `U<n>` — n UCS4 code points, so `4 * n` bytes.
     Str(u32),
+    /// NEP 55 variable-width UTF-8 strings. The payload identifies the
+    /// Python-owned StringDType parameters (`na_object` and `coerce`). The
+    /// default, parameter-less descriptor always uses id 0.
+    String(u32),
     /// `V<n>` — n raw bytes with no interpretation.
     Void(u32),
     /// A structured dtype; the payload indexes the struct registry.
@@ -67,6 +71,8 @@ pub enum Kind {
     Bytes,
     /// `U`
     Str,
+    /// `T` — variable-width UTF-8 StringDType.
+    String,
     /// `V`, including structured and subarray dtypes.
     Void,
     /// `M`
@@ -113,7 +119,7 @@ impl DType {
             DType::I16 | DType::U16 | DType::F16 => 2,
             DType::I32 | DType::U32 | DType::F32 => 4,
             DType::I64 | DType::U64 | DType::F64 | DType::C64 => 8,
-            DType::C128 => 16,
+            DType::C128 | DType::String(_) => 16,
             DType::Bytes(n) | DType::Void(n) => n as usize,
             DType::Str(n) => 4 * n as usize,
             DType::DateTime(_) | DType::TimeDelta(_) => 8,
@@ -133,6 +139,7 @@ impl DType {
             DType::C128 => 8,
             DType::Bytes(_) | DType::Void(_) => 1,
             DType::Str(_) => 4,
+            DType::String(_) => 8,
             DType::Struct(id) => registry::struct_def(id).alignment,
             DType::SubArray(id) => registry::subarray_def(id).base.alignment(),
             DType::Object | DType::DateTime(_) | DType::TimeDelta(_) => 8,
@@ -149,6 +156,7 @@ impl DType {
             DType::C64 | DType::C128 => Kind::Complex,
             DType::Bytes(_) => Kind::Bytes,
             DType::Str(_) => Kind::Str,
+            DType::String(_) => Kind::String,
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => Kind::Void,
             DType::DateTime(_) => Kind::DateTime,
             DType::TimeDelta(_) => Kind::TimeDelta,
@@ -166,6 +174,7 @@ impl DType {
             Kind::Complex => 'c',
             Kind::Bytes => 'S',
             Kind::Str => 'U',
+            Kind::String => 'T',
             Kind::Void => 'V',
             Kind::DateTime => 'M',
             Kind::TimeDelta => 'm',
@@ -192,6 +201,7 @@ impl DType {
             DType::C128 => 'D',
             DType::Bytes(_) => 'S',
             DType::Str(_) => 'U',
+            DType::String(_) => 'T',
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 'V',
             DType::DateTime(_) => 'M',
             DType::TimeDelta(_) => 'm',
@@ -228,6 +238,9 @@ impl DType {
         }
         if self == DType::Object {
             return "object".to_string();
+        }
+        if matches!(self, DType::String(_)) {
+            return "StringDType128".to_string();
         }
         if let DType::DateTime(u) | DType::TimeDelta(u) = self {
             let stem = if matches!(self, DType::DateTime(_)) {
@@ -269,6 +282,7 @@ impl DType {
             DType::C128 => 15,
             DType::Bytes(_) => 18,
             DType::Str(_) => 19,
+            DType::String(_) => 2056,
             DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => 20,
             DType::DateTime(_) => 21,
             DType::TimeDelta(_) => 22,
@@ -286,7 +300,7 @@ impl DType {
     pub fn byteorder_matters(self) -> bool {
         match self {
             DType::Str(_) => true,
-            DType::Bytes(_) | DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => false,
+            DType::Bytes(_) | DType::String(_) | DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => false,
             DType::Object => false,
             DType::DateTime(_) | DType::TimeDelta(_) => true,
             other => other.itemsize() > 1,
@@ -307,6 +321,7 @@ impl DType {
     pub fn str_size(self) -> usize {
         match self {
             DType::Str(n) => n as usize,
+            DType::String(_) => self.itemsize(),
             other => other.itemsize(),
         }
     }
@@ -352,7 +367,7 @@ impl DType {
         self.category() == Kind::Complex
     }
     pub fn is_flexible(self) -> bool {
-        matches!(self.category(), Kind::Bytes | Kind::Str | Kind::Void)
+        matches!(self.category(), Kind::Bytes | Kind::Str | Kind::String | Kind::Void)
     }
     /// True for `M8`/`m8`: int64 storage plus unit metadata.
     pub fn is_datetime_like(self) -> bool {
@@ -369,6 +384,10 @@ impl DType {
     /// `object` dtype: a descriptor with no storage behind it.
     pub fn is_object(self) -> bool {
         self == DType::Object
+    }
+    /// NEP 55 variable-width UTF-8 string dtype.
+    pub fn is_string(self) -> bool {
+        matches!(self, DType::String(_))
     }
     /// True for bool and all integer types (the "not inexact" set).
     pub fn is_exact(self) -> bool {
@@ -396,6 +415,7 @@ impl DType {
     pub(crate) fn from_plain_name(s: &str) -> Option<DType> {
         Some(match s {
             "object" | "object_" | "O" | "O8" => DType::Object,
+            "T" => DType::String(0),
             "bool" | "bool_" | "?" | "b1" => DType::Bool,
             "int8" | "byte" | "b" | "i1" => DType::I8,
             "int16" | "short" | "h" | "i2" => DType::I16,
@@ -514,6 +534,7 @@ pub fn promote_flexible(a: DType, b: DType) -> Option<DType> {
     match (a, b) {
         (Bytes(n), Bytes(m)) => Some(Bytes(n.max(m))),
         (Str(n), Str(m)) => Some(Str(n.max(m))),
+        (String(a), String(b)) if a == b => Some(String(a)),
         (Void(n), Void(m)) if n == m => Some(Void(n)),
         // numpy promotes bytes -> str by widening to the code-point count.
         (Bytes(n), Str(m)) | (Str(m), Bytes(n)) => Some(Str(n.max(m))),

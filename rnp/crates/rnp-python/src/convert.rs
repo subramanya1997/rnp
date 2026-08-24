@@ -97,6 +97,9 @@ pub fn element_to_py<'py>(
     arr: &NdArray,
     off: isize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if arr.dtype().is_string() {
+        return Ok(crate::objects::read_string(py, arr, off));
+    }
     if arr.dtype().is_object() {
         return Ok(crate::objects::read(py, arr, off));
     }
@@ -191,6 +194,9 @@ pub fn npflexible_to_py<'py>(
     arr: &NdArray,
     off: isize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if arr.dtype().is_string() {
+        return Ok(crate::objects::read_string(py, arr, off));
+    }
     if arr.dtype().is_object() {
         return Ok(crate::objects::read(py, arr, off));
     }
@@ -601,6 +607,54 @@ fn array_from_text(obj: &Bound<'_, PyAny>, dtype: Option<DType>) -> PyResult<NdA
     Ok(out)
 }
 
+fn string_na_matches(item: &Bound<'_, PyAny>, na: &Bound<'_, PyAny>) -> bool {
+    if item.is(na) {
+        return true;
+    }
+    if item.extract::<f64>().is_ok_and(f64::is_nan)
+        && na.extract::<f64>().is_ok_and(f64::is_nan)
+    {
+        return true;
+    }
+    item.eq(na).unwrap_or(false)
+}
+
+/// Build a variable-width StringDType array. The 16-byte core cell carries a
+/// slab handle; the pointed-to object is always a builtin `str`, except for a
+/// configured NA sentinel whose exact Python identity is retained.
+fn array_from_string(obj: &Bound<'_, PyAny>, dtype: DType) -> PyResult<NdArray> {
+    let py = obj.py();
+    let (coerce, na_object) = crate::pydtype::string_config(py, dtype)
+        .ok_or_else(|| PyTypeError::new_err("invalid StringDType descriptor"))?;
+    let mut shape = Vec::new();
+    discover_shape(obj, &mut shape)?;
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::new();
+    collect_objects(obj, 0, &shape, &mut items)?;
+    let out = NdArray::zeros(shape, dtype).map_err(crate::err)?;
+    let isz = dtype.itemsize() as isize;
+    for (i, item) in items.iter().enumerate() {
+        if let Some(na) = &na_object {
+            if string_na_matches(item, na.bind(py)) {
+                crate::objects::write_string(&out, i as isize * isz, na.bind(py));
+                continue;
+            }
+        }
+        let value = if let Ok(s) = item.cast::<PyString>() {
+            PyString::new(py, s.to_str()?).into_any()
+        } else if !coerce {
+            return Err(PyValueError::new_err(
+                "StringDType only allows string data when string coercion is disabled.",
+            ));
+        } else if let Ok(b) = item.cast::<PyBytes>() {
+            b.call_method0("decode")?
+        } else {
+            item.str()?.into_any()
+        };
+        crate::objects::write_string(&out, i as isize * isz, &value);
+    }
+    Ok(out)
+}
+
 /// Flatten nested sequences into the leaf Python objects.
 fn collect_objects<'py>(
     obj: &Bound<'py, PyAny>,
@@ -660,6 +714,9 @@ pub fn array_from_any(
     // Object arrays store handles into the interning slab.
     if dtype == Some(DType::Object) {
         return crate::objects::array_from_objects(obj);
+    }
+    if let Some(d) = dtype.filter(|d| d.is_string()) {
+        return array_from_string(obj, d);
     }
     // datetime64 / timedelta64 elements can be strings, `datetime` objects
     // or plain ints, and the unit is metadata, so they need their own path.

@@ -235,7 +235,7 @@ def _text_scalar(obj, dtype):
     if not isinstance(obj, (bytes, str)) or dtype is None:
         return None
     dt = _rnp.dtype(dtype)
-    if dt.kind in "USVO":
+    if dt.kind in "USVOT":
         return None
     return _rnp_array(obj, None).astype(dt)
 
@@ -245,6 +245,31 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
     # `copy` is numpy 2.x's tri-state and the engine understands all three:
     # True always copies, False refuses to, None copies only when it must.
     _copy = copy
+    if dtype is not None:
+        try:
+            _void_dt = globals()["dtype"](dtype)
+        except (TypeError, ValueError):
+            _void_dt = None
+        if (isinstance(obj, ndarray) and _void_dt is not None
+                and _void_dt.kind == "T"):
+            if copy is False:
+                raise ValueError("Unable to avoid copy while creating an array as requested.")
+            return obj.astype(_void_dt, copy=True)
+        if (_void_dt is not None and _void_dt.kind == "V"
+                and _void_dt.names is None and _void_dt.subdtype is None):
+            def _void_leaves(value):
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        yield from _void_leaves(item)
+                else:
+                    yield value
+            _vals = list(_void_leaves(obj))
+            if _builtins.all(
+                    isinstance(value, (bytes, bytearray)) for value in _vals):
+                _width = _void_dt.itemsize or max(
+                    (len(value) for value in _vals), default=0)
+                return _rnp_array(obj, f"S{_width}", copy=_copy).view(
+                    f"V{_width}")
     if isinstance(dtype, str) and dtype in _CHAR_TYPECODES:
         obj, dtype = _char_typecode_elements(obj), "S1"
     _text = _text_scalar(obj, dtype)

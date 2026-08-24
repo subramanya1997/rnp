@@ -2152,6 +2152,13 @@ impl PyNdArray {
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        if self.arr.dtype().is_string() {
+            return Ok(format!(
+                "array({}, dtype={})",
+                string_body(py, &self.arr, &mut Vec::new(), true)?,
+                crate::pydtype::string_repr_for(py, self.arr.dtype())?,
+            ));
+        }
         if self.arr.dtype().is_object() {
             return Ok(format!("array({}, dtype=object)",
                               object_body(py, &self.arr, &mut Vec::new())?));
@@ -2160,6 +2167,9 @@ impl PyNdArray {
     }
 
     fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        if self.arr.dtype().is_string() {
+            return string_body(py, &self.arr, &mut Vec::new(), false);
+        }
         if self.arr.dtype().is_object() {
             return object_body(py, &self.arr, &mut Vec::new());
         }
@@ -2525,6 +2535,32 @@ fn object_body(py: Python<'_>, arr: &NdArray, index: &mut Vec<isize>) -> PyResul
     Ok(format!("[{}]", parts.join(", ")))
 }
 
+fn string_body(
+    py: Python<'_>,
+    arr: &NdArray,
+    index: &mut Vec<isize>,
+    commas: bool,
+) -> PyResult<String> {
+    if index.len() == arr.ndim() {
+        let o = crate::objects::read_string(py, arr, arr.byte_index(index));
+        return if commas {
+            Ok(o.repr()?.to_string())
+        } else if arr.ndim() == 0 {
+            Ok(o.str()?.to_string())
+        } else {
+            Ok(o.repr()?.to_string())
+        };
+    }
+    let n = arr.shape[index.len()];
+    let mut parts = Vec::with_capacity(n.max(0) as usize);
+    for i in 0..n {
+        index.push(i);
+        parts.push(string_body(py, arr, index, commas)?);
+        index.pop();
+    }
+    Ok(format!("[{}]", parts.join(if commas { ", " } else { " " })))
+}
+
 /// Return `res`, or copy it into a caller-supplied `out=` array (casting to
 /// the output dtype, as numpy does).
 pub fn store_or_wrap<'py>(
@@ -2676,7 +2712,11 @@ impl PyNdArray {
                 let mut acc = want_all;
                 for o in rnp_core::iter::offsets(&self.arr.shape, &self.arr.strides,
                                                  self.arr.byte_offset) {
-                    let t = truthy(self.arr.read_at(o));
+                    let t = if self.arr.dtype().is_string() {
+                        crate::objects::read_string(py, &self.arr, o).is_truthy()?
+                    } else {
+                        truthy(self.arr.read_at(o))
+                    };
                     if want_all {
                         acc &= t;
                         if !acc {
@@ -2698,7 +2738,20 @@ impl PyNdArray {
                 npscalar_to_py(py, DType::Bool, Scalar::Bool(acc))
             }
             Some(ax) => {
-                let bools = self.arr.astype(DType::Bool);
+                let bools = if self.arr.dtype().is_string() {
+                    let mut out = NdArray::zeros(self.arr.shape.clone(), DType::Bool)
+                        .map_err(crate::err)?;
+                    let src = rnp_core::iter::offsets(
+                        &self.arr.shape, &self.arr.strides, self.arr.byte_offset);
+                    for (i, off) in src.enumerate() {
+                        let value = crate::objects::read_string(py, &self.arr, off)
+                            .is_truthy()?;
+                        out.set_flat(i, Scalar::Bool(value));
+                    }
+                    out
+                } else {
+                    self.arr.astype(DType::Bool)
+                };
                 let op = if want_all {
                     rnp_core::ReduceOp::Min
                 } else {
