@@ -101,6 +101,11 @@ def _normalize_dtypes(op_dtypes, nop, dtype):
         return [None] * nop
     if isinstance(op_dtypes, (str, type)) or hasattr(op_dtypes, "kind"):
         return [dtype(op_dtypes)] * nop
+    if nop == 1:
+        try:
+            return [dtype(op_dtypes)]
+        except (TypeError, ValueError):
+            pass
     specs = list(op_dtypes)
     if len(specs) != nop:
         raise ValueError("op_dtypes must be a tuple or array of per-op dtypes")
@@ -142,7 +147,7 @@ class nditer:
         if op_flags is None:
             self._op_flags = [
                 frozenset(("writeonly", "allocate"))
-                if value is None and requested is not None else mode
+                if value is None else mode
                 for value, requested, mode in zip(
                     raw, self._requested_dtypes, self._op_flags
                 )
@@ -187,6 +192,8 @@ class nditer:
                     for arr, requested in zip(arrays, self._requested_dtypes)
                 ]
 
+        source_arrays = list(arrays)
+        self._has_op_axes = op_axes is not None
         if op_axes is not None:
             arrays, logical_shape = self._apply_op_axes(arrays, op_axes, itershape)
         else:
@@ -214,6 +221,7 @@ class nditer:
         inferred_dtype = (result_type(*promotion_inputs)
                           if promotion_inputs else None)
         allocation_order = self._allocation_order(inputs)
+        public_arrays = list(source_arrays)
         for i, (arr, mode, requested) in enumerate(
                 zip(arrays, self._op_flags, self._requested_dtypes)):
             if arr is not None:
@@ -223,12 +231,21 @@ class nditer:
             target = requested if requested is not None else inferred_dtype
             if target is None:
                 raise TypeError("cannot allocate an iterator output without a dtype")
-            arrays[i] = empty(logical_shape, dtype=target, order=allocation_order)
+            allocation_shape = (self._allocation_shapes[i]
+                                if self._has_op_axes else logical_shape)
+            allocated = self._allocate_output(
+                empty, allocation_shape, target, inputs, i, allocation_order
+            )
+            public_arrays[i] = allocated
+            arrays[i] = (self._remap_array(allocated, self._axis_mappings[i])
+                         if self._has_op_axes else allocated)
 
         self._original_operands = tuple(arrays)
         self._writebacks = []
         arrays = self._prepare_temporary_operands(arrays, can_cast)
         self._operands = tuple(arrays)
+        self._public_operands = (tuple(public_arrays) if self._has_op_axes
+                                 else self._operands)
         self._logical_shape = tuple(logical_shape)
         for arr, mode in zip(self._operands, self._op_flags):
             if "no_broadcast" in mode:
@@ -259,6 +276,40 @@ class nditer:
                 a.flags.f_contiguous and not a.flags.c_contiguous for a in inputs):
             return "F"
         return "C"
+
+    def _allocate_output(self, empty, shape, target, inputs, operand,
+                         fallback_order):
+        if not shape or len(shape) == 1:
+            return empty(shape, dtype=target, order=fallback_order)
+        if not self._has_op_axes:
+            return empty(shape, dtype=target, order=fallback_order)
+        mapping = self._axis_mappings[operand]
+        if self._order == "C":
+            logical_fast = list(range(len(mapping) - 1, -1, -1))
+        elif self._order == "F":
+            logical_fast = list(range(len(mapping)))
+        else:
+            first = next((a for a in inputs if a is not None), None)
+            if first is None:
+                logical_fast = list(range(len(mapping) - 1, -1, -1))
+            else:
+                logical_fast = sorted(
+                    range(len(mapping)),
+                    key=lambda axis: (
+                        -1 if int(first.shape[axis]) == 1
+                        else abs(int(first.strides[axis])), -axis
+                    ),
+                )
+        raw_fast = []
+        for logical_axis in logical_fast:
+            raw_axis = mapping[logical_axis]
+            if raw_axis >= 0 and raw_axis not in raw_fast:
+                raw_fast.append(raw_axis)
+        raw_fast.extend(axis for axis in range(len(shape)) if axis not in raw_fast)
+        slow_to_fast = list(reversed(raw_fast))
+        base = empty(tuple(shape[axis] for axis in slow_to_fast), dtype=target)
+        permutation = tuple(slow_to_fast.index(axis) for axis in range(len(shape)))
+        return base.transpose(permutation)
 
     def _validate_writemasked(self, arrays):
         masks = [i for i, mode in enumerate(self._op_flags)
@@ -296,7 +347,114 @@ class nditer:
             raise ValueError("large WRITEMASKED buffering is not implemented")
 
     def _apply_op_axes(self, arrays, op_axes, itershape):
-        raise NotImplementedError("op_axes requires the extended axis-remapping lane")
+        if len(op_axes) != len(arrays):
+            raise ValueError("op_axes must have one entry per operand")
+        explicit = [tuple(x) for x in op_axes if x is not None]
+        if explicit:
+            iterator_ndim = len(explicit[0])
+            if any(len(x) != iterator_ndim for x in explicit):
+                raise ValueError("Each entry of op_axes must have the same size")
+        elif itershape is not None:
+            iterator_ndim = len(itershape)
+        else:
+            iterator_ndim = max((a.ndim for a in arrays if a is not None),
+                                default=0)
+
+        mappings = []
+        projected_shapes = []
+        allocation_shapes = []
+        for arr, axes in zip(arrays, op_axes):
+            if axes is None:
+                ndim = iterator_ndim if arr is None else arr.ndim
+                if ndim > iterator_ndim:
+                    raise ValueError("operand has more dimensions than op_axes")
+                mapping = ([-1] * (iterator_ndim - ndim)
+                           + list(range(ndim)))
+            else:
+                mapping = []
+                for value in axes:
+                    axis = -1 if value is None else int(value)
+                    mapping.append(axis)
+            nonnegative = [axis for axis in mapping if axis >= 0]
+            if len(set(nonnegative)) != len(nonnegative):
+                raise ValueError("op_axes contained a duplicate axis")
+            if arr is not None and any(axis >= arr.ndim for axis in nonnegative):
+                raise ValueError("op_axes axis is out of bounds")
+            if arr is None and nonnegative:
+                expected = list(range(max(nonnegative) + 1))
+                if sorted(nonnegative) != expected:
+                    raise ValueError("allocated op_axes must specify every output axis")
+
+            shape = tuple(1 if axis < 0 else int(arr.shape[axis])
+                          for axis in mapping) if arr is not None else (1,) * iterator_ndim
+            projected_shapes.append(shape)
+            mappings.append(tuple(mapping))
+            if nonnegative:
+                raw_shape = [1] * (max(nonnegative) + 1)
+                for logical_axis, operand_axis in enumerate(mapping):
+                    if operand_axis >= 0:
+                        raw_shape[operand_axis] = shape[logical_axis]
+                allocation_shapes.append(tuple(raw_shape))
+            else:
+                allocation_shapes.append(())
+
+        logical_shape = _broadcast_shape(projected_shapes)
+        if itershape is not None:
+            requested = tuple(int(x) for x in itershape)
+            if len(requested) != iterator_ndim or any(x < -1 for x in requested):
+                raise ValueError("itershape must match the iterator dimensions")
+            result = []
+            for inferred, asked in zip(logical_shape, requested):
+                if asked == -1:
+                    result.append(inferred)
+                elif inferred not in (1, asked):
+                    raise ValueError("operands could not be broadcast to itershape")
+                else:
+                    result.append(asked)
+            logical_shape = tuple(result)
+
+        self._axis_mappings = tuple(mappings)
+        final_allocation_shapes = []
+        for mapping in mappings:
+            axes = [axis for axis in mapping if axis >= 0]
+            raw_shape = [1] * (max(axes) + 1) if axes else []
+            for logical_axis, operand_axis in enumerate(mapping):
+                if operand_axis >= 0:
+                    raw_shape[operand_axis] = logical_shape[logical_axis]
+            final_allocation_shapes.append(tuple(raw_shape))
+        self._allocation_shapes = tuple(final_allocation_shapes)
+
+        for mapping, mode in zip(mappings, self._op_flags):
+            if "readonly" in mode:
+                continue
+            reduces = any(axis < 0 and logical_shape[logical_axis] != 1
+                          for logical_axis, axis in enumerate(mapping))
+            if reduces and "reduce_ok" not in self._flags:
+                raise ValueError("output operand requires a reduction, but REDUCE_OK was not enabled")
+        remapped = [None if arr is None else self._remap_array(arr, mapping)
+                    for arr, mapping in zip(arrays, mappings)]
+        return remapped, logical_shape
+
+    @staticmethod
+    def _remap_array(arr, mapping):
+        used = [axis for axis in mapping if axis >= 0]
+        omitted = [axis for axis in range(arr.ndim) if axis not in used]
+        if omitted:
+            index = tuple(0 if axis in omitted else slice(None)
+                          for axis in range(arr.ndim))
+            view = arr[index]
+            remaining = [axis for axis in range(arr.ndim) if axis in used]
+        else:
+            view = arr
+            remaining = list(range(arr.ndim))
+        if used:
+            permutation = tuple(remaining.index(axis) for axis in used)
+            if permutation != tuple(range(len(permutation))):
+                view = view.transpose(permutation)
+        if any(axis < 0 for axis in mapping):
+            view = view[tuple(None if axis < 0 else slice(None)
+                              for axis in mapping)]
+        return view
 
     def _prepare_temporary_operands(self, arrays, can_cast):
         prepared = []
@@ -364,10 +522,11 @@ class nditer:
                 list(range(ndim - 1, -1, -1)), [False] * ndim)
 
         def key(axis):
-            strides = [abs(self._mapped_stride(arr, axis))
-                       for arr in self._operands
-                       if self._mapped_stride(arr, axis) != 0]
-            return (min(strides) if strides else 1 << 62, -axis)
+            for arr in self._operands:
+                stride = self._mapped_stride(arr, axis)
+                if stride != 0:
+                    return (abs(stride), -axis)
+            return (1 << 62, -axis)
 
         fast = sorted(range(ndim), key=key)
         reverse = [False] * ndim
@@ -465,6 +624,13 @@ class nditer:
         n = self._external_chunk_len()
         chunks = []
         for arr, mode in zip(self._operands, self._op_flags):
+            if ("readonly" not in mode and arr.size == 1
+                    and all(self._mapped_stride(arr, axis) == 0
+                            for axis in range(len(self._logical_shape)))):
+                from .lib.stride_tricks import as_strided
+                chunks.append(as_strided(arr.reshape(()), shape=(n,),
+                                         strides=(0,), writeable=True))
+                continue
             if (len(self._logical_shape) == 1 and arr.ndim == 1
                     and tuple(arr.shape) == self._logical_shape
                     and not self._axis_reverse[0]):
@@ -522,7 +688,7 @@ class nditer:
     @property
     def operands(self):
         self._check_open()
-        return self._operands
+        return self._public_operands
 
     @property
     def dtypes(self):
