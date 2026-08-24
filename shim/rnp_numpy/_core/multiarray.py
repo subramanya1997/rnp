@@ -73,7 +73,15 @@ from .._datetime import (  # noqa: E402
 fromfile = not_implemented("numpy._core.multiarray.fromfile")
 fromiter = not_implemented("numpy._core.multiarray.fromiter")
 fromstring = not_implemented("numpy._core.multiarray.fromstring")
-nested_iters = not_implemented("numpy._core.multiarray.nested_iters")
+def nditer(*args, **kwargs):
+    # Lazy to avoid the top-level package's initialization cycle.
+    from .. import nditer as iterator_type
+    return iterator_type(*args, **kwargs)
+
+
+def nested_iters(*args, **kwargs):
+    from .. import nested_iters as iterator_factory
+    return iterator_factory(*args, **kwargs)
 shares_memory = not_implemented("numpy._core.multiarray.shares_memory")
 may_share_memory = not_implemented("numpy._core.multiarray.may_share_memory")
 _get_madvise_hugepage = not_implemented(

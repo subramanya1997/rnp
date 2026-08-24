@@ -1353,6 +1353,7 @@ del _name
 
 # Classes upstream test modules *instantiate* at import time.
 from .matrixlib.defmatrix import asmatrix, bmat, matrix  # noqa: E402
+from ._nditer import nditer, nested_iters  # noqa: E402,F401
 
 
 class _BroadcastIter:
