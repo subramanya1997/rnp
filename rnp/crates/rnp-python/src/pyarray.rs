@@ -2078,7 +2078,7 @@ impl PyNdArray {
                 Ok(())
             }
             Indexed::Fancy(plan) => {
-                let src = assignment_source(value, &plan.shape, me.dtype())?;
+                let src = fancy_assignment_source(value, &plan.shape, me.dtype())?;
                 rnp_core::indexing::scatter(&me, &plan, &src).map_err(crate::err)
             }
         }
@@ -2498,9 +2498,36 @@ pub fn store_or_wrap<'py>(
     Ok(dest.clone())
 }
 
-/// Coerce the right-hand side of an assignment: build an array of `dtype`
-/// and broadcast it to `shape`, with numpy's message when it does not fit.
+/// Coerce the right-hand side of an assignment into a *view* destination
+/// (`a[...] = v`, `a[1:3] = v`, `a['f0'] = v`): build an array of `dtype` and
+/// broadcast it to `shape`.
+///
+/// numpy has **two** messages for a right-hand side that will not broadcast,
+/// and which one it uses depends on the kind of indexing. Basic indexing --
+/// anything that yields a view -- goes through `PyArray_AssignArray` and says
+/// "could not broadcast input array from shape (S,) into shape (D,)", while
+/// advanced (fancy) indexing goes through the mapping iterator and says
+/// "shape mismatch: value array of shape (S,) could not be broadcast to
+/// indexing result of shape (D,)". Probed on 2.5.2 for `a[...]`, `a[:]`,
+/// `a['f']` (all the first form) against `a[[0, 1]]` (the second).
 fn assignment_source(
+    value: &Bound<'_, PyAny>,
+    shape: &[isize],
+    dtype: DType,
+) -> PyResult<NdArray> {
+    let src = array_from_any(value, Some(dtype), false)?;
+    rnp_core::iter::broadcast_to(&src, shape).map_err(|_| {
+        PyValueError::new_err(format!(
+            "could not broadcast input array from shape {} into shape {}",
+            fmt_shape(&src.shape),
+            fmt_shape(shape)
+        ))
+    })
+}
+
+/// [`assignment_source`] for a *fancy* (advanced-indexing) destination, which
+/// numpy reports with its own message.
+fn fancy_assignment_source(
     value: &Bound<'_, PyAny>,
     shape: &[isize],
     dtype: DType,

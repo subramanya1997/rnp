@@ -449,6 +449,11 @@ fn is_text(obj: &Bound<'_, PyAny>) -> bool {
 }
 
 /// The element bytes and logical length of one `S`/`U` value.
+///
+/// A value that is neither `str` nor `bytes` is rendered with `str()`, which
+/// is what numpy does: probed on 2.5.2, `np.zeros(2, 'S3')[...] = 0` gives
+/// `b'0'`, `= 1.5` gives `b'1.5'`, `= True` gives `b'Tru'` (truncated) and
+/// `= None` gives `b'Non'`.
 fn text_bytes(obj: &Bound<'_, PyAny>, dt: DType) -> PyResult<(Vec<u8>, usize)> {
     match dt {
         DType::Bytes(_) => {
@@ -458,9 +463,7 @@ fn text_bytes(obj: &Bound<'_, PyAny>, dt: DType) -> PyResult<(Vec<u8>, usize)> {
                 // numpy encodes str into an S array as ASCII/latin-1 bytes.
                 s.to_str()?.as_bytes().to_vec()
             } else {
-                return Err(PyTypeError::new_err(
-                    "only str and bytes can fill a bytes ('S') array",
-                ));
+                obj.str()?.to_str()?.as_bytes().to_vec()
             };
             let n = b.len();
             Ok((b, n))
@@ -471,9 +474,7 @@ fn text_bytes(obj: &Bound<'_, PyAny>, dt: DType) -> PyResult<(Vec<u8>, usize)> {
             } else if let Ok(b) = obj.cast::<PyBytes>() {
                 String::from_utf8_lossy(b.as_bytes()).into_owned()
             } else {
-                return Err(PyTypeError::new_err(
-                    "only str and bytes can fill a str ('U') array",
-                ));
+                obj.str()?.to_str()?.to_string()
             };
             let mut out = Vec::with_capacity(s.chars().count() * 4);
             let mut n = 0usize;
@@ -712,20 +713,25 @@ pub fn array_from_any(
 }
 
 /// Build a structured array from nested sequences of record tuples.
+///
+/// numpy's discovery rule for a structured dtype, probed on 2.5.2: a **tuple
+/// is always one element** of the array (whatever its length -- a wrong length
+/// is a `ValueError`, not a new dimension), a **list is always a dimension**,
+/// and anything else is a single element too. So
+/// `np.array([(1, 2), (3, 4)], 'i4,f8')` has shape `(2,)`, while
+/// `np.array([[1, 2], [3, 4]], 'i4,f8')` has shape `(2, 2)` with each *scalar*
+/// filling both fields of its record.
 fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
-    let def = rnp_core::descr::registry::struct_def(id);
-    let nfields = def.fields.len();
-    // Descend list/tuple nesting until the first record tuple (a tuple whose
-    // length matches the field count) is reached.
+    // Descend *lists* (and other non-tuple sequences) only; a tuple stops the
+    // descent because it is an element.
     let mut shape: Vec<isize> = Vec::new();
     let mut cur = obj.clone();
-    loop {
-        let is_record = cur
-            .cast::<PyTuple>()
-            .map(|t| t.len() == nfields)
-            .unwrap_or(false);
-        if is_record || !is_sequence(&cur) {
-            break;
+    while is_sequence(&cur) && cur.cast::<PyTuple>().is_err() {
+        if shape.len() >= 64 {
+            return Err(PyValueError::new_err(format!(
+                "maximum supported dimension for an ndarray is 64, found {}",
+                shape.len() + 1
+            )));
         }
         let seq = cur.cast::<PySequence>()?;
         let n = seq.len()?;
@@ -740,49 +746,109 @@ fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
 
     let out = NdArray::zeros(shape, DType::Struct(id)).map_err(crate::err)?;
     let isz = out.itemsize() as isize;
+    let descr = out.descr;
     for (i, rec) in records.iter().enumerate() {
-        let base = i as isize * isz;
-        let items: Vec<Bound<'_, PyAny>> = if let Ok(t) = rec.cast::<PyTuple>() {
-            t.iter().collect()
-        } else if let Ok(l) = rec.cast::<PyList>() {
-            l.iter().collect()
-        } else {
-            return Err(PyTypeError::new_err(
-                "a structured array element must be a tuple of field values",
-            ));
-        };
-        if items.len() != nfields {
-            return Err(PyValueError::new_err(format!(
-                "could not assign tuple of length {} to structure with {} fields.",
-                items.len(),
-                nfields
-            )));
-        }
-        for (f, val) in def.fields.iter().zip(items.iter()) {
-            let off = base + f.offset as isize;
-            let fdt = f.descr.dt;
-            if matches!(fdt, DType::Bytes(_) | DType::Str(_)) {
-                let (bytes, _) = text_bytes(val, fdt)?;
-                let n = fdt.itemsize().min(bytes.len());
-                // SAFETY: `off` addresses this field inside a zeroed record.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        out.buffer.as_mut_ptr().offset(off),
-                        n,
-                    );
-                }
-            } else {
-                let sv = scalar_from_py(val).ok_or_else(|| {
-                    PyTypeError::new_err("unsupported field value in a structured array")
-                })?;
-                let mut field = out.clone();
-                field.descr = f.descr;
-                field.write_at(off, sv);
-            }
-        }
+        write_element(&out, i as isize * isz, descr, rec)?;
     }
     Ok(out)
+}
+
+/// Store one Python object into the element of `descr` at absolute byte
+/// offset `base` inside `out`'s buffer.
+///
+/// This is numpy's `VOID_setitem` (see
+/// `upstream/numpy/_core/src/multiarray/arraytypes.c.src`), probed on 2.5.2:
+///
+/// * a **tuple** whose length matches the field count is distributed across
+///   the fields, one component each, recursively;
+/// * a tuple of any *other* length is
+///   `ValueError: could not assign tuple of length N to structure with M
+///   fields.`;
+/// * **anything else** is assigned to *every* field, so
+///   `np.zeros(2, 'i4,f8,u1')[...] = 5` is `(5, 5.0, 5)` and a nested
+///   structured field gets 5 in each of *its* leaves in turn.
+///
+/// Errors surface from the first field that cannot take the value, which is
+/// how `np.zeros(2, 'i4,f8')[...] = b'ab'` ends up raising `int`'s own
+/// `invalid literal for int() with base 10: b'ab'`.
+fn write_element(
+    out: &NdArray,
+    base: isize,
+    descr: Descr,
+    val: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    // A field value may be a *foreign* array or scalar -- numpy's own
+    // `tolist()` renders a subarray field as a real `np.ndarray`, and feeding
+    // those tuples straight back is exactly what `np.array(rows, dtype=...)`
+    // supports. Render them as plain Python objects first; the target dtype is
+    // already pinned by the field, so nothing is inferred from them.
+    if let Some(plain) = as_plain_python(val)? {
+        return write_element(out, base, descr, &plain);
+    }
+    let Some(def) = descr.struct_def() else {
+        // A leaf (or a subarray field): hand the bytes to the ordinary
+        // assignment machinery through a view, so broadcasting, casting and
+        // every error message match `view[...] = val` exactly.
+        let elem = element_view(out, base, descr);
+        let py = val.py();
+        let holder = Py::new(py, PyNdArray::wrap(elem))?.into_bound(py);
+        return holder.set_item(py.Ellipsis(), val);
+    };
+    if let Ok(t) = val.cast::<PyTuple>() {
+        if t.len() != def.fields.len() {
+            return Err(PyValueError::new_err(format!(
+                "could not assign tuple of length {} to structure with {} fields.",
+                t.len(),
+                def.fields.len()
+            )));
+        }
+        for (f, v) in def.fields.iter().zip(t.iter()) {
+            write_element(out, base + f.offset as isize, f.descr, &v)?;
+        }
+        return Ok(());
+    }
+    for f in def.fields.iter() {
+        write_element(out, base + f.offset as isize, f.descr, val)?;
+    }
+    Ok(())
+}
+
+/// `Some(plain)` when `val` is an array-like from *another* library (a real
+/// `numpy.ndarray`, a numpy scalar) that has to be rendered as plain Python
+/// objects before it can be stored. `None` means "already plain".
+fn as_plain_python<'py>(val: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if val.cast::<PyNdArray>().is_ok()
+        || is_sequence(val)
+        || is_text(val)
+        || val.is_none()
+        || scalar_from_py(val).is_some()
+    {
+        return Ok(None);
+    }
+    if val.hasattr(pyo3::intern!(val.py(), "tolist"))? {
+        return Ok(Some(val.call_method0(pyo3::intern!(val.py(), "tolist"))?));
+    }
+    Ok(None)
+}
+
+/// A writeable view of the single element of `descr` at `base`: 0-d for a
+/// leaf, and the subarray's own shape for a subarray field.
+pub fn element_view(out: &NdArray, base: isize, descr: Descr) -> NdArray {
+    let zero = NdArray {
+        buffer: out.buffer.clone(),
+        byte_offset: base,
+        shape: Vec::new(),
+        strides: Vec::new(),
+        descr,
+        flags: rnp_core::array::Flags {
+            owndata: false,
+            writeable: true,
+            ..out.flags
+        },
+    };
+    // `field_view` splices a subarray field's shape onto the (empty) shape and
+    // replaces the descriptor with the subarray's base.
+    zero.field_view(descr, 0)
 }
 
 /// NEP 50 promotion for `array OP python-scalar`, taking the scalar's *value*
