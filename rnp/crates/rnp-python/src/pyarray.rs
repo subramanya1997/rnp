@@ -932,6 +932,11 @@ impl PyNdArray {
                 "astype from {} to {} is not implemented yet",
                 self.arr.dtype(), d.dt
             )));
+        } else if d.dt.is_datetime_like() || self.arr.dtype().is_datetime_like() {
+            // A datetime unit conversion can overflow int64, and numpy raises
+            // rather than substituting NaT, so this cast must not go through
+            // the infallible `astype_descr`.
+            self.arr.try_astype_descr(d).map_err(crate::err)?
         } else {
             self.arr.astype_descr(d)
         };

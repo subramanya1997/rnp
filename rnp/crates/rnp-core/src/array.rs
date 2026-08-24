@@ -842,7 +842,7 @@ impl NdArray {
                         Scalar::Int(i) => i,
                         s => s.as_f64() as i64,
                     };
-                    Scalar::Int(dtm::cast_value(src_dt, dtype, raw)?)
+                    Scalar::Int(dtm::cast_value_array(src_dt, dtype, raw)?)
                 }
                 // datetime-like -> numeric: the raw int64 goes through the
                 // ordinary numeric cast.
@@ -860,6 +860,15 @@ impl NdArray {
         }
         out.update_flags();
         Ok(out)
+    }
+
+    /// [`Self::astype_descr`], surfacing the `OverflowError` a datetime unit
+    /// conversion can raise instead of substituting NaT.
+    pub fn try_astype_descr(&self, d: Descr) -> Result<NdArray> {
+        let src = self.to_native();
+        let mut out = src.try_astype(d.dt)?;
+        out.descr = Descr::native(d.dt);
+        Ok(out.into_descr(d))
     }
 
     /// `astype` to a full descriptor: cast the values through the native

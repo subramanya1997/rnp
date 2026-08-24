@@ -100,7 +100,12 @@ def _missing(name):
     return fn
 
 
-from .._datetime import datetime_as_string, datetime_data, isnat  # noqa: E402
+from .._datetime import datetime_as_string, datetime_data  # noqa: E402
+from .._ufunc import ALL as _UFUNCS  # noqa: E402
+
+#: `np.isnat` is a real ufunc (`M->?`, `m->?`), so it must come from the
+#: ufunc table rather than being a plain function that shadows it.
+isnat = _UFUNCS["isnat"]
 
 
 def _boolean_select(a, mask):

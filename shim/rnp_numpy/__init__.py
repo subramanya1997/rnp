@@ -862,7 +862,7 @@ from ._core.records import record  # noqa: E402,F401
 from . import __config__, lib, ma, random  # noqa: E402,F401
 from ._datetime import (  # noqa: E402,F401
     busday_count, busday_offset, busdaycalendar, datetime_as_string,
-    datetime_data, is_busday, isnat,
+    datetime_data, is_busday,
 )
 # `arange` gains datetime64/timedelta64 ranges; the numeric path is unchanged
 # (the wrapper delegates straight to the engine when no operand is time-like).

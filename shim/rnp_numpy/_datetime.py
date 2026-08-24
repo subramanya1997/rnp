@@ -1,9 +1,10 @@
 """datetime64 / timedelta64 helpers that live above the engine.
 
-`datetime_data`, `isnat` and `datetime_as_string` are thin wrappers over the
-Rust entry points; the business-day family is a documented gap that raises
-`NotImplementedError` while still existing, so that code (and numpy's own test
-module) can import it.
+`datetime_data` and `datetime_as_string` are thin wrappers over the Rust
+entry points (`np.isnat` is a real ufunc, so it lives in the ufunc table);
+the business-day family is a documented gap that raises
+`NotImplementedError` while still existing, so that code (and numpy's own
+test module) can import it.
 """
 
 import _rnp
@@ -14,18 +15,6 @@ _dtype = _rnp.dtype
 _raw_arange = _rnp.arange
 
 datetime_data = _rnp.datetime_data
-
-
-def isnat(x, /, out=None, **kwargs):
-    """`np.isnat`: True exactly where a datetime64/timedelta64 is NaT."""
-    r = _rnp.isnat(x)
-    if out is not None:
-        out[...] = r
-        return out
-    if getattr(x, "ndim", None) == 0 or not hasattr(x, "ndim"):
-        if r.ndim == 0:
-            return r[()]
-    return r
 
 
 def datetime_as_string(arr, unit=None, timezone="naive", casting="same_kind"):
