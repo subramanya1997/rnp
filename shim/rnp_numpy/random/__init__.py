@@ -958,6 +958,20 @@ class RandomState:
 def default_rng(seed=None):
     if isinstance(seed, Generator):
         return seed
+    if isinstance(seed, RandomState):
+        bit_generator = seed._bit_generator
+        if isinstance(bit_generator, LegacyMT19937):
+            modern = MT19937()
+            modern.state = {
+                "bit_generator": "MT19937",
+                "state": {"key": array(bit_generator._key, dtype="uint32"),
+                          "pos": bit_generator._pos},
+            }
+            seed._bit_generator = modern
+            seed._legacy = LegacyDistributions(modern)
+            seed._modern = DistributionKernels(modern)
+            bit_generator = modern
+        return Generator(bit_generator)
     if isinstance(seed, BitGenerator):
         return Generator(seed)
     return Generator(PCG64(seed))

@@ -263,6 +263,61 @@ class MT19937(BitGenerator):
         b = self.next_uint32() >> 6
         return (a * 67108864.0 + b) / 9007199254740992.0
 
+    @staticmethod
+    def _jump_gen_next(key, pos):
+        if pos < 227:
+            other = pos + 397
+            next_pos = pos + 1
+            following = pos + 1
+        elif pos < 623:
+            other = pos - 227
+            next_pos = pos + 1
+            following = pos + 1
+        else:
+            other = 396
+            next_pos = 0
+            following = 0
+        y = (key[pos] & 0x80000000) | (key[following] & 0x7FFFFFFF)
+        key[pos] = (key[other] ^ (y >> 1) ^ ((-(y & 1)) & 0x9908B0DF)) & _MASK32
+        return next_pos
+
+    @staticmethod
+    def _jump_add(target_key, target_pos, source_key, source_pos):
+        for offset in range(624):
+            target = (target_pos + offset) % 624
+            source = (source_pos + offset) % 624
+            target_key[target] ^= source_key[source]
+
+    def _jump_once(self):
+        from ._mt_jump import POLY_COEF
+
+        source_key = list(self._key)
+        source_pos = 0 if self._pos >= 624 else self._pos
+        index = 19936
+        while not ((POLY_COEF[index >> 5] >> (index & 31)) & 1):
+            index -= 1
+        temp_key = list(source_key)
+        temp_pos = self._jump_gen_next(temp_key, source_pos)
+        index -= 1
+        while index > 0:
+            if (POLY_COEF[index >> 5] >> (index & 31)) & 1:
+                self._jump_add(temp_key, temp_pos, source_key, source_pos)
+            temp_pos = self._jump_gen_next(temp_key, temp_pos)
+            index -= 1
+        if POLY_COEF[0] & 1:
+            self._jump_add(temp_key, temp_pos, source_key, source_pos)
+        self._key = [value & _MASK32 for value in temp_key]
+        self._pos = temp_pos
+
+    def jumped(self, jumps=1):
+        jumps = operator.index(jumps)
+        other = type(self)()
+        other._seed_seq = copy.deepcopy(self._seed_seq)
+        other.state = self.state
+        for _ in range(jumps):
+            other._jump_once()
+        return other
+
     @property
     def state(self):
         return {
