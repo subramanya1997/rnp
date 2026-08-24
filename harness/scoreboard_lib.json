@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T14:12:58.285636+00:00",
-  "overall_passed": 3413,
+  "timestamp": "2026-08-24T17:15:41.220510+00:00",
+  "overall_passed": 3491,
   "overall_total": 4759,
   "files": [
     {
@@ -53,8 +53,8 @@
     },
     {
       "file": "lib/test_arrayterator.py",
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 1
@@ -69,16 +69,16 @@
     },
     {
       "file": "lib/test_function_base.py",
-      "passed": 1001,
-      "failed": 422,
+      "passed": 1049,
+      "failed": 374,
       "errors": 0,
       "skipped": 73,
       "total": 1496
     },
     {
       "file": "lib/test_histograms.py",
-      "passed": 59,
-      "failed": 9,
+      "passed": 61,
+      "failed": 7,
       "errors": 0,
       "skipped": 1,
       "total": 69
@@ -93,8 +93,8 @@
     },
     {
       "file": "lib/test_io.py",
-      "passed": 101,
-      "failed": 113,
+      "passed": 100,
+      "failed": 114,
       "errors": 0,
       "skipped": 1,
       "total": 215
@@ -133,8 +133,8 @@
     },
     {
       "file": "lib/test_polynomial.py",
-      "passed": 10,
-      "failed": 32,
+      "passed": 34,
+      "failed": 8,
       "errors": 0,
       "skipped": 0,
       "total": 42
@@ -149,8 +149,8 @@
     },
     {
       "file": "lib/test_regression.py",
-      "passed": 15,
-      "failed": 10,
+      "passed": 19,
+      "failed": 6,
       "errors": 0,
       "skipped": 0,
       "total": 25

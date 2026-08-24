@@ -132,6 +132,28 @@ fft 0/8 — GRAND TOTAL 40676/45686 (89.0%). (M5-final was 32180/41304, 77.9%.)
   SeedSequence, Generator distributions (probe numpy's exact algorithms).
 - remainder sweeps: lib 1346 fails, ma 272, polynomial 225, matrixlib 65.
 
+## M7 FINAL (2026-08-24 midday)
+
+linalg 485/485 (100%, Accelerate ILP64 LAPACK, byte-identical incl. stacked/
+f32/c64 paths); fft 159/159 (100%, pocketfft transcribed into Rust; byte probe
+1109/1120 — 11 last-ULP remainders are wheel-compiler FP-contraction artifacts,
+documented in harness/dev_check_fft.py); random 1188/1349 (88.1%, bit-exact
+SeedSequence + MT19937/PCG64/PCG64DXSM/Philox/SFC64 streams, ziggurat/Lemire/
+BTPE distributions, legacy RandomState). dev_check 36504/0 throughout.
+
+Full sweep: core 32697/35345 (92.5%), lib 3491/4759, ma 4080/4352, linalg
+485/485, fft 159/159, random 1188/1349, polynomial 422/610, matrixlib 149/209,
+top 107/207 — GRAND TOTAL 42778/47475 (90.1%). Every suite now collects.
+
+## M8: performance + remainder sweeps
+
+- BENCHMARKS (first-class goal, untouched so far): benchmarks/run.py paired
+  vs real numpy — elementwise/reduction/matmul/fft/sort across sizes; gate:
+  match-or-beat per row; rayon above a size threshold; LTO+codegen-units=1
+  already set (verify). Fix losing rows.
+- Remainder sweeps: lib 1268, random 161, polynomial 188, ma 272, top 100,
+  matrixlib 60, core 2648.
+
 ## Revised ladder after M5 (2026-08-23)
 
 The original M6 (sort/matmul) landed early — sort/argsort/searchsorted in M4,
