@@ -700,12 +700,36 @@ fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
     Ok(out)
 }
 
-/// NEP 50 promotion for `array OP python-scalar`: the Python scalar is
-/// "weak" and adopts the array's dtype unless its own kind is higher.
+/// NEP 50 promotion for `array OP python-scalar`, taking the scalar's *value*
+/// into account when its kind alone would not hold it.
+///
+/// The kind rule is [`weak_kind_promote`]. On top of it, an integer that does
+/// not fit the dtype that rule picks widens to one that does:
+/// `np.uint8(10) < -1` has to answer `False`, not `10 < 255`, and the only way
+/// to get there is to compare in a dtype that holds `-1`.
+///
+/// numpy raises an `OverflowError` instead for the *arithmetic* ops (see
+/// [`weak_dtype`], which is what the array path uses); the widening here is
+/// the answer for everything that cannot raise.
+pub fn weak_promote(arr: DType, s: Scalar) -> DType {
+    let d = weak_kind_promote(arr, s);
+    let v: i128 = match s {
+        Scalar::Int(i) => i as i128,
+        Scalar::Uint(u) => u as i128,
+        _ => return d,
+    };
+    match int_bounds(d) {
+        Some((lo, hi)) if v < lo || v > hi => promote(d, s.natural_dtype()),
+        _ => d,
+    }
+}
+
+/// The kind-only half of NEP 50 weak promotion: the Python scalar adopts the
+/// array's dtype unless its own kind is higher.
 ///
 /// Probed from numpy 2.5.2: `int8 + 1 -> int8`, `int8 + 1.0 -> float64`,
 /// `float32 + 1j -> complex64`, `bool + 1 -> int64`.
-pub fn weak_promote(arr: DType, s: Scalar) -> DType {
+pub fn weak_kind_promote(arr: DType, s: Scalar) -> DType {
     let arr_level = match arr {
         DType::Bool => 0,
         d if d.is_integer() => 1,
@@ -738,7 +762,7 @@ pub fn weak_promote(arr: DType, s: Scalar) -> DType {
 /// still answers correctly -- so a comparison widens the *weak* operand to its
 /// own natural dtype instead of raising.
 pub fn weak_dtype(arr: DType, s: Scalar, comparison: bool) -> PyResult<DType> {
-    let d = weak_promote(arr, s);
+    let d = weak_kind_promote(arr, s);
     let v: i128 = match s {
         Scalar::Int(i) => i as i128,
         Scalar::Uint(u) => u as i128,
