@@ -134,15 +134,22 @@ def _values_equal(a, b):
 def build_err_msg(arrays, err_msg, header="Items are not equal:",
                   verbose=True, names=("ACTUAL", "DESIRED"), precision=8):
     msg = ["\n" + header]
+    err_msg = str(err_msg)
     if err_msg:
-        msg = [msg[0] + " " + err_msg] if not verbose else msg + [err_msg]
+        if "\n" not in err_msg and len(err_msg) < 79 - len(header):
+            msg[0] += " " + err_msg
+        else:
+            msg.append(err_msg)
     if verbose:
         for i, a in enumerate(arrays):
             name = names[i] if i < len(names) else f"item {i}"
             try:
-                r = repr(a)
-            except Exception:
-                r = "[repr failed]"
+                r = (np.array_repr(a, precision=precision)
+                     if isinstance(a, np.ndarray) else repr(a))
+            except Exception as exc:
+                r = f"[repr failed for <{type(a).__name__}>: {exc}]"
+            if r.count("\n") > 3:
+                r = "\n".join(r.splitlines()[:3]) + "..."
             msg.append(f" {name}: {r}")
     return "\n".join(msg)
 
@@ -195,11 +202,42 @@ def assert_array_compare(comparison, x, y, err_msg="", verbose=True,
         raise AssertionError(build_err_msg(
             [x, y], err_msg, header=f"{header}\n(dtypes differ)",
             verbose=verbose))
-    bad = [i for i, (a, b) in enumerate(zip(xf, yf)) if not comparison(a, b)]
+    bad = [i for i, (a, b) in enumerate(zip(xf, yf))
+           if not comparison(a, b)]
     if bad:
+        n_elements = max(len(xf), len(yf))
+        percent = 100 * len(bad) / max(n_elements, 1)
+        remarks = [f"Mismatched elements: {len(bad)} / {n_elements} "
+                   f"({percent:.3g}%)"]
+        if xs != () and ys != ():
+            def unravel(index, shape):
+                pos = []
+                for size in reversed(shape):
+                    pos.append(index % size)
+                    index //= size
+                return list(reversed(pos))
+            positions = [unravel(i, xs) for i in bad[:5]]
+            label = ("Mismatch at index:" if len(bad) == 1 else
+                     "Mismatch at indices:" if len(bad) <= 5 else
+                     "First 5 mismatches are at indices:")
+            rows = [f" {p}: {xf[i]} (ACTUAL), {yf[i]} (DESIRED)"
+                    for p, i in zip(positions, bad[:5])]
+            remarks.append(label + "\n" + "\n".join(rows))
+        try:
+            errors = [abs(xf[i] - yf[i]) for i in bad]
+            max_abs = max(errors)
+            ratios = [errors[j] / abs(yf[i])
+                      for j, i in enumerate(bad) if yf[i] != 0]
+            max_rel = max(ratios) if ratios else float("inf")
+            remarks.append("Max absolute difference among violations: " +
+                           np.array2string(np.asarray(max_abs)))
+            remarks.append("Max relative difference among violations: " +
+                           np.array2string(np.asarray(max_rel)))
+        except (TypeError, ValueError, NotImplementedError):
+            pass
         raise AssertionError(build_err_msg(
-            [x, y], err_msg,
-            header=f"{header}\nMismatched elements: {len(bad)} / {len(xf)}",
+            [x, y], str(err_msg) + "\n" + "\n".join(remarks),
+            header=header,
             verbose=verbose))
 
 
@@ -358,8 +396,25 @@ class clear_and_catch_warnings(warnings.catch_warnings):
     class_modules = ()
 
     def __init__(self, record=False, modules=()):
-        self.modules = set(modules)
+        self.modules = set(modules).union(self.class_modules)
+        self._warnreg_copies = {}
         super().__init__(record=record)
+
+    def __enter__(self):
+        for mod in self.modules:
+            if hasattr(mod, "__warningregistry__"):
+                registry = mod.__warningregistry__
+                self._warnreg_copies[mod] = registry.copy()
+                registry.clear()
+        return super().__enter__()
+
+    def __exit__(self, *exc_info):
+        super().__exit__(*exc_info)
+        for mod in self.modules:
+            if hasattr(mod, "__warningregistry__"):
+                mod.__warningregistry__.clear()
+            if mod in self._warnreg_copies:
+                mod.__warningregistry__.update(self._warnreg_copies[mod])
 
 
 # --------------------------------------------------------------------------
