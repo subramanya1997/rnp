@@ -378,6 +378,15 @@ fn array_front(
         }
         return wrap(py, array_from_any_descr(obj, d, copy == Some(true))?);
     }
+    if copy != Some(false)
+        && d.is_some_and(|want| want.dt.is_object())
+        && convert::np_scalar(obj)?.is_some()
+    {
+        // An explicit object dtype boxes a numpy scalar itself, including a
+        // scalar subclass, instead of consuming its array protocol and
+        // storing the resulting plain numeric value.
+        return wrap(py, array_from_any_descr(obj, d, copy == Some(true))?);
+    }
     if let Some(res) = protocol_array(py, obj, d, copy)? {
         return Ok(res);
     }
