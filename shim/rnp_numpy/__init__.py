@@ -773,30 +773,6 @@ def load(file, mmap_mode=None, allow_pickle=False, fix_imports=True,
         return _pickle.load(fh)
 
 
-def frombuffer(buffer, dtype=float, count=-1, offset=0, *, like=None):
-    """`np.frombuffer` — reinterpret a bytes-like object's memory as an array.
-
-    The port copies rather than sharing the buffer's memory, so the result is
-    writeable and owns its data; numpy shares and marks the result read-only
-    for an immutable source.
-    """
-    data = _builtins.bytes(buffer)[offset:]
-    dt = _rnp.dtype(dtype)
-    isz = dt.itemsize
-    if isz == 0:
-        raise ValueError("cannot create an array from a zero-sized dtype")
-    if count < 0:
-        if len(data) % isz != 0:
-            raise ValueError(
-                "buffer size must be a multiple of element size")
-        count = len(data) // isz
-    elif count * isz > len(data):
-        raise ValueError("buffer is smaller than requested size")
-    out = empty((count,), dt)
-    out.__setstate__((1, (count,), dt, False, data[:count * isz]))
-    return out
-
-
 class _CClass:
     """`np.c_` — column-wise concatenation of the indexed operands."""
 

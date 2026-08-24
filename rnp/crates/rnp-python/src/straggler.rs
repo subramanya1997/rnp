@@ -1319,59 +1319,8 @@ fn divide_by(total: &NdArray, count: &NdArray, dt: DType) -> NdArray {
 // getfield / setfield
 // ---------------------------------------------------------------------------
 
-/// `a.getfield(dtype, offset=0)` — reinterpret the bytes at `offset` within
-/// each element under another dtype.
-pub fn getfield_impl(
-    slf: &Bound<'_, PyNdArray>,
-    dtype: &Bound<'_, PyAny>,
-    offset: isize,
-) -> PyResult<Py<PyNdArray>> {
-    let arr = slf.borrow().arr.clone();
-    let d = descr_from_any(dtype)?;
-    if d.itemsize() > arr.itemsize() {
-        return Err(PyValueError::new_err(
-            "new type is larger than original type",
-        ));
-    }
-    if offset < 0 {
-        return Err(PyValueError::new_err("offset is negative"));
-    }
-    if offset + d.itemsize() as isize > arr.itemsize() as isize {
-        return Err(PyValueError::new_err(
-            "new type plus offset is larger than original type",
-        ));
-    }
-    let mut out = arr.clone();
-    out.descr = d;
-    out.byte_offset += offset;
-    out.flags.owndata = false;
-    out.update_flags();
-    PyNdArray::view_of(out, slf)
-}
-
-/// `a.setfield(value, dtype, offset=0)` — the in-place inverse of `getfield`.
-pub fn setfield_impl(
-    slf: &Bound<'_, PyNdArray>,
-    value: &Bound<'_, PyAny>,
-    dtype: &Bound<'_, PyAny>,
-    offset: isize,
-) -> PyResult<()> {
-    let field = getfield_impl(slf, dtype, offset)?;
-    let py = slf.py();
-    let target = field.borrow(py).arr.clone();
-    let src = array_from_any(value, Some(target.dtype()), false)?;
-    let bc = rnp_core::iter::broadcast_to(&src, &target.shape).map_err(crate::err)?;
-    for (s, d) in rnp_core::iter::offsets(&bc.shape, &bc.strides, bc.byte_offset).zip(
-        rnp_core::iter::offsets(&target.shape, &target.strides, target.byte_offset),
-    ) {
-        if target.dtype().is_flexible() {
-            target.write_raw_at(d, bc.raw_bytes_at(s));
-        } else {
-            target.write_at(d, bc.read_at(s));
-        }
-    }
-    Ok(())
-}
+// `getfield`/`setfield` live in `fields.rs`; the structured-dtype lane
+// owns them.
 
 /// `np.c_[...]` — column-wise concatenation with `r_`'s 2-D upgrade rule:
 /// every operand is turned into at least a 2-D array by appending an axis,

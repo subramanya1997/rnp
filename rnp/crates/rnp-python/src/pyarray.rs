@@ -1309,25 +1309,6 @@ impl PyNdArray {
         crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, true)
     }
 
-    #[pyo3(signature = (dtype, offset = 0))]
-    fn getfield(
-        slf: &Bound<'_, Self>,
-        dtype: &Bound<'_, PyAny>,
-        offset: isize,
-    ) -> PyResult<Py<PyNdArray>> {
-        crate::straggler::getfield_impl(slf, dtype, offset)
-    }
-
-    #[pyo3(signature = (val, dtype, offset = 0))]
-    fn setfield(
-        slf: &Bound<'_, Self>,
-        val: &Bound<'_, PyAny>,
-        dtype: &Bound<'_, PyAny>,
-        offset: isize,
-    ) -> PyResult<()> {
-        crate::straggler::setfield_impl(slf, val, dtype, offset)
-    }
-
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
         crate::straggler::reduce_impl(slf)
     }
