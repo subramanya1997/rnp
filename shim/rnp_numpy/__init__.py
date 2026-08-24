@@ -8,6 +8,7 @@ Python, except for a few thin conveniences at the bottom of this file.
 
 import builtins as _builtins
 import enum as _enum
+import operator as _operator
 
 from _rnp import (
     add,
@@ -739,8 +740,10 @@ _rnp_mean = mean
 
 
 def mean(a, axis=None, dtype=None, out=None, keepdims=False, *, where=None):
+    if isinstance(a, _builtins.type):
+        raise TypeError("unsupported operand type(s) for /: 'type' and 'int'")
     if where is None:
-        return _rnp_mean(a, axis, dtype, out, keepdims)
+        return _rnp_mean(_asarr(a), axis, dtype, out, keepdims)
     return _asarr(a).mean(axis, dtype, out, keepdims, where=where)
 
 
@@ -874,14 +877,98 @@ def ix_(*args):
     return tuple(out)
 
 
-def indices(dimensions, dtype=int_):
+def indices(dimensions, dtype=int_, sparse=False):
     dimensions = tuple(dimensions)
     n = len(dimensions)
-    out = empty((n,) + dimensions, dtype)
+    shape = (1,) * n
+    out = () if sparse else empty((n,) + dimensions, dtype)
     for i, d in enumerate(dimensions):
-        shape = (1,) * i + (d,) + (1,) * (n - i - 1)
-        out[i] = arange(d, dtype=dtype).reshape(shape)
+        idx = arange(d, dtype=dtype).reshape(
+            shape[:i] + (d,) + shape[i + 1:])
+        if sparse:
+            out += (idx,)
+        else:
+            out[i] = idx
     return out
+
+
+def binary_repr(num, width=None):
+    def err_if_insufficient(width, binwidth):
+        if width is not None and width < binwidth:
+            raise ValueError(
+                f"Insufficient bit width={width} provided for "
+                f"binwidth={binwidth}")
+
+    num = _operator.index(num)
+    if num == 0:
+        return "0" * (width or 1)
+    if num > 0:
+        binary = f"{num:b}"
+        binwidth = len(binary)
+        err_if_insufficient(width, binwidth)
+        return binary.zfill(
+            binwidth if width is None else _builtins.max(binwidth, width))
+    if width is None:
+        return f"-{-num:b}"
+    poswidth = len(f"{-num:b}")
+    if 2 ** (poswidth - 1) == -num:
+        poswidth -= 1
+    binary = f"{2 ** (poswidth + 1) + num:b}"
+    binwidth = len(binary)
+    err_if_insufficient(width, binwidth)
+    outwidth = _builtins.max(binwidth, width)
+    return "1" * (outwidth - binwidth) + binary
+
+
+def base_repr(number, base=2, padding=0):
+    digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if base > len(digits):
+        raise ValueError("Bases greater than 36 not handled in base_repr.")
+    if base < 2:
+        raise ValueError("Bases less than 2 not handled in base_repr.")
+    num = abs(int(number))
+    result = []
+    while num:
+        result.append(digits[num % base])
+        num //= base
+    if padding:
+        result.append("0" * padding)
+    if number < 0:
+        result.append("-")
+    return "".join(reversed(result or "0"))
+
+
+def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
+    if axis is not None:
+        axisa = axisb = axisc = axis
+    a, b = _asarr(a), _asarr(b)
+    if a.ndim < 1 or b.ndim < 1:
+        raise ValueError("At least one array has zero dimension")
+    axisa = _normalize_axis_tuple(axisa, a.ndim, "axisa")[0]
+    axisb = _normalize_axis_tuple(axisb, b.ndim, "axisb")[0]
+    a, b = moveaxis(a, axisa, -1), moveaxis(b, axisb, -1)
+    if a.shape[-1] != 3 or b.shape[-1] != 3:
+        raise ValueError(
+            "Both input arrays must be (arrays of) 3-dimensional vectors, "
+            f"but they are {a.shape[-1]} and {b.shape[-1]} dimensional instead.")
+    lead = broadcast_shapes(a.shape[:-1], b.shape[:-1])
+    dt = promote_types(a.dtype, b.dtype)
+    a = broadcast_to(a.astype(dt), lead + (3,))
+    b = broadcast_to(b.astype(dt), lead + (3,))
+    result = stack((
+        a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1],
+        a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2],
+        a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0],
+    ), axis=-1)
+    axisc = _normalize_axis_tuple(axisc, result.ndim, "axisc")[0]
+    return moveaxis(result, -1, axisc)
+
+
+def matrix_transpose(x, /):
+    x = _asarr(x)
+    if x.ndim < 2:
+        raise ValueError("Input array must be at least 2-dimensional")
+    return x.swapaxes(-1, -2)
 
 
 
@@ -1256,7 +1343,7 @@ try:
 except Exception as _exc:  # pragma: no cover - diagnostic path
     _subsystem_import_errors["emath"] = _exc
 
-for _name in ("char", "strings", "polynomial"):
+for _name in ("char", "strings", "polynomial", "fft", "linalg"):
     try:
         globals()[_name] = _importlib.import_module(f".{_name}", __name__)
     except Exception as _exc:  # pragma: no cover - diagnostic path
@@ -1265,7 +1352,81 @@ del _name
 
 
 # Classes upstream test modules *instantiate* at import time.
-for _name in ("matrix", "poly1d", "vectorize", "broadcast"):
+from .matrixlib.defmatrix import asmatrix, bmat, matrix  # noqa: E402
+
+
+class _BroadcastIter:
+    def __init__(self, base):
+        self.base = base
+
+
+class broadcast:
+    """Iterator yielding tuples from arrays broadcast to one shape."""
+
+    def __init__(self, *arrays, **kwargs):
+        if kwargs:
+            raise ValueError("broadcast() takes no keyword arguments")
+        if len(arrays) > 64:
+            raise ValueError("Need at least 0 and at most 64 array objects.")
+        flattened = []
+        for value in arrays:
+            if isinstance(value, broadcast):
+                flattened.extend(value._arrays)
+            else:
+                flattened.append(_asarr(value))
+        if len(flattened) > 64:
+            raise ValueError("Need at least 0 and at most 64 array objects.")
+        shapes = [a.shape for a in flattened]
+        try:
+            self.shape = broadcast_shapes(*shapes) if shapes else ()
+        except ValueError:
+            for j in _builtins.range(1, len(shapes)):
+                for i in _builtins.range(j):
+                    try:
+                        broadcast_shapes(shapes[i], shapes[j])
+                    except ValueError:
+                        raise ValueError(
+                            "shape mismatch: objects cannot be broadcast to a "
+                            "single shape.  Mismatch is between arg "
+                            f"{i} with shape {shapes[i]} and arg {j} with "
+                            f"shape {shapes[j]}.") from None
+            raise
+        self._arrays = flattened
+        self._views = [broadcast_to(a, self.shape) for a in flattened]
+        self.iters = tuple(_BroadcastIter(a) for a in flattened)
+        self.nd = self.ndim = len(self.shape)
+        self.numiter = len(flattened)
+        self.size = 1
+        for dimension in self.shape:
+            self.size *= dimension
+        self.index = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.index >= self.size:
+            raise StopIteration
+        if not self.shape:
+            index = ()
+        else:
+            rem, out = self.index, [0] * self.ndim
+            for axis in _builtins.range(self.ndim - 1, -1, -1):
+                out[axis] = rem % self.shape[axis]
+                rem //= self.shape[axis]
+            index = tuple(out)
+        self.index += 1
+        return tuple(a[index] for a in self._views)
+
+    def reset(self, /):
+        self.index = 0
+
+
+import inspect as _inspect  # noqa: E402
+broadcast.__signature__ = _inspect.Signature([
+    _inspect.Parameter("arrays", _inspect.Parameter.VAR_POSITIONAL)])
+
+for _name in ("poly1d", "vectorize", "broadcast"):
     globals().setdefault(_name, _inert_class(_name))
 del _name
 
@@ -1348,6 +1509,114 @@ def promote_types(type1, type2):
 def can_cast(from_, to, casting="safe"):
     """Delegate descriptor-aware cast safety to the Rust dtype engine."""
     return _can_cast_scalar(from_, to, casting)
+
+
+# --------------------------------------------------------------------------
+# NEP 18 public dispatch wrappers.
+# --------------------------------------------------------------------------
+
+from .lib import _rnp_compat as overrides  # noqa: E402
+
+
+def _dispatch_first(*args, **kwargs):
+    relevant = list(args[:1])
+    for name in ("out", "where"):
+        value = kwargs.get(name)
+        if value is not None:
+            relevant.append(value)
+    return tuple(relevant)
+
+
+def _dispatch_all(*args, **kwargs):
+    return args
+
+
+def _dispatch_concatenate(arrays, axis=None, out=None, dtype=None,
+                          casting=None):
+    relevant = list(arrays)
+    if out is not None:
+        relevant.append(out)
+    return tuple(relevant)
+
+
+def _install_array_function_dispatch():
+    # Functions exercised directly by test_overrides plus common core entry
+    # points.  Pure-Python lib functions already carry the same decorator.
+    dispatchers = {
+        "sum": _dispatch_first, "prod": _dispatch_first,
+        "mean": _dispatch_first, "std": _dispatch_first,
+        "var": _dispatch_first, "reshape": _dispatch_first,
+        "transpose": _dispatch_first, "concatenate": _dispatch_concatenate,
+    }
+    for name, dispatcher in dispatchers.items():
+        implementation = globals().get(name)
+        if implementation is None or hasattr(implementation, "_implementation"):
+            continue
+        globals()[name] = overrides.array_function_dispatch(
+            dispatcher, module="numpy", verify=False)(implementation)
+
+    # NEP 35 creation routines dispatch only on `like`.  Signature validation
+    # happens before calling the override so unknown keywords keep NumPy's
+    # normal TypeError precedence.
+    import functools as _functools
+    import inspect as _inspect
+
+    like_names = (
+        "array", "asarray", "asanyarray", "ascontiguousarray",
+        "asfortranarray", "require", "empty", "full", "ones", "zeros",
+        "arange", "frombuffer", "fromfile", "fromiter", "fromstring",
+        "loadtxt", "genfromtxt", "eye", "fromfunction", "identity", "tri",
+    )
+    for name in like_names:
+        implementation = globals().get(name)
+        if implementation is None:
+            continue
+
+        def make_like_wrapper(implementation, name):
+            @_functools.wraps(implementation)
+            def public_api(*args, **kwargs):
+                like = kwargs.pop("like", None)
+                try:
+                    _inspect.signature(implementation).bind(*args, **kwargs)
+                except TypeError:
+                    return implementation(*args, **kwargs)
+                except ValueError:
+                    if not callable(implementation):
+                        raise
+                    # Builtin/stub signatures may not be introspectable; their
+                    # own call remains the authority in that case.
+                    try:
+                        _inspect.signature(implementation)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        raise
+                if like is None:
+                    return implementation(*args, **kwargs)
+                method = getattr(type(like), "__array_function__", None)
+                if method is None:
+                    raise TypeError(
+                        "The `like` argument must be an array-like that "
+                        "implements the `__array_function__` protocol.")
+                if type(like) is ndarray:
+                    return implementation(*args, **kwargs)
+                types_ = (type(like),)
+                result = method(like, public_api, types_, args, kwargs)
+                if result is NotImplemented:
+                    raise TypeError(
+                        f"no implementation found for 'numpy.{name}' on types "
+                        "that implement __array_function__")
+                return result
+
+            public_api._implementation = implementation
+            public_api.__module__ = "numpy"
+            overrides.ARRAY_FUNCTIONS.add(public_api)
+            return public_api
+
+        globals()[name] = make_like_wrapper(implementation, name)
+
+
+_install_array_function_dispatch()
 
 
 __all__ = [n for n in dir() if not n.startswith("_")]

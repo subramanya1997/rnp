@@ -7,13 +7,14 @@ that lives in a C extension module (`numpy._core._multiarray_umath`) or in
 numpy's `__array_function__` dispatch machinery (`numpy._core.overrides`) is
 provided here instead.
 
-Nothing in this module is a numpy *behaviour* re-implementation: the dispatch
-decorators are no-ops (the port has no `__array_function__` protocol, so a
-plain function is the correct degenerate form), and the axis normalisers are
-upstream's own algorithm.
+The NEP 18 dispatch layer is implemented in Python; numeric work continues to
+be delegated to the Rust engine.
 """
+import collections
 import functools
+import inspect
 import operator
+import types
 
 import rnp_numpy as np
 
@@ -23,9 +24,14 @@ __all__ = [
     "add_docstring", "tracemalloc_domain", "ARRAY_FUNCTION_ENABLED",
 ]
 
-#: numpy exposes this so tests can tell whether dispatch is compiled in.  The
-#: port has no dispatch machinery at all, which is what `False` means here.
-ARRAY_FUNCTION_ENABLED = False
+#: The shim implements NEP 18 dispatch in Python.
+ARRAY_FUNCTION_ENABLED = True
+ARRAY_FUNCTIONS = set()
+
+array_function_like_doc = """like : array_like, optional
+    Reference object to allow the creation of arrays which are not NumPy
+    arrays. If an array-like passed in as ``like`` supports the
+    ``__array_function__`` protocol, the result will be defined by it."""
 
 tracemalloc_domain = 389047
 
@@ -63,24 +69,152 @@ def asbytes(s):
 # ---------------------------------------------------------------------------
 # numpy._core.overrides
 #
-# The port implements no `__array_function__` protocol, so dispatch collapses
-# to "call the implementation".  `array_function_dispatch` keeps upstream's
-# signature (it is used both bare and with a dispatcher argument) and keeps
-# the `_implementation` attribute the tests introspect.
+# Pure-Python equivalent of NumPy's `_ArrayFunctionDispatcher`.
 # ---------------------------------------------------------------------------
+
+def _get_implementing_args(relevant_args):
+    """Collect one argument per overriding type, subclasses first."""
+    implementing_args = []
+    implementing_types = []
+    for argument in relevant_args:
+        argument_type = type(argument)
+        if getattr(argument_type, "__array_function__", None) is None:
+            continue
+        if argument_type in implementing_types:
+            continue
+        if len(implementing_types) >= 64:
+            raise TypeError(
+                "maximum number (64) of distinct argument types implementing "
+                "__array_function__ exceeded")
+        insert_at = len(implementing_types)
+        for i, old_type in enumerate(implementing_types):
+            if issubclass(argument_type, old_type):
+                insert_at = i
+                break
+        implementing_types.insert(insert_at, argument_type)
+        implementing_args.insert(insert_at, argument)
+    return implementing_args
+
+
+def _restore_dispatcher(module_name, name):
+    import importlib
+    return getattr(importlib.import_module(module_name), name)
+
+
+class _ArrayFunctionDispatcher:
+    """Callable descriptor wrapping an implementation and its dispatcher."""
+
+    def __init__(self, dispatcher, implementation):
+        self._dispatcher = dispatcher
+        self._implementation = implementation
+        functools.update_wrapper(self, implementation)
+
+    def __call__(self, *args, **kwargs):
+        try:
+            inspect.signature(self._implementation).bind(*args, **kwargs)
+        except TypeError:
+            # Calling the implementation reproduces CPython's function-name
+            # prefix exactly; Signature.bind omits it.
+            return self._implementation(*args, **kwargs)
+        except (ValueError, AttributeError):
+            pass
+        relevant_args = self._dispatcher(*args, **kwargs)
+        implementing_args = _get_implementing_args(relevant_args)
+        if not implementing_args:
+            return self._implementation(*args, **kwargs)
+
+        # Base rnp ndarrays use the default implementation.  This preserves
+        # the normal-call fast path while duck arrays take protocol dispatch.
+        if all(type(arg) is np.ndarray for arg in implementing_args):
+            return self._implementation(*args, **kwargs)
+
+        types_ = tuple(type(arg) for arg in implementing_args)
+        for argument in implementing_args:
+            method = type(argument).__array_function__
+            result = method(argument, self, types_, args, kwargs)
+            if result is not NotImplemented:
+                return result
+        type_list = ", ".join(t.__name__ for t in types_)
+        raise TypeError(
+            f"no implementation found for '{self.__module__}.{self.__name__}' "
+            "on types that implement __array_function__: "
+            f"[{type_list}]")
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return self
+        return types.MethodType(self, obj)
+
+    def __repr__(self):
+        return repr(self._implementation)
+
+    def __str__(self):
+        return str(self._implementation)
+
+    def __reduce__(self):
+        return _restore_dispatcher, (self.__module__, self.__name__)
+
+
+ArgSpec = collections.namedtuple("ArgSpec", "args varargs keywords defaults")
+
+
+def _argspec(func):
+    spec = inspect.getfullargspec(func)
+    return ArgSpec(spec.args, spec.varargs, spec.varkw, spec.defaults)
+
+
+def verify_matching_signatures(implementation, dispatcher):
+    implementation_spec = _argspec(implementation)
+    dispatcher_spec = _argspec(dispatcher)
+    if (implementation_spec.args != dispatcher_spec.args or
+            implementation_spec.varargs != dispatcher_spec.varargs or
+            implementation_spec.keywords != dispatcher_spec.keywords or
+            bool(implementation_spec.defaults) != bool(dispatcher_spec.defaults) or
+            (implementation_spec.defaults is not None and
+             len(implementation_spec.defaults) != len(dispatcher_spec.defaults))):
+        raise RuntimeError(
+            f"implementation and dispatcher for {implementation} have "
+            "different function signatures")
+    if (implementation_spec.defaults is not None and
+            dispatcher_spec.defaults != (None,) * len(dispatcher_spec.defaults)):
+        raise RuntimeError(
+            "dispatcher functions can only use None for default argument values")
 
 def array_function_dispatch(dispatcher=None, module=None, verify=True,
                             docs_from_dispatcher=False):
     def decorator(implementation):
+        if dispatcher is None:
+            if verify:
+                co = implementation.__code__
+                last_arg = co.co_argcount + co.co_kwonlyargcount - 1
+                if (co.co_kwonlyargcount == 0 or
+                        co.co_varnames[last_arg] != "like"):
+                    raise RuntimeError(
+                        "__array_function__ expects `like=` to be the last "
+                        "argument and a keyword-only argument. "
+                        f"{implementation} does not seem to comply.")
+            # NumPy's no-dispatcher form is an internal `like=` building
+            # block.  It expects the reference object as an extra positional
+            # argument and deliberately errors when called as a public API.
+            def like_dispatch(like, /, *args, **kwargs):
+                return (like,)
+            public_api = _ArrayFunctionDispatcher(like_dispatch, implementation)
+        else:
+            if verify:
+                verify_matching_signatures(implementation, dispatcher)
+            if docs_from_dispatcher and dispatcher.__doc__ is not None:
+                implementation.__doc__ = inspect.cleandoc(dispatcher.__doc__)
+            public_api = _ArrayFunctionDispatcher(dispatcher, implementation)
         if module is not None:
-            implementation.__module__ = module
-        implementation._implementation = implementation
-        implementation.__wrapped__ = implementation
-        return implementation
+            public_api.__module__ = module
+        ARRAY_FUNCTIONS.add(public_api)
+        return public_api
     return decorator
 
 
 def finalize_array_function_like(public_api):
+    ARRAY_FUNCTIONS.add(public_api)
+    public_api.__doc__ = get_array_function_like_doc(public_api)
     return public_api
 
 
@@ -98,11 +232,12 @@ def array_function_from_dispatcher(implementation, module=None,
 
 
 def get_array_function_like_doc(*a, **k):
-    return ""
-
-
-def verify_matching_signatures(*a, **k):
-    return None
+    public_api = a[0] if a else None
+    if public_api is not None:
+        ARRAY_FUNCTIONS.add(public_api)
+        doc = public_api.__doc__ or (a[1] if len(a) > 1 else "")
+        return doc.replace("${ARRAY_FUNCTION_LIKE}", array_function_like_doc)
+    return array_function_like_doc
 
 
 # ---------------------------------------------------------------------------

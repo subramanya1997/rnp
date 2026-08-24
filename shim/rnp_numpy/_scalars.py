@@ -369,6 +369,11 @@ class number(generic):
 class integer(number):
     __slots__ = ()
 
+    def __round__(self, ndigits=None):
+        if ndigits is None:
+            return _builtins.round(_builtins.int(self._v))
+        return type(self)(_builtins.round(_builtins.int(self._v), ndigits))
+
     def is_integer(self, /):
         return True
 
@@ -387,6 +392,11 @@ class inexact(number):
 
 class floating(inexact):
     __slots__ = ()
+
+    def __round__(self, ndigits=None):
+        if ndigits is None:
+            return _builtins.round(_builtins.float(self._v))
+        return type(self)(_builtins.round(_builtins.float(self._v), ndigits))
 
     def is_integer(self, /):
         return _builtins.float(self._v).is_integer()

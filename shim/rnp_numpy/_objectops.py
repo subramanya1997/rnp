@@ -170,6 +170,8 @@ def _wrap_free(fn, method):
     """`np.<method>(a, ...)` routed through the (already wrapped) method."""
     def free(a, axis=None, dtype=None, out=None, keepdims=False,
              initial=None, where=True, **kw):
+        if isinstance(a, _rnp.ndarray) and type(a) is not _rnp.ndarray:
+            return getattr(a, method)(axis, out)
         arr = _pkg().asarray(a)
         if arr.dtype.kind != "O":
             return fn(a, axis=axis, dtype=dtype, out=out, keepdims=keepdims,

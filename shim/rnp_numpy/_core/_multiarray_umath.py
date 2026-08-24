@@ -15,6 +15,7 @@ from .._stubs import not_implemented, ufunc
 # names in both are the ufuncs themselves.
 from . import multiarray as _multiarray
 from . import umath as _umath
+from ..lib._rnp_compat import _ArrayFunctionDispatcher, _get_implementing_args
 
 for _mod in (_multiarray, _umath):
     for _name in dir(_mod):

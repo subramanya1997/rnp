@@ -1,0 +1,31 @@
+{
+  "timestamp": "2026-08-24T08:21:32.131879+00:00",
+  "overall_passed": 0,
+  "overall_total": 0,
+  "files": [
+    {
+      "file": "linalg/test_deprecations.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "linalg/test_linalg.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "linalg/test_regression.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    }
+  ]
+}

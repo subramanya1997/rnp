@@ -562,7 +562,8 @@ def _tofile(self, fid, sep="", format="%s"):
         close = True
     try:
         if sep == "":
-            raise ValueError("tofile: binary mode is not supported by rnp yet")
+            fh.write(self.tobytes(order="C"))
+            return
         items = _np.asarray(self).reshape(-1).tolist()
         text = sep.join(format % v for v in items)
         try:
@@ -818,9 +819,7 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
     missing.add("")
 
     dt = None if dtype is None else _np.dtype(dtype)
-    if dt is not None and dt.names is not None:
-        raise NotImplementedError(
-            "genfromtxt: structured dtypes are not supported by rnp yet")
+    structured = dt is not None and dt.names is not None
     if dt is None and names is not None:
         raise NotImplementedError(
             "genfromtxt: `names=` requires structured array support, which "
@@ -860,6 +859,11 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
         else:
             colconv = {int(k): v for k, v in converters.items()}
 
+    field_converters = None
+    if structured:
+        field_converters = [
+            _dtype_converter(dt.fields[name][0]) for name in dt.names]
+
     data = []
     for r in rows:
         out = []
@@ -873,13 +877,15 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
                 field = colconv[j](field)
             if isinstance(field, str):
                 try:
-                    field = conv(field.strip())
+                    converter = (field_converters[j] if field_converters
+                                 is not None else conv)
+                    field = converter(field.strip())
                 except ValueError:
                     if not loose:
                         raise
                     field = fill
             out.append(field)
-        data.append(out)
+        data.append(tuple(out) if structured else out)
 
     if not data:
         import warnings

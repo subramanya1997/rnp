@@ -1,0 +1,103 @@
+{
+  "timestamp": "2026-08-24T08:21:42.823177+00:00",
+  "overall_passed": 3,
+  "overall_total": 6,
+  "files": [
+    {
+      "file": "numpy/test__all__.py",
+      "passed": 1,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 1
+    },
+    {
+      "file": "numpy/test_configtool.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "numpy/test_ctypeslib.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "numpy/test_lazyloading.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "numpy/test_matlib.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "numpy/test_numpy_config.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 4,
+      "total": 4
+    },
+    {
+      "file": "numpy/test_numpy_version.py",
+      "passed": 1,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 0,
+      "total": 3
+    },
+    {
+      "file": "numpy/test_public_api.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "numpy/test_reloading.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "numpy/test_scripts.py",
+      "passed": 0,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 3,
+      "total": 4
+    },
+    {
+      "file": "numpy/test_warnings.py",
+      "passed": 1,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 1
+    },
+    {
+      "file": "testing/test_utils.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    }
+  ]
+}

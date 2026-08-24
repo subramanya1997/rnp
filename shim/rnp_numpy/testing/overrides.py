@@ -1,4 +1,4 @@
-"""Placeholder for numpy.testing.overrides (array-function protocol tests)."""
+"""Introspection helpers for NumPy override protocols."""
 
 
 def get_overridable_numpy_ufuncs():
@@ -10,8 +10,10 @@ def allows_array_ufunc_override(func):
 
 
 def get_overridable_numpy_array_functions():
-    return set()
+    from .._core.overrides import ARRAY_FUNCTIONS
+    return set(ARRAY_FUNCTIONS)
 
 
 def allows_array_function_override(func):
-    return False
+    from .._core.overrides import ARRAY_FUNCTIONS
+    return func in ARRAY_FUNCTIONS

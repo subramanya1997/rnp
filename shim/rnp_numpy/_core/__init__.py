@@ -25,7 +25,7 @@ from .. import (  # noqa: F401
     zeros,
 )
 from . import multiarray, numerictypes, shape_base, umath  # noqa: F401
-from . import _internal, _umath_tests  # noqa: F401
+from . import _internal, _multiarray_tests, _multiarray_umath, _umath_tests  # noqa: F401
 from .numerictypes import sctypes  # noqa: F401
 from .shape_base import (  # noqa: F401
     atleast_1d,

@@ -26,7 +26,7 @@ __all__ = [
     "assert_warns", "break_cycles", "build_err_msg", "clear_and_catch_warnings",
     "check_support_sve", "decorate_methods", "jiffies", "measure", "memusage",
     "print_assert_equal", "rundocs", "runstring", "suppress_warnings",
-    "tempdir", "temppath", "verbose",
+    "run_subprocess", "tempdir", "temppath", "verbose",
 ]
 
 verbose = 0
@@ -46,6 +46,30 @@ NOGIL_BUILD = False
 
 def check_support_sve(__cache=[]):
     return False
+
+
+def run_subprocess(cmd, cwd=None, **kwargs):
+    """Run *cmd*, failing the test with captured output on nonzero exit.
+
+    This is NumPy 2.5.2's implementation.  Capturing both streams is
+    important under pytest workers, where inherited child output would
+    otherwise disappear from the failure report.
+    """
+    import subprocess
+
+    import pytest
+
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                         errors="replace", **kwargs)
+    if res.returncode != 0:
+        cmd_str = cmd if isinstance(cmd, str) else " ".join(map(str, cmd))
+        in_dir = f" in {cwd}" if cwd is not None else ""
+        pytest.fail(
+            f"`{cmd_str}` failed (exit {res.returncode}){in_dir}\n"
+            f"----- stdout -----\n{res.stdout}\n"
+            f"----- stderr -----\n{res.stderr}",
+            pytrace=False)
+    return res
 
 
 # --------------------------------------------------------------------------

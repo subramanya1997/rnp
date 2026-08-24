@@ -1,0 +1,64 @@
+{
+  "timestamp": "2026-08-24T08:21:41.881370+00:00",
+  "overall_passed": 2,
+  "overall_total": 89,
+  "files": [
+    {
+      "file": "matrixlib/test_defmatrix.py",
+      "passed": 1,
+      "failed": 43,
+      "errors": 0,
+      "skipped": 0,
+      "total": 44
+    },
+    {
+      "file": "matrixlib/test_interaction.py",
+      "passed": 0,
+      "failed": 23,
+      "errors": 0,
+      "skipped": 0,
+      "total": 23
+    },
+    {
+      "file": "matrixlib/test_masked_matrix.py",
+      "passed": 1,
+      "failed": 13,
+      "errors": 0,
+      "skipped": 0,
+      "total": 14
+    },
+    {
+      "file": "matrixlib/test_matrix_linalg.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "matrixlib/test_multiarray.py",
+      "passed": 0,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 0,
+      "total": 2,
+      "shards": 16
+    },
+    {
+      "file": "matrixlib/test_numeric.py",
+      "passed": 0,
+      "failed": 2,
+      "errors": 0,
+      "skipped": 0,
+      "total": 2
+    },
+    {
+      "file": "matrixlib/test_regression.py",
+      "passed": 0,
+      "failed": 4,
+      "errors": 0,
+      "skipped": 0,
+      "total": 4
+    }
+  ]
+}

@@ -20,6 +20,10 @@ def __getattr__(name: str):
     import rnp_numpy._core.defchararray as char
 
     if (export := getattr(char, name, None)) is not None:
+        try:
+            export.__module__ = "numpy.char"
+        except (AttributeError, TypeError):
+            pass
         return export
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

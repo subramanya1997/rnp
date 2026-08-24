@@ -1,0 +1,87 @@
+{
+  "timestamp": "2026-08-24T08:21:36.471035+00:00",
+  "overall_passed": 23,
+  "overall_total": 363,
+  "files": [
+    {
+      "file": "random/test_direct.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "random/test_extending.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "random/test_generator_mt19937.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "random/test_generator_mt19937_regressions.py",
+      "passed": 0,
+      "failed": 19,
+      "errors": 0,
+      "skipped": 0,
+      "total": 19
+    },
+    {
+      "file": "random/test_random.py",
+      "passed": 11,
+      "failed": 131,
+      "errors": 0,
+      "skipped": 0,
+      "total": 142
+    },
+    {
+      "file": "random/test_randomstate.py",
+      "passed": 9,
+      "failed": 166,
+      "errors": 6,
+      "skipped": 0,
+      "total": 181
+    },
+    {
+      "file": "random/test_randomstate_regression.py",
+      "passed": 3,
+      "failed": 18,
+      "errors": 0,
+      "skipped": 0,
+      "total": 21
+    },
+    {
+      "file": "random/test_regression.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "random/test_seed_sequence.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "random/test_smoke.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    }
+  ]
+}

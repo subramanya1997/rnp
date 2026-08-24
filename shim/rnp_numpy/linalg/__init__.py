@@ -44,6 +44,7 @@ def __getattr__(name):
             return obj
     if name in __all__:
         obj = not_implemented(f"numpy.linalg.{name}")
+        obj.__module__ = "numpy.linalg"
         _cache[name] = obj
         return obj
     raise AttributeError(f"module 'numpy.linalg' has no attribute {name!r}")

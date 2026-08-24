@@ -1,5 +1,6 @@
 """`numpy._core._internal` — the pure-Python helpers numpy keeps here."""
 
+import ctypes
 import re
 
 from .._stubs import not_implemented
@@ -21,7 +22,49 @@ _pep3118_native_map = {
 _dtype_from_pep3118 = not_implemented("numpy._core._internal._dtype_from_pep3118")
 _view_is_safe = not_implemented("numpy._core._internal._view_is_safe")
 _gcd = not_implemented("numpy._core._internal._gcd")
-_ctypes = not_implemented("numpy._core._internal._ctypes")
+def _getintp_ctype():
+    return ctypes.c_ssize_t
+
+
+class _ctypes:
+    """The pointer/shape facade exposed as ``ndarray.ctypes``."""
+
+    def __init__(self, array, ptr=None):
+        self._arr = array
+        if ptr is None:
+            ptr = array.__array_interface__["data"][0]
+        self._data = ctypes.c_void_p(ptr)
+
+    def data_as(self, obj):
+        ptr = ctypes.cast(ctypes.c_void_p(self.data), obj)
+        ptr._arr = self._arr
+        return ptr
+
+    def shape_as(self, obj):
+        if self._arr.ndim == 0:
+            return None
+        return (obj * self._arr.ndim)(*self._arr.shape)
+
+    def strides_as(self, obj):
+        if self._arr.ndim == 0:
+            return None
+        return (obj * self._arr.ndim)(*self._arr.strides)
+
+    @property
+    def data(self):
+        return self._data.value
+
+    @property
+    def shape(self):
+        return self.shape_as(_getintp_ctype())
+
+    @property
+    def strides(self):
+        return self.strides_as(_getintp_ctype())
+
+    @property
+    def _as_parameter_(self):
+        return self.data_as(ctypes.c_void_p)
 array_function_errmsg_formatter = not_implemented(
     "numpy._core._internal.array_function_errmsg_formatter")
 array_ufunc_errmsg_formatter = not_implemented(

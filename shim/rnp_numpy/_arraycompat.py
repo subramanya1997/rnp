@@ -781,6 +781,23 @@ def install():
     ndarray.__array__ = array_protocol
     ndarray.copy = copy_method
     ndarray.__setitem__ = setitem
+
+    def array_function(self, func, types, args, kwargs):
+        if not isinstance(args, tuple):
+            raise TypeError("args must be a tuple")
+        if not isinstance(kwargs, dict):
+            raise TypeError("kwargs must be a dict")
+        if not all(issubclass(t, ndarray) for t in types):
+            return NotImplemented
+        implementation = getattr(func, "_implementation", func)
+        return implementation(*args, **kwargs)
+
+    ndarray.__array_function__ = array_function
+    def ctypes_property(self):
+        from ._core._internal import _ctypes
+        return _ctypes(self, self.__array_interface__["data"][0])
+
+    ndarray.ctypes = property(ctypes_property)
     for _name in _STR_COMPARISONS:
         setattr(ndarray, _name, _make_str_comparison(_name))
     for _name, (_fn, _rev) in _STR_BINOPS.items():

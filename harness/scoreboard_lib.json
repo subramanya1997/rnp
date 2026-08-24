@@ -1,0 +1,208 @@
+{
+  "timestamp": "2026-08-24T08:20:51.270524+00:00",
+  "overall_passed": 2268,
+  "overall_total": 4575,
+  "files": [
+    {
+      "file": "lib/test__datasource.py",
+      "passed": 26,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 26
+    },
+    {
+      "file": "lib/test__iotools.py",
+      "passed": 21,
+      "failed": 3,
+      "errors": 0,
+      "skipped": 0,
+      "total": 24
+    },
+    {
+      "file": "lib/test__version.py",
+      "passed": 8,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 8
+    },
+    {
+      "file": "lib/test_array_utils.py",
+      "passed": 4,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 4
+    },
+    {
+      "file": "lib/test_arraypad.py",
+      "passed": 572,
+      "failed": 44,
+      "errors": 0,
+      "skipped": 1,
+      "total": 617
+    },
+    {
+      "file": "lib/test_arraysetops.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "lib/test_arrayterator.py",
+      "passed": 0,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 0,
+      "total": 1
+    },
+    {
+      "file": "lib/test_format.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    },
+    {
+      "file": "lib/test_function_base.py",
+      "passed": 566,
+      "failed": 857,
+      "errors": 0,
+      "skipped": 73,
+      "total": 1496
+    },
+    {
+      "file": "lib/test_histograms.py",
+      "passed": 49,
+      "failed": 19,
+      "errors": 0,
+      "skipped": 1,
+      "total": 69
+    },
+    {
+      "file": "lib/test_index_tricks.py",
+      "passed": 54,
+      "failed": 12,
+      "errors": 0,
+      "skipped": 0,
+      "total": 66
+    },
+    {
+      "file": "lib/test_io.py",
+      "passed": 78,
+      "failed": 136,
+      "errors": 0,
+      "skipped": 1,
+      "total": 215
+    },
+    {
+      "file": "lib/test_loadtxt.py",
+      "passed": 124,
+      "failed": 173,
+      "errors": 0,
+      "skipped": 4,
+      "total": 301
+    },
+    {
+      "file": "lib/test_mixins.py",
+      "passed": 1,
+      "failed": 10,
+      "errors": 0,
+      "skipped": 0,
+      "total": 11
+    },
+    {
+      "file": "lib/test_nanfunctions.py",
+      "passed": 269,
+      "failed": 924,
+      "errors": 0,
+      "skipped": 86,
+      "total": 1279
+    },
+    {
+      "file": "lib/test_packbits.py",
+      "passed": 274,
+      "failed": 6,
+      "errors": 0,
+      "skipped": 0,
+      "total": 280
+    },
+    {
+      "file": "lib/test_polynomial.py",
+      "passed": 10,
+      "failed": 32,
+      "errors": 0,
+      "skipped": 0,
+      "total": 42
+    },
+    {
+      "file": "lib/test_recfunctions.py",
+      "passed": 10,
+      "failed": 41,
+      "errors": 0,
+      "skipped": 0,
+      "total": 51
+    },
+    {
+      "file": "lib/test_regression.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0,
+      "error": "manya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_manager.py\", line 120 in _hookexec\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_hooks.py\", line 512 in __call__\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/_pytest/main.py\", line 408 in pytest_runtestloop\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_callers.py\", line 121 in _multicall\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_manager.py\", line 120 in _hookexec\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_hooks.py\", line 512 in __call__\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/_pytest/main.py\", line 384 in _main\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/_pytest/main.py\", line 330 in wrap_session\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/_pytest/main.py\", line 377 in pytest_cmdline_main\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_callers.py\", line 121 in _multicall\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_manager.py\", line 120 in _hookexec\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pluggy/_hooks.py\", line 512 in __call__\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/_pytest/config/__init__.py\", line 229 in _main\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/_pytest/config/__init__.py\", line 253 in _console_main\n  File \"/Users/subramanya/Desktop/projects/numpy/.venv/lib/python3.13/site-packages/pytest/__main__.py\", line 9 in <module>\n  File \"<frozen runpy>\", line 88 in _run_code\n  File \"<frozen runpy>\", line 198 in _run_module_as_main\n"
+    },
+    {
+      "file": "lib/test_shape_base.py",
+      "passed": 55,
+      "failed": 22,
+      "errors": 0,
+      "skipped": 0,
+      "total": 77
+    },
+    {
+      "file": "lib/test_stride_tricks.py",
+      "passed": 56,
+      "failed": 22,
+      "errors": 0,
+      "skipped": 0,
+      "total": 78
+    },
+    {
+      "file": "lib/test_twodim_base.py",
+      "passed": 33,
+      "failed": 4,
+      "errors": 0,
+      "skipped": 0,
+      "total": 37
+    },
+    {
+      "file": "lib/test_type_check.py",
+      "passed": 51,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 51
+    },
+    {
+      "file": "lib/test_ufunclike.py",
+      "passed": 7,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 0,
+      "total": 8
+    },
+    {
+      "file": "lib/test_utils.py",
+      "passed": 0,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "total": 0
+    }
+  ]
+}
