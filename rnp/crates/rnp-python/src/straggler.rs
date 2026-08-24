@@ -189,29 +189,27 @@ pub fn lexsort<'py>(
     }
     let ndim = shape.len();
     let ax = norm_axis(axis, ndim)?;
+    if ndim == 0 {
+        // 0-d keys are legal: there is exactly one element, so the answer is
+        // always index 0, returned as a numpy scalar.
+        return crate::convert::npscalar_to_py(py, DType::I64, Scalar::Int(0));
+    }
 
     // Least-significant-digit pass: sort by the first key, then stably
     // re-sort by each later key, so the last key ends up dominant.
-    let n_lanes = lane_offsets(&arrays[0], if ndim == 0 { 0 } else { ax }).len();
-    let lane_len = if ndim == 0 { 1 } else { shape[ax].max(0) as usize };
+    let n_lanes = lane_offsets(&arrays[0], ax).len();
+    let lane_len = shape[ax].max(0) as usize;
     let mut order: Vec<Vec<usize>> = vec![(0..lane_len).collect(); n_lanes];
 
     for key in &arrays {
-        let permuted = if ndim == 0 {
-            key.clone()
-        } else {
-            permute_along_axis(key, &order, ax)
-        };
-        let pass = stable_order(py, &permuted, if ndim == 0 { 0 } else { ax })?;
+        let permuted = permute_along_axis(key, &order, ax);
+        let pass = stable_order(py, &permuted, ax)?;
         for (lane, p) in order.iter_mut().zip(pass.iter()) {
             *lane = p.iter().map(|&i| lane[i]).collect();
         }
     }
 
     let out = NdArray::zeros(shape.clone(), DType::I64).map_err(crate::err)?;
-    if ndim == 0 {
-        return crate::convert::npscalar_to_py(py, DType::I64, Scalar::Int(0));
-    }
     for (lane, off) in lane_offsets(&out, ax).into_iter().zip(order.iter()) {
         for (k, &v) in off.iter().enumerate() {
             out.write_at(lane[k], Scalar::Int(v as i64));
@@ -325,6 +323,40 @@ pub fn clip_impl<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let lo = min.filter(|b| !b.is_none());
     let hi = max.filter(|b| !b.is_none());
+    if lo.is_none() && hi.is_none() {
+        // Probed: numpy 2.5.2 does *not* raise for two `None` bounds, it
+        // applies `np.positive` — which is why a bool operand is the one
+        // dtype that fails here.
+        if arr.dtype() == DType::Bool {
+            return Err(crate::err(rnp_core::Error::UFuncNoLoop {
+                ufunc: "positive".into(),
+                dtypes: vec!["bool".into()],
+                message: "ufunc 'positive' did not contain a loop with \
+                          signature matching types"
+                    .into(),
+            }));
+        }
+    }
+    if let Some(os) = out_shape_of(out) {
+        if os != arr.shape {
+            let mut shapes = vec![tuple_repr(&arr.shape)];
+            for b in [lo, hi].into_iter().flatten() {
+                let bs = match b.cast::<PyNdArray>() {
+                    Ok(c) => {
+                        let sh = c.borrow().arr.shape.clone();
+                        tuple_repr(&sh)
+                    }
+                    Err(_) => "()".to_string(),
+                };
+                shapes.push(bs);
+            }
+            shapes.push(tuple_repr(&os));
+            return Err(PyValueError::new_err(format!(
+                "operands could not be broadcast together with shapes {} ",
+                shapes.join(" ")
+            )));
+        }
+    }
     let mut res = arr.clone();
     let mut dt = arr.dtype();
     // First pass fixes the result dtype (weak Python scalars adopt the
@@ -367,10 +399,7 @@ pub fn conjugate_impl<'py>(
     let arr = slf.borrow().arr.clone();
     let dt = arr.dtype();
     if arr.descr.is_struct() || dt.is_flexible() || matches!(dt, DType::DateTime(_) | DType::TimeDelta(_)) {
-        return Err(PyTypeError::new_err(format!(
-            "cannot conjugate non-numeric dtype {}",
-            arr.descr.name()
-        )));
+        return Err(PyTypeError::new_err("cannot conjugate non-numeric dtype"));
     }
     if dt.is_object() {
         let res = NdArray::zeros_descr(arr.shape.clone(), arr.descr).map_err(crate::err)?;
@@ -403,6 +432,12 @@ pub fn conjugate_impl<'py>(
             other => other,
         };
         res.write_at(d, v);
+    }
+    if res.ndim() == 0 && out.is_none_or(|o| o.is_none()) {
+        // numpy hands back a scalar, not a 0-d array, for a 0-d complex
+        // operand (the real-dtype path above returns `self` unchanged).
+        let v = res.get_flat(0);
+        return crate::convert::npscalar_to_py(py, res.dtype(), v);
     }
     store_or_wrap(py, res, out)
 }
@@ -502,6 +537,78 @@ pub fn reduce_impl<'py>(slf: &Bound<'py, PyNdArray>) -> PyResult<Bound<'py, PyTu
     )
 }
 
+/// `numpy._core.multiarray._frombuffer(buf, dtype, shape, order)` — the
+/// protocol-5 reconstructor, which (unlike `_reconstruct` + `__setstate__`)
+/// preserves a non-native byte order.
+#[pyfunction]
+pub fn _frombuffer<'py>(
+    py: Python<'py>,
+    buf: &Bound<'py, PyAny>,
+    dtype: &Bound<'py, PyAny>,
+    shape: &Bound<'py, PyAny>,
+    order: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let descr = descr_from_any(dtype)?;
+    let want = crate::pyarray::shape_from_any(shape)?;
+    let bytes: Vec<u8> = buf.extract()?;
+    let mut arr = NdArray::zeros_descr(want.clone(), descr).map_err(crate::err)?;
+    if order.eq_ignore_ascii_case("F") && arr.ndim() > 1 {
+        arr = arr.transpose().copy().transpose();
+        arr.descr = descr;
+    }
+    if bytes.len() != arr.nbytes() {
+        return Err(PyValueError::new_err(
+            "buffer size does not match array size",
+        ));
+    }
+    let walk = if order.eq_ignore_ascii_case("F") {
+        arr.transpose()
+    } else {
+        arr.clone()
+    };
+    let isz = arr.itemsize();
+    for (k, off) in
+        rnp_core::iter::offsets(&walk.shape, &walk.strides, walk.byte_offset).enumerate()
+    {
+        arr.write_raw_at(off, &bytes[k * isz..(k + 1) * isz]);
+    }
+    arr.update_flags();
+    Ok(PyNdArray::into_py_any(arr, py)?.into_bound(py).into_any())
+}
+
+/// `a.__reduce_ex__(protocol)`.
+///
+/// Probed: from protocol 5 numpy hands the raw buffer to `_frombuffer`
+/// whenever the array is single-segment and not object-typed — a path that
+/// keeps a byte-swapped descriptor intact, where the older `__setstate__`
+/// route normalises it. Everything else falls back to `__reduce__`.
+pub fn reduce_ex_impl<'py>(
+    slf: &Bound<'py, PyNdArray>,
+    protocol: i32,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let py = slf.py();
+    let arr = slf.borrow().arr.clone();
+    let one_segment = arr.flags.c_contiguous || arr.flags.f_contiguous;
+    if protocol < 5 || !one_segment || arr.dtype().is_object() {
+        return reduce_impl(slf);
+    }
+    let order = if arr.flags.c_contiguous { "C" } else { "F" };
+    let data = tobytes_impl(py, &arr, Some(order))?;
+    let f = py.import("_rnp")?.getattr("_frombuffer")?;
+    let args = PyTuple::new(
+        py,
+        [
+            data.into_any().unbind(),
+            Py::new(py, PyDType::from_descr(arr.descr))?.into_any(),
+            PyTuple::new(py, arr.shape.iter().copied())?
+                .into_any()
+                .unbind(),
+            order.into_pyobject(py)?.into_any().unbind(),
+        ],
+    )?;
+    PyTuple::new(py, [f.unbind(), args.into_any().unbind()])
+}
+
 /// `a.__setstate__(state)` — rebuild the array in place from the 5-tuple.
 pub fn setstate_impl(slf: &Bound<'_, PyNdArray>, state: &Bound<'_, PyAny>) -> PyResult<()> {
     let py = slf.py();
@@ -556,6 +663,14 @@ pub fn setstate_impl(slf: &Bound<'_, PyNdArray>, state: &Bound<'_, PyAny>) -> Py
         if bytes.len() > SETSTATE_BASE_THRESHOLD && data.is_instance_of::<PyBytes>() {
             base = Some(data.clone().unbind());
         }
+    }
+    if !arr.is_native() {
+        // Probed: numpy's `array_setstate` normalises a byte-swapped payload
+        // — `pickle.loads(pickle.dumps(a.astype('>i4'))).dtype` is `int32`,
+        // with the values (not the bytes) preserved.
+        arr.byteswap_inplace();
+        arr.descr = arr.descr.newbyteorder(Some('=')).unwrap_or(arr.descr);
+        base = None;
     }
     arr.update_flags();
     let mut me = slf.borrow_mut();
@@ -663,25 +778,44 @@ pub fn var_impl<'py>(
     ddof: f64,
     keepdims: bool,
     where_: Option<&Bound<'py, PyAny>>,
+    mean_arg: Option<&Bound<'py, PyAny>>,
     sqrt: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let dt = arr.dtype();
-    if dt.is_object() || dt.is_flexible() || arr.descr.is_struct() {
+    if dt.is_flexible() || arr.descr.is_struct() {
+        // numpy's `add.reduce` is what actually refuses; it reports the
+        // resolved loop dtypes, whose output is twice the operand width.
+        let one = arr.descr.str_code();
+        let mut wide = arr.descr;
+        wide.dt = match wide.dt {
+            DType::Bytes(n) => DType::Bytes(n * 2),
+            DType::Str(n) => DType::Str(n * 2),
+            DType::Void(n) => DType::Void(n * 2),
+            other => other,
+        };
         return Err(PyTypeError::new_err(format!(
-            "cannot perform var with type {}",
-            arr.descr.name()
+            "the resolved dtypes are not compatible with add.reduce. \
+             Resolved (dtype('{}'), dtype('{}'), dtype('{}'))",
+            one,
+            one,
+            wide.str_code()
         )));
+    }
+    if dt.is_object() {
+        return Err(PyTypeError::new_err(
+            "cannot perform var with type object",
+        ));
     }
     // Accumulator dtype: an explicit `dtype=` wins, bool/int accumulate in
     // float64, float16 in float32, everything else keeps its own type.
+    // `_methods._var` promotes only bool/integer operands to float64; unlike
+    // `_mean` it leaves float16 alone, so a float16 variance accumulates in
+    // float16. Probed: `np.eye(3, dtype='e').var()` differs from the float32
+    // answer in the last few bits, and numpy's is the float16 one.
     let acc = match dtype {
         Some(d) if !d.is_none() => crate::pydtype::dtype_from_any(d)?,
         _ => match dt {
-            DType::F16 => DType::F32,
-            DType::F32 => DType::F32,
-            DType::C64 => DType::C64,
-            DType::C128 => DType::C128,
-            DType::F64 => DType::F64,
+            DType::F16 | DType::F32 | DType::F64 | DType::C64 | DType::C128 => dt,
             _ => DType::F64,
         },
     };
@@ -704,13 +838,31 @@ pub fn var_impl<'py>(
         DType::C128 => DType::F64,
         d => d,
     };
-    let out_dt = if dt == DType::F16 && !explicit {
-        DType::F16
-    } else {
-        res_dt
-    };
+    let out_dt = res_dt;
 
     let ax = resolve_axis_pub(arr, axis)?;
+    if let Some(os) = out_shape_of(out) {
+        let want: Vec<isize> = match (ax, keepdims) {
+            (_, true) => {
+                let mut v = arr.shape.clone();
+                if let Some(a) = ax {
+                    v[a] = 1;
+                } else {
+                    v = vec![1; arr.ndim()];
+                }
+                v
+            }
+            (None, false) => vec![],
+            (Some(a), false) => {
+                let mut v = arr.shape.clone();
+                v.remove(a);
+                v
+            }
+        };
+        if os != want {
+            return Err(reduce_out_error(&arr.shape, ax, &os));
+        }
+    }
     let mask = match where_ {
         Some(w) if !w.is_none() => {
             let m = array_from_any(w, Some(DType::Bool), false)?;
@@ -721,8 +873,15 @@ pub fn var_impl<'py>(
 
     let promoted = arr.astype(acc);
     let count = counts(arr, ax, mask.as_ref());
-    let mean = masked_sum(&promoted, ax, mask.as_ref(), true)?;
-    let mean = divide_by(&mean, &count, acc);
+    // `mean=` lets the caller supply a precomputed (keepdims-shaped) mean,
+    // exactly as `_methods._var` does.
+    let mean = match mean_arg {
+        Some(m) if !m.is_none() => array_from_any(m, Some(acc), false)?,
+        _ => {
+            let total = masked_sum(&promoted, ax, mask.as_ref(), true)?;
+            divide_by(&total, &count, acc)
+        }
+    };
 
     // x = arr - mean, broadcast back over the reduced axis.
     let diff = rnp_core::binary(&promoted, &mean, BinOp::Sub).map_err(crate::err)?;
@@ -807,6 +966,28 @@ pub fn mean_impl<'py>(
         acc
     };
     let ax = resolve_axis_pub(arr, axis)?;
+    if let Some(os) = out_shape_of(out) {
+        let want: Vec<isize> = match (ax, keepdims) {
+            (_, true) => {
+                let mut v = arr.shape.clone();
+                if let Some(a) = ax {
+                    v[a] = 1;
+                } else {
+                    v = vec![1; arr.ndim()];
+                }
+                v
+            }
+            (None, false) => vec![],
+            (Some(a), false) => {
+                let mut v = arr.shape.clone();
+                v.remove(a);
+                v
+            }
+        };
+        if os != want {
+            return Err(reduce_out_error(&arr.shape, ax, &os));
+        }
+    }
     let mask = match where_ {
         Some(w) if !w.is_none() => {
             let m = array_from_any(w, Some(DType::Bool), false)?;
@@ -899,6 +1080,106 @@ fn keepdims_view(out: &NdArray, arr: &NdArray, axis: Option<usize>) -> NdArray {
         }
     }
     v
+}
+
+
+
+/// CPython's `__index__` coercion, with numpy's (i.e. CPython's) message for
+/// anything that is not an integer. `resize` reports its `refcheck=` and its
+/// shape entries through this.
+pub fn as_index(obj: &Bound<'_, PyAny>) -> PyResult<isize> {
+    if let Ok(v) = obj.extract::<isize>() {
+        return Ok(v);
+    }
+    Err(PyTypeError::new_err(format!(
+        "'{}' object cannot be interpreted as an integer",
+        obj.get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    )))
+}
+
+/// A shape from a single sequence argument, coercing each entry with
+/// [`as_index`] so a bad element reports CPython's message.
+pub fn shape_from_sequence(obj: &Bound<'_, PyAny>) -> PyResult<Vec<isize>> {
+    let mut out = Vec::new();
+    for item in obj.try_iter().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "'{}' object cannot be interpreted as an integer",
+            obj.get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ))
+    })? {
+        out.push(as_index(&item?)?);
+    }
+    Ok(out)
+}
+
+/// numpy's tuple rendering: `(2,)` for a 1-tuple, `(3,3)` otherwise.
+fn tuple_repr(s: &[isize]) -> String {
+    if s.len() == 1 {
+        format!("({},)", s[0])
+    } else {
+        format!(
+            "({})",
+            s.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// The exact `ValueError` numpy's reduction machinery raises for a badly
+/// shaped `out=`. Two distinct messages: a plain dimension-count complaint,
+/// and a "remapped shapes" one that shows where the reduced axis went. Both
+/// were transcribed from probing `ndarray.mean(axis=..., out=...)`.
+fn reduce_out_error(arr_shape: &[isize], axis: Option<usize>, out_shape: &[isize]) -> PyErr {
+    let expected = match axis {
+        None => 0,
+        Some(_) => arr_shape.len().saturating_sub(1),
+    };
+    if out_shape.len() != expected {
+        return PyValueError::new_err(format!(
+            "output parameter for reduction operation add has the wrong \
+             number of dimensions: Found {} but expected {}",
+            out_shape.len(),
+            expected
+        ));
+    }
+    // Rebuild numpy's `op_axes` rendering: walk the operand's axes, printing
+    // `newaxis` where the reduced one sat, then drop any leading `newaxis`.
+    let mut parts: Vec<String> = Vec::new();
+    let mut k = 0usize;
+    for i in 0..arr_shape.len() {
+        if Some(i) == axis {
+            parts.push("newaxis".to_string());
+        } else {
+            parts.push(out_shape.get(k).copied().unwrap_or(0).to_string());
+            k += 1;
+        }
+    }
+    while parts.first().is_some_and(|p| p == "newaxis") {
+        parts.remove(0);
+    }
+    PyValueError::new_err(format!(
+        "operands could not be broadcast together with remapped shapes \
+         [original->remapped]: {}->({}) {} ",
+        tuple_repr(out_shape),
+        parts.join(","),
+        tuple_repr(arr_shape)
+    ))
+}
+
+/// The shape of an `out=` argument, when one was actually supplied.
+fn out_shape_of(out: Option<&Bound<'_, PyAny>>) -> Option<Vec<isize>> {
+    let o = out?;
+    if o.is_none() {
+        return None;
+    }
+    let cell = o.cast::<PyNdArray>().ok()?;
+    let shape = cell.borrow().arr.shape.clone();
+    Some(shape)
 }
 
 /// numpy's `_methods._mean` warning for a reduction over nothing.
@@ -1047,14 +1328,18 @@ pub fn getfield_impl(
 ) -> PyResult<Py<PyNdArray>> {
     let arr = slf.borrow().arr.clone();
     let d = descr_from_any(dtype)?;
-    if offset < 0 || offset + d.itemsize() as isize > arr.itemsize() as isize {
-        return Err(PyValueError::new_err(format!(
-            "Need 0 <= offset <= {} for requested type but received offset = {}, \
-             required size = {}",
-            arr.itemsize() as isize - d.itemsize() as isize,
-            offset,
-            d.itemsize()
-        )));
+    if d.itemsize() > arr.itemsize() {
+        return Err(PyValueError::new_err(
+            "new type is larger than original type",
+        ));
+    }
+    if offset < 0 {
+        return Err(PyValueError::new_err("offset is negative"));
+    }
+    if offset + d.itemsize() as isize > arr.itemsize() as isize {
+        return Err(PyValueError::new_err(
+            "new type plus offset is larger than original type",
+        ));
     }
     let mut out = arr.clone();
     out.descr = d;
@@ -1117,12 +1402,14 @@ pub fn _c_concat<'py>(py: Python<'py>, items: &Bound<'py, PyAny>) -> PyResult<Py
     }
     let rows = parts[0].shape[0];
     let mut cols = 0isize;
-    for p in &parts {
+    for (k, p) in parts.iter().enumerate() {
         if p.ndim() != 2 || p.shape[0] != rows {
-            return Err(PyValueError::new_err(
+            return Err(PyValueError::new_err(format!(
                 "all the input array dimensions except for the concatenation \
-                 axis must match exactly",
-            ));
+                 axis must match exactly, but along dimension 0, the array at \
+                 index 0 has size {} and the array at index {} has size {}",
+                rows, k, p.shape[0]
+            )));
         }
         cols += p.shape[1];
     }

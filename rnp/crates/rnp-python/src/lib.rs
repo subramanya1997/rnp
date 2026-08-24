@@ -941,6 +941,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(itemsel::_as_strided, m)?)?;
     m.add_function(wrap_pyfunction!(straggler::lexsort, m)?)?;
     m.add_function(wrap_pyfunction!(straggler::_reconstruct, m)?)?;
+    m.add_function(wrap_pyfunction!(straggler::_frombuffer, m)?)?;
     m.add_function(wrap_pyfunction!(straggler::_c_concat, m)?)?;
 
     m.add_function(wrap_pyfunction!(_set_error_factories, m)?)?;

@@ -1205,37 +1205,46 @@ impl PyNdArray {
         crate::straggler::conjugate_impl(slf, out)
     }
 
-    #[pyo3(signature = (*shape, refcheck = None))]
+    #[pyo3(signature = (*shape, **kwargs))]
     fn resize(
         slf: &Bound<'_, Self>,
         shape: &Bound<'_, PyTuple>,
-        refcheck: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
         // numpy accepts `a.resize(2, 3)`, `a.resize((2, 3))` and `a.resize()`
-        // / `a.resize(None)` (both no-ops), and nothing else.
-        let check = match refcheck {
-            None => true,
-            Some(o) => o.extract::<isize>().map(|v| v != 0).map_err(|_| {
-                PyTypeError::new_err(format!(
-                    "'{}' object cannot be interpreted as an integer",
-                    o.get_type().name().map(|n| n.to_string()).unwrap_or_default()
-                ))
-            })?,
-        };
+        // / `a.resize(None)` (both no-ops), and `refcheck=` — nothing else.
+        // Probed: there is no `order=` keyword, and a bad one is reported as
+        // "this function got an unexpected keyword argument '...'".
+        let mut check = true;
+        if let Some(kw) = kwargs {
+            for (k, v) in kw.iter() {
+                let name: String = k.extract()?;
+                if name != "refcheck" {
+                    return Err(PyTypeError::new_err(format!(
+                        "this function got an unexpected keyword argument '{name}'"
+                    )));
+                }
+                check = crate::straggler::as_index(&v)? != 0;
+            }
+        }
         let want = if shape.is_empty() {
             return Ok(());
         } else if shape.len() == 1 && shape.get_item(0)?.is_none() {
             return Ok(());
-        } else if shape.len() == 1 && !shape.get_item(0)?.extract::<isize>().is_ok() {
-            shape_from_any(&shape.get_item(0)?)?
+        } else if shape.len() == 1 && shape.get_item(0)?.extract::<isize>().is_err() {
+            crate::straggler::shape_from_sequence(&shape.get_item(0)?)?
         } else {
-            shape_from_args(shape)?
+            let mut v = Vec::with_capacity(shape.len());
+            for item in shape.iter() {
+                v.push(crate::straggler::as_index(&item)?);
+            }
+            v
         };
         crate::straggler::resize_impl(slf, want, check)
     }
 
     #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
-                        r#where = None, mean = None, correction = None))]
+                        r#where = None, mean = None, **kwargs))]
     #[allow(clippy::too_many_arguments)]
     fn var<'py>(
         &self,
@@ -1247,15 +1256,28 @@ impl PyNdArray {
         keepdims: bool,
         r#where: Option<&Bound<'py, PyAny>>,
         mean: Option<&Bound<'py, PyAny>>,
-        correction: Option<f64>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = mean;
-        let dd = correction.unwrap_or(ddof);
-        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, false)
+        // Probed: `ndarray.var(correction=...)` is a TypeError in 2.5.2 (only
+        // `np.var` accepts it), and the message names the private helper.
+        let mut dd = ddof;
+        if let Some(kw) = kwargs {
+            for (k, v) in kw.iter() {
+                let name: String = k.extract()?;
+                if name == "_correction" {
+                    dd = v.extract()?;
+                    continue;
+                }
+                return Err(PyTypeError::new_err(format!(
+                    "_var() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, false)
     }
 
     #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
-                        r#where = None, mean = None, correction = None))]
+                        r#where = None, mean = None, **kwargs))]
     #[allow(clippy::too_many_arguments)]
     fn std<'py>(
         &self,
@@ -1267,11 +1289,24 @@ impl PyNdArray {
         keepdims: bool,
         r#where: Option<&Bound<'py, PyAny>>,
         mean: Option<&Bound<'py, PyAny>>,
-        correction: Option<f64>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = mean;
-        let dd = correction.unwrap_or(ddof);
-        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, true)
+        // Probed: `ndarray.std(correction=...)` is a TypeError in 2.5.2 (only
+        // `np.std` accepts it), and the message names the private helper.
+        let mut dd = ddof;
+        if let Some(kw) = kwargs {
+            for (k, v) in kw.iter() {
+                let name: String = k.extract()?;
+                if name == "_correction" {
+                    dd = v.extract()?;
+                    continue;
+                }
+                return Err(PyTypeError::new_err(format!(
+                    "_std() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, mean, true)
     }
 
     #[pyo3(signature = (dtype, offset = 0))]
@@ -1295,6 +1330,10 @@ impl PyNdArray {
 
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
         crate::straggler::reduce_impl(slf)
+    }
+
+    fn __reduce_ex__<'py>(slf: &Bound<'py, Self>, protocol: i32) -> PyResult<Bound<'py, PyTuple>> {
+        crate::straggler::reduce_ex_impl(slf, protocol)
     }
 
     fn __setstate__(slf: &Bound<'_, Self>, state: &Bound<'_, PyAny>) -> PyResult<()> {
