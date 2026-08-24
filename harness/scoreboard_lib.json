@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T19:30:13.106124+00:00",
-  "overall_passed": 3834,
+  "timestamp": "2026-08-24T19:32:50.708567+00:00",
+  "overall_passed": 4120,
   "overall_total": 4759,
   "files": [
     {
@@ -37,16 +37,16 @@
     },
     {
       "file": "lib/test_arraypad.py",
-      "passed": 575,
-      "failed": 41,
+      "passed": 586,
+      "failed": 30,
       "errors": 0,
       "skipped": 1,
       "total": 617
     },
     {
       "file": "lib/test_arraysetops.py",
-      "passed": 107,
-      "failed": 10,
+      "passed": 109,
+      "failed": 8,
       "errors": 0,
       "skipped": 0,
       "total": 117
@@ -69,16 +69,16 @@
     },
     {
       "file": "lib/test_function_base.py",
-      "passed": 1049,
-      "failed": 374,
+      "passed": 1289,
+      "failed": 134,
       "errors": 0,
       "skipped": 73,
       "total": 1496
     },
     {
       "file": "lib/test_histograms.py",
-      "passed": 61,
-      "failed": 7,
+      "passed": 65,
+      "failed": 3,
       "errors": 0,
       "skipped": 1,
       "total": 69
@@ -117,8 +117,8 @@
     },
     {
       "file": "lib/test_nanfunctions.py",
-      "passed": 1060,
-      "failed": 133,
+      "passed": 1089,
+      "failed": 104,
       "errors": 0,
       "skipped": 86,
       "total": 1279

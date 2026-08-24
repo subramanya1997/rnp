@@ -374,6 +374,9 @@ def asarray(obj, dtype=None, order=None, *, device=None, copy=None, like=None):
         _as_text = _string_fill_fallback(exc, dtype, obj)
         if _as_text is not None:
             return _as_text
+        _ac = _arraycompat_mod()
+        if _ac._has_none_error(exc):
+            return _ac.array_none_fallback(obj, dtype)
         if hasattr(obj, "__array_interface__"):
             import importlib
             _mo = importlib.import_module(__name__ + "._core._memoverlap")
