@@ -13,6 +13,7 @@ pub mod element;
 pub mod error;
 pub mod fpe;
 pub mod fft;
+mod fft_single;
 pub mod indexing;
 pub mod iter;
 pub mod lapack;

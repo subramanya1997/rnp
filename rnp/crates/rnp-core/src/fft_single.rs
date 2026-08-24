@@ -1,24 +1,30 @@
-//! One-dimensional pocketfft kernels and ndarray axis orchestration.
-//!
-//! This is a safe Rust transcription of pocketfft's complex FFTPACK and
-//! Bluestein plans. Expression grouping, factor order, twiddle construction,
-//! buffer swaps, and final scaling follow `pocketfft_hdronly.h`.
+//! Single-precision specialization of the pocketfft transcription.
 
 use num_complex::Complex;
 
-use crate::{DType, Error, NdArray, Result, Scalar};
-
-type C64 = Complex<f64>;
+type C32 = Complex<f32>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct C {
+    r: f32,
+    i: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Chigh {
     r: f64,
     i: f64,
 }
 
+impl Chigh {
+    const fn new(r: f64, i: f64) -> Self {
+        Self { r, i }
+    }
+}
+
 impl C {
     #[inline]
-    const fn new(r: f64, i: f64) -> Self {
+    const fn new(r: f32, i: f32) -> Self {
         Self { r, i }
     }
     #[inline]
@@ -30,7 +36,7 @@ impl C {
         Self::new(self.r - other.r, self.i - other.i)
     }
     #[inline]
-    fn mul(self, value: f64) -> Self {
+    fn mul(self, value: f32) -> Self {
         Self::new(self.r * value, self.i * value)
     }
 }
@@ -73,30 +79,30 @@ struct Twiddles {
     n: usize,
     mask: usize,
     shift: usize,
-    v1: Vec<C>,
-    v2: Vec<C>,
+    v1: Vec<Chigh>,
+    v2: Vec<Chigh>,
 }
 
 impl Twiddles {
-    fn calc(mut x: usize, n: usize, ang: f64) -> C {
+    fn calc(mut x: usize, n: usize, ang: f64) -> Chigh {
         x <<= 3;
         if x < 4 * n {
             if x < 2 * n {
                 if x < n {
                     let (s, c) = (x as f64 * ang).sin_cos();
-                    C::new(c, s)
+                    Chigh::new(c, s)
                 } else {
                     let (s, c) = ((2 * n - x) as f64 * ang).sin_cos();
-                    C::new(s, c)
+                    Chigh::new(s, c)
                 }
             } else {
                 x -= 2 * n;
                 if x < n {
                     let (s, c) = (x as f64 * ang).sin_cos();
-                    C::new(-s, c)
+                    Chigh::new(-s, c)
                 } else {
                     let (s, c) = ((2 * n - x) as f64 * ang).sin_cos();
-                    C::new(-c, s)
+                    Chigh::new(-c, s)
                 }
             }
         } else {
@@ -104,19 +110,19 @@ impl Twiddles {
             if x < 2 * n {
                 if x < n {
                     let (s, c) = (x as f64 * ang).sin_cos();
-                    C::new(c, -s)
+                    Chigh::new(c, -s)
                 } else {
                     let (s, c) = ((2 * n - x) as f64 * ang).sin_cos();
-                    C::new(s, -c)
+                    Chigh::new(s, -c)
                 }
             } else {
                 x -= 2 * n;
                 if x < n {
                     let (s, c) = (x as f64 * ang).sin_cos();
-                    C::new(-s, -c)
+                    Chigh::new(-s, -c)
                 } else {
                     let (s, c) = ((2 * n - x) as f64 * ang).sin_cos();
-                    C::new(-c, -s)
+                    Chigh::new(-c, -s)
                 }
             }
         }
@@ -130,13 +136,13 @@ impl Twiddles {
             shift += 1;
         }
         let mask = (1usize << shift) - 1;
-        let mut v1 = vec![C::default(); mask + 1];
-        v1[0] = C::new(1.0, 0.0);
+        let mut v1 = vec![Chigh::default(); mask + 1];
+        v1[0] = Chigh::new(1.0, 0.0);
         for (i, value) in v1.iter_mut().enumerate().skip(1) {
             *value = Self::calc(i, n, ang);
         }
-        let mut v2 = vec![C::default(); (nval + mask) / (mask + 1)];
-        v2[0] = C::new(1.0, 0.0);
+        let mut v2 = vec![Chigh::default(); (nval + mask) / (mask + 1)];
+        v2[0] = Chigh::new(1.0, 0.0);
         for (i, value) in v2.iter_mut().enumerate().skip(1) {
             *value = Self::calc(i * (mask + 1), n, ang);
         }
@@ -155,16 +161,16 @@ impl Twiddles {
             let x1 = self.v1[idx & self.mask];
             let x2 = self.v2[idx >> self.shift];
             C::new(
-                x1.r.mul_add(x2.r, -(x1.i * x2.i)),
-                x1.r.mul_add(x2.i, x1.i * x2.r),
+                x1.r.mul_add(x2.r, -(x1.i * x2.i)) as f32,
+                x1.r.mul_add(x2.i, x1.i * x2.r) as f32,
             )
         } else {
             idx = self.n - idx;
             let x1 = self.v1[idx & self.mask];
             let x2 = self.v2[idx >> self.shift];
             C::new(
-                x1.r.mul_add(x2.r, -(x1.i * x2.i)),
-                -x1.r.mul_add(x2.i, x1.i * x2.r),
+                x1.r.mul_add(x2.r, -(x1.i * x2.i)) as f32,
+                -x1.r.mul_add(x2.i, x1.i * x2.r) as f32,
             )
         }
     }
@@ -209,7 +215,7 @@ fn pass2(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
 
 fn pass3(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
     let tw1r = -0.5;
-    let tw1i = (if fwd { -1.0 } else { 1.0 }) * 0.8660254037844386467637231707529362_f64;
+    let tw1i = (if fwd { -1.0 } else { 1.0 }) * 0.8660254037844386467637231707529362_f32;
     for k in 0..l1 {
         for i in 0..ido {
             let t0 = cc[cc_idx(ido, 3, i, 0, k)];
@@ -251,7 +257,7 @@ fn pass4(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pair5(t0: C, t1: C, t2: C, t3: C, t4: C, ar: f64, br: f64, ai: f64, bi: f64) -> (C, C) {
+fn pair5(t0: C, t1: C, t2: C, t3: C, t4: C, ar: f32, br: f32, ai: f32, bi: f32) -> (C, C) {
     let ca = C::new(
         br.mul_add(t2.r, ar.mul_add(t1.r, t0.r)),
         br.mul_add(t2.i, ar.mul_add(t1.i, t0.i)),
@@ -261,10 +267,10 @@ fn pair5(t0: C, t1: C, t2: C, t3: C, t4: C, ar: f64, br: f64, ai: f64, bi: f64) 
 }
 
 fn pass5(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
-    let tw1r = 0.3090169943749474241022934171828191_f64;
-    let tw1i = (if fwd { -1.0 } else { 1.0 }) * 0.9510565162951535721164393333793821_f64;
-    let tw2r = -0.8090169943749474241022934171828191_f64;
-    let tw2i = (if fwd { -1.0 } else { 1.0 }) * 0.5877852522924731291687059546390728_f64;
+    let tw1r = 0.3090169943749474241022934171828191_f32;
+    let tw1i = (if fwd { -1.0 } else { 1.0 }) * 0.9510565162951535721164393333793821_f32;
+    let tw2r = -0.8090169943749474241022934171828191_f32;
+    let tw2i = (if fwd { -1.0 } else { 1.0 }) * 0.5877852522924731291687059546390728_f32;
     for k in 0..l1 {
         for i in 0..ido {
             let t0 = cc[cc_idx(ido, 5, i, 0, k)];
@@ -293,12 +299,12 @@ fn pair7(
     t5: C,
     t6: C,
     t7: C,
-    x1: f64,
-    x2: f64,
-    x3: f64,
-    y1: f64,
-    y2: f64,
-    y3: f64,
+    x1: f32,
+    x2: f32,
+    x3: f32,
+    y1: f32,
+    y2: f32,
+    y3: f32,
 ) -> (C, C) {
     let ca = C::new(
         x3.mul_add(t4.r, x2.mul_add(t3.r, x1.mul_add(t2.r, t1.r))),
@@ -313,12 +319,12 @@ fn pair7(
 
 fn pass7(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
     let s = if fwd { -1.0 } else { 1.0 };
-    let tw1r = 0.6234898018587335305250048840042398_f64;
-    let tw1i = s * 0.7818314824680298087084445266740578_f64;
-    let tw2r = -0.2225209339563144042889025644967948_f64;
-    let tw2i = s * 0.9749279121818236070181316829939312_f64;
-    let tw3r = -0.9009688679024191262361023195074451_f64;
-    let tw3i = s * 0.433883739117558120475768332848359_f64;
+    let tw1r = 0.6234898018587335305250048840042398_f32;
+    let tw1i = s * 0.7818314824680298087084445266740578_f32;
+    let tw2r = -0.2225209339563144042889025644967948_f32;
+    let tw2i = s * 0.9749279121818236070181316829939312_f32;
+    let tw3r = -0.9009688679024191262361023195074451_f32;
+    let tw3i = s * 0.433883739117558120475768332848359_f32;
     for k in 0..l1 {
         for i in 0..ido {
             let t1 = cc[cc_idx(ido, 7, i, 0, k)];
@@ -368,7 +374,7 @@ fn pass7(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
 
 #[inline]
 fn rot_x45(a: &mut C, fwd: bool) {
-    const HSQT2: f64 = 0.707106781186547524400844362104849_f64;
+    const HSQT2: f32 = 0.707106781186547524400844362104849_f32;
     if fwd {
         let tmp = a.r;
         a.r = HSQT2 * (a.r + a.i);
@@ -382,7 +388,7 @@ fn rot_x45(a: &mut C, fwd: bool) {
 
 #[inline]
 fn rot_x135(a: &mut C, fwd: bool) {
-    const HSQT2: f64 = 0.707106781186547524400844362104849_f64;
+    const HSQT2: f32 = 0.707106781186547524400844362104849_f32;
     if fwd {
         let tmp = a.r;
         a.r = HSQT2 * (a.i - a.r);
@@ -447,7 +453,7 @@ fn pass8(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pair11(t: &[C; 11], x: [f64; 5], y: [f64; 5]) -> (C, C) {
+fn pair11(t: &[C; 11], x: [f32; 5], y: [f32; 5]) -> (C, C) {
     // These are overloaded complex operations in the source; contraction
     // does not cross the inlined operator boundaries.
     let ca = t[0]
@@ -478,18 +484,18 @@ fn pair11(t: &[C; 11], x: [f64; 5], y: [f64; 5]) -> (C, C) {
 fn pass11(ido: usize, l1: usize, cc: &[C], ch: &mut [C], wa: &[C], fwd: bool) {
     let s = if fwd { -1.0 } else { 1.0 };
     let xr = [
-        0.8412535328311811688618116489193677_f64,
-        0.4154150130018864255292741492296232_f64,
-        -0.1423148382732851404437926686163697_f64,
-        -0.6548607339452850640569250724662936_f64,
-        -0.9594929736144973898903680570663277_f64,
+        0.8412535328311811688618116489193677_f32,
+        0.4154150130018864255292741492296232_f32,
+        -0.1423148382732851404437926686163697_f32,
+        -0.6548607339452850640569250724662936_f32,
+        -0.9594929736144973898903680570663277_f32,
     ];
     let yi = [
-        s * 0.5406408174555975821076359543186917_f64,
-        s * 0.9096319953545183714117153830790285_f64,
-        s * 0.9898214418809327323760920377767188_f64,
-        s * 0.7557495743542582837740358439723444_f64,
-        s * 0.2817325568414296977114179153466169_f64,
+        s * 0.5406408174555975821076359543186917_f32,
+        s * 0.9096319953545183714117153830790285_f32,
+        s * 0.9898214418809327323760920377767188_f32,
+        s * 0.7557495743542582837740358439723444_f32,
+        s * 0.2817325568414296977114179153466169_f32,
     ];
     let xs = [
         [0, 1, 2, 3, 4],
@@ -746,7 +752,7 @@ impl CfftPlan {
         Self { length, factors }
     }
 
-    fn exec(&self, c: &mut [C], fct: f64, fwd: bool) {
+    fn exec(&self, c: &mut [C], fct: f32, fwd: bool) {
         if self.length == 1 {
             c[0] = c[0].mul(fct);
             return;
@@ -903,7 +909,7 @@ impl FftBlue {
             bk[m] = tmp.get(coeff);
         }
         let mut tbkf = vec![C::default(); n2];
-        let xn2 = 1.0 / n2 as f64;
+        let xn2 = 1.0 / n2 as f32;
         tbkf[0] = bk[0].mul(xn2);
         for m in 1..n {
             tbkf[m] = bk[m].mul(xn2);
@@ -923,7 +929,7 @@ impl FftBlue {
         }
     }
 
-    fn exec(&self, c: &mut [C], fct: f64, fwd: bool) {
+    fn exec(&self, c: &mut [C], fct: f32, fwd: bool) {
         let mut akf = vec![C::default(); self.n2];
         for m in 0..self.n {
             akf[m] = special_mul(c[m], self.bk[m], fwd);
@@ -972,7 +978,7 @@ impl PocketPlan {
         }
     }
 
-    fn exec(&self, c: &mut [C], fct: f64, fwd: bool) {
+    fn exec(&self, c: &mut [C], fct: f32, fwd: bool) {
         match self {
             Self::Pack(plan) => plan.exec(c, fct, fwd),
             Self::Blue(plan) => plan.exec(c, fct, fwd),
@@ -981,18 +987,18 @@ impl PocketPlan {
 }
 
 /// Complex-to-complex transform of one contiguous logical vector.
-pub fn c2c(input: &[C64], forward: bool, scale: f64) -> Vec<C64> {
+pub fn c2c(input: &[C32], forward: bool, scale: f32) -> Vec<C32> {
     let mut data: Vec<C> = input.iter().map(|z| C::new(z.re, z.im)).collect();
     PocketPlan::new(data.len()).exec(&mut data, scale, forward);
-    data.into_iter().map(|z| C64::new(z.r, z.i)).collect()
+    data.into_iter().map(|z| C32::new(z.r, z.i)).collect()
 }
 
 #[inline]
-fn mulpm(c: f64, d: f64, e: f64, f: f64) -> (f64, f64) {
+fn mulpm(c: f32, d: f32, e: f32, f: f32) -> (f32, f32) {
     (c.mul_add(e, d * f), c.mul_add(f, -(d * e)))
 }
 
-fn radf2(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+fn radf2(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
     let ci = |a, b, c| a + ido * (b + l1 * c);
     let hi = |a, b, c| a + ido * (b + 2 * c);
     for k in 0..l1 {
@@ -1027,7 +1033,7 @@ fn radf2(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
 }
 
 #[inline]
-fn rearrange(rx: &mut f64, ix: &mut f64, ry: &mut f64, iy: &mut f64) {
+fn rearrange(rx: &mut f32, ix: &mut f32, ry: &mut f32, iy: &mut f32) {
     let t1 = *rx + *ry;
     let t2 = *ry - *rx;
     let t3 = *ix + *iy;
@@ -1038,9 +1044,9 @@ fn rearrange(rx: &mut f64, ix: &mut f64, ry: &mut f64, iy: &mut f64) {
     *iy = t2;
 }
 
-fn radf3(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
-    const TAUR: f64 = -0.5;
-    const TAUI: f64 = 0.8660254037844386467637231707529362_f64;
+fn radf3(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
+    const TAUR: f32 = -0.5;
+    const TAUI: f32 = 0.8660254037844386467637231707529362_f32;
     let ci = |a, b, c| a + ido * (b + l1 * c);
     let hi = |a, b, c| a + ido * (b + 3 * c);
     for k in 0..l1 {
@@ -1079,8 +1085,8 @@ fn radf3(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radf4(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
-    const H: f64 = 0.707106781186547524400844362104849_f64;
+fn radf4(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
+    const H: f32 = 0.707106781186547524400844362104849_f32;
     let ci = |a, b, c| a + ido * (b + l1 * c);
     let hi = |a, b, c| a + ido * (b + 4 * c);
     for k in 0..l1 {
@@ -1141,11 +1147,11 @@ fn radf4(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radf5(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
-    const R1: f64 = 0.3090169943749474241022934171828191_f64;
-    const I1: f64 = 0.9510565162951535721164393333793821_f64;
-    const R2: f64 = -0.8090169943749474241022934171828191_f64;
-    const I2: f64 = 0.5877852522924731291687059546390728_f64;
+fn radf5(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
+    const R1: f32 = 0.3090169943749474241022934171828191_f32;
+    const I1: f32 = 0.9510565162951535721164393333793821_f32;
+    const R2: f32 = -0.8090169943749474241022934171828191_f32;
+    const I2: f32 = 0.5877852522924731291687059546390728_f32;
     let ci = |a, b, c| a + ido * (b + l1 * c);
     let hi = |a, b, c| a + ido * (b + 5 * c);
     for k in 0..l1 {
@@ -1210,7 +1216,7 @@ fn radf5(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radb2(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+fn radb2(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
     let ci = |a, b, c| a + ido * (b + 2 * c);
     let hi = |a, b, c| a + ido * (b + l1 * c);
     for k in 0..l1 {
@@ -1240,9 +1246,9 @@ fn radb2(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radb3(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
-    const R: f64 = -0.5;
-    const I: f64 = 0.8660254037844386467637231707529362_f64;
+fn radb3(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
+    const R: f32 = -0.5;
+    const I: f32 = 0.8660254037844386467637231707529362_f32;
     let ci = |a, b, c| a + ido * (b + 3 * c);
     let hi = |a, b, c| a + ido * (b + l1 * c);
     for k in 0..l1 {
@@ -1282,8 +1288,8 @@ fn radb3(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radb4(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
-    const S: f64 = 1.414213562373095048801688724209698_f64;
+fn radb4(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
+    const S: f32 = 1.414213562373095048801688724209698_f32;
     let ci = |a, b, c| a + ido * (b + 4 * c);
     let hi = |a, b, c| a + ido * (b + l1 * c);
     for k in 0..l1 {
@@ -1340,11 +1346,11 @@ fn radb4(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radb5(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
-    const R1: f64 = 0.3090169943749474241022934171828191_f64;
-    const I1: f64 = 0.9510565162951535721164393333793821_f64;
-    const R2: f64 = -0.8090169943749474241022934171828191_f64;
-    const I2: f64 = 0.5877852522924731291687059546390728_f64;
+fn radb5(ido: usize, l1: usize, cc: &[f32], ch: &mut [f32], wa: &[f32]) {
+    const R1: f32 = 0.3090169943749474241022934171828191_f32;
+    const I1: f32 = 0.9510565162951535721164393333793821_f32;
+    const R2: f32 = -0.8090169943749474241022934171828191_f32;
+    const I2: f32 = 0.5877852522924731291687059546390728_f32;
     let ci = |a, b, c| a + ido * (b + 5 * c);
     let hi = |a, b, c| a + ido * (b + l1 * c);
     for k in 0..l1 {
@@ -1406,7 +1412,7 @@ fn radb5(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
     }
 }
 
-fn radfg(ido: usize, ip: usize, l1: usize, cc: &mut [f64], ch: &mut [f64], wa: &[f64], cs: &[f64]) {
+fn radfg(ido: usize, ip: usize, l1: usize, cc: &mut [f32], ch: &mut [f32], wa: &[f32], cs: &[f32]) {
     let ipph = (ip + 1) / 2;
     let idl1 = ido * l1;
     let c1 = |a, b, c| a + ido * (b + l1 * c);
@@ -1573,7 +1579,7 @@ fn radfg(ido: usize, ip: usize, l1: usize, cc: &mut [f64], ch: &mut [f64], wa: &
     }
 }
 
-fn radbg(ido: usize, ip: usize, l1: usize, cc: &mut [f64], ch: &mut [f64], wa: &[f64], cs: &[f64]) {
+fn radbg(ido: usize, ip: usize, l1: usize, cc: &mut [f32], ch: &mut [f32], wa: &[f32], cs: &[f32]) {
     let ipph = (ip + 1) / 2;
     let idl1 = ido * l1;
     let cp = |a, b, c| a + ido * (b + ip * c);
@@ -1733,8 +1739,8 @@ fn radbg(ido: usize, ip: usize, l1: usize, cc: &mut [f64], ch: &mut [f64], wa: &
 
 struct RealFactor {
     fct: usize,
-    tw: Vec<f64>,
-    tws: Vec<f64>,
+    tw: Vec<f32>,
+    tws: Vec<f32>,
 }
 struct RealPack {
     length: usize,
@@ -1807,7 +1813,7 @@ impl RealPack {
         }
         Self { length, factors }
     }
-    fn exec(&self, c: &mut [f64], fct: f64, forward: bool) {
+    fn exec(&self, c: &mut [f32], fct: f32, forward: bool) {
         if self.length == 1 {
             c[0] *= fct;
             return;
@@ -1827,7 +1833,7 @@ impl RealPack {
                         radfg(ido, ip, l1, &mut ch, c, &factor.tw, &factor.tws)
                     }
                 } else {
-                    let run = |src: &[f64], dst: &mut [f64]| match ip {
+                    let run = |src: &[f32], dst: &mut [f32]| match ip {
                         2 => radf2(ido, l1, src, dst, &factor.tw),
                         3 => radf3(ido, l1, src, dst, &factor.tw),
                         4 => radf4(ido, l1, src, dst, &factor.tw),
@@ -1854,7 +1860,7 @@ impl RealPack {
                         radbg(ido, ip, l1, &mut ch, c, &factor.tw, &factor.tws)
                     }
                 } else {
-                    let run = |src: &[f64], dst: &mut [f64]| match ip {
+                    let run = |src: &[f32], dst: &mut [f32]| match ip {
                         2 => radb2(ido, l1, src, dst, &factor.tw),
                         3 => radb3(ido, l1, src, dst, &factor.tw),
                         4 => radb4(ido, l1, src, dst, &factor.tw),
@@ -1888,7 +1894,7 @@ impl RealPack {
 }
 
 impl FftBlue {
-    fn exec_real(&self, c: &mut [f64], fct: f64, forward: bool) {
+    fn exec_real(&self, c: &mut [f32], fct: f32, forward: bool) {
         let mut tmp = vec![C::default(); self.n];
         if forward {
             for m in 0..self.n {
@@ -1942,7 +1948,7 @@ impl RealPlan {
             Self::Pack(RealPack::new(n))
         }
     }
-    fn exec(&self, c: &mut [f64], fct: f64, forward: bool) {
+    fn exec(&self, c: &mut [f32], fct: f32, forward: bool) {
         match self {
             Self::Pack(p) => p.exec(c, fct, forward),
             Self::Blue(p) => p.exec_real(c, fct, forward),
@@ -1950,12 +1956,12 @@ impl RealPlan {
     }
 }
 
-pub fn r2c(input: &[f64], scale: f64) -> Vec<C64> {
+pub fn r2c(input: &[f32], scale: f32) -> Vec<C32> {
     let n = input.len();
     let mut data = input.to_vec();
     RealPlan::new(n).exec(&mut data, scale, true);
-    let mut out = vec![C64::new(0., 0.); n / 2 + 1];
-    out[0] = C64::new(data[0], 0.);
+    let mut out = vec![C32::new(0., 0.); n / 2 + 1];
+    out[0] = C32::new(data[0], 0.);
     for (k, z) in out.iter_mut().enumerate().skip(1) {
         z.re = data[2 * k - 1];
         if 2 * k < n {
@@ -1964,7 +1970,7 @@ pub fn r2c(input: &[f64], scale: f64) -> Vec<C64> {
     }
     out
 }
-pub fn c2r(input: &[C64], n: usize, scale: f64) -> Vec<f64> {
+pub fn c2r(input: &[C32], n: usize, scale: f32) -> Vec<f32> {
     let mut data = vec![0.; n];
     if let Some(z) = input.first() {
         data[0] = z.re;
@@ -1980,255 +1986,4 @@ pub fn c2r(input: &[C64], n: usize, scale: f64) -> Vec<f64> {
     }
     RealPlan::new(n).exec(&mut data, scale, false);
     data
-}
-
-fn decode_batch(mut flat: usize, shape: &[isize], axis: usize, index: &mut [isize]) {
-    for ax in (0..shape.len()).rev() {
-        if ax == axis {
-            index[ax] = 0;
-            continue;
-        }
-        let dim = shape[ax] as usize;
-        index[ax] = (flat % dim) as isize;
-        flat /= dim;
-    }
-}
-
-fn scale_f32(scale: f64, n: usize) -> f32 {
-    if scale == 1.0 {
-        1.0
-    } else if scale == 1.0 / n as f64 {
-        1.0f32 / n as f32
-    } else {
-        1.0f32 / (n as f32).sqrt()
-    }
-}
-
-/// Apply a complex transform independently along one ndarray axis.
-pub fn c2c_axis(
-    input: &NdArray,
-    n: usize,
-    axis: usize,
-    forward: bool,
-    scale: f64,
-    out_dtype: DType,
-) -> Result<NdArray> {
-    if n == 0 {
-        return Err(Error::ValueError(
-            "Invalid number of FFT data points (0) specified.".into(),
-        ));
-    }
-    if axis >= input.ndim() {
-        return Err(Error::IndexError("tuple index out of range".into()));
-    }
-    let mut shape = input.shape.clone();
-    shape[axis] = n as isize;
-    let output = NdArray::zeros(shape.clone(), out_dtype)?;
-    let batches = shape
-        .iter()
-        .enumerate()
-        .filter(|(ax, _)| *ax != axis)
-        .map(|(_, &d)| d as usize)
-        .product::<usize>();
-    let take = n.min(input.shape[axis] as usize);
-    let scaled_single = out_dtype == DType::C64 && scale != 1.0;
-    let mut src_index = vec![0isize; input.ndim()];
-    let mut dst_index = vec![0isize; input.ndim()];
-    for batch in 0..batches {
-        decode_batch(batch, &shape, axis, &mut src_index);
-        dst_index.copy_from_slice(&src_index);
-        if scaled_single {
-            let mut line = vec![Complex::<f32>::new(0.0, 0.0); n];
-            for (j, value) in line.iter_mut().take(take).enumerate() {
-                src_index[axis] = j as isize;
-                *value = match input.read_at(input.byte_index(&src_index)) {
-                    Scalar::Complex(value) => {
-                        Complex::new(value.re as f32, value.im as f32)
-                    }
-                    other => Complex::new(other.as_f64() as f32, 0.0),
-                };
-            }
-            for (j, value) in crate::fft_single::c2c(
-                &line,
-                forward,
-                scale_f32(scale, n),
-            )
-            .into_iter()
-            .enumerate()
-            {
-                dst_index[axis] = j as isize;
-                output.write_at(
-                    output.byte_index(&dst_index),
-                    Scalar::Complex(C64::new(value.re as f64, value.im as f64)),
-                );
-            }
-            continue;
-        }
-        let mut line = vec![C64::new(0.0, 0.0); n];
-        for (j, value) in line.iter_mut().take(take).enumerate() {
-            src_index[axis] = j as isize;
-            let scalar = input.read_at(input.byte_index(&src_index));
-            *value = match scalar {
-                Scalar::Complex(value) => value,
-                other => C64::new(other.as_f64(), 0.0),
-            };
-        }
-        let transformed = c2c(&line, forward, scale);
-        for (j, value) in transformed.into_iter().enumerate() {
-            dst_index[axis] = j as isize;
-            output.write_at(output.byte_index(&dst_index), Scalar::Complex(value));
-        }
-    }
-    Ok(output)
-}
-
-pub fn r2c_axis(
-    input: &NdArray,
-    n: usize,
-    axis: usize,
-    scale: f64,
-    out_dtype: DType,
-) -> Result<NdArray> {
-    let mut shape = input.shape.clone();
-    shape[axis] = (n / 2 + 1) as isize;
-    let output = NdArray::zeros(shape.clone(), out_dtype)?;
-    let batches = shape
-        .iter()
-        .enumerate()
-        .filter(|(a, _)| *a != axis)
-        .map(|(_, d)| *d as usize)
-        .product();
-    let take = n.min(input.shape[axis] as usize);
-    let scaled_single = out_dtype == DType::C64 && scale != 1.0;
-    let mut si = vec![0isize; input.ndim()];
-    let mut di = si.clone();
-    for batch in 0..batches {
-        decode_batch(batch, &shape, axis, &mut si);
-        di.copy_from_slice(&si);
-        if scaled_single {
-            let mut line = vec![0.0f32; n];
-            for j in 0..take {
-                si[axis] = j as isize;
-                line[j] = input.read_at(input.byte_index(&si)).as_f64() as f32;
-            }
-            for (j, z) in crate::fft_single::r2c(&line, scale_f32(scale, n))
-                .into_iter()
-                .enumerate()
-            {
-                di[axis] = j as isize;
-                output.write_at(
-                    output.byte_index(&di),
-                    Scalar::Complex(C64::new(z.re as f64, z.im as f64)),
-                );
-            }
-            continue;
-        }
-        let mut line = vec![0.; n];
-        for j in 0..take {
-            si[axis] = j as isize;
-            line[j] = input.read_at(input.byte_index(&si)).as_f64();
-        }
-        for (j, z) in r2c(&line, scale).into_iter().enumerate() {
-            di[axis] = j as isize;
-            output.write_at(output.byte_index(&di), Scalar::Complex(z));
-        }
-    }
-    Ok(output)
-}
-
-pub fn c2r_axis(
-    input: &NdArray,
-    n: usize,
-    axis: usize,
-    scale: f64,
-    out_dtype: DType,
-) -> Result<NdArray> {
-    let mut shape = input.shape.clone();
-    shape[axis] = n as isize;
-    let output = NdArray::zeros(shape.clone(), out_dtype)?;
-    let batches = shape
-        .iter()
-        .enumerate()
-        .filter(|(a, _)| *a != axis)
-        .map(|(_, d)| *d as usize)
-        .product();
-    let take = (n / 2 + 1).min(input.shape[axis] as usize);
-    let scaled_single = out_dtype == DType::F32 && scale != 1.0;
-    let mut si = vec![0isize; input.ndim()];
-    let mut di = si.clone();
-    for batch in 0..batches {
-        decode_batch(batch, &shape, axis, &mut si);
-        di.copy_from_slice(&si);
-        if scaled_single {
-            let mut line = vec![Complex::<f32>::new(0.0, 0.0); take];
-            for (j, value) in line.iter_mut().enumerate() {
-                si[axis] = j as isize;
-                *value = match input.read_at(input.byte_index(&si)) {
-                    Scalar::Complex(value) => {
-                        Complex::new(value.re as f32, value.im as f32)
-                    }
-                    other => Complex::new(other.as_f64() as f32, 0.0),
-                };
-            }
-            for (j, value) in crate::fft_single::c2r(
-                &line,
-                n,
-                scale_f32(scale, n),
-            )
-            .into_iter()
-            .enumerate()
-            {
-                di[axis] = j as isize;
-                output.write_at(
-                    output.byte_index(&di),
-                    Scalar::Float(value as f64),
-                );
-            }
-            continue;
-        }
-        let mut line = vec![C64::new(0., 0.); take];
-        for (j, z) in line.iter_mut().enumerate() {
-            si[axis] = j as isize;
-            *z = match input.read_at(input.byte_index(&si)) {
-                Scalar::Complex(v) => v,
-                v => C64::new(v.as_f64(), 0.),
-            };
-        }
-        for (j, x) in c2r(&line, n, scale).into_iter().enumerate() {
-            di[axis] = j as isize;
-            output.write_at(output.byte_index(&di), Scalar::Float(x));
-        }
-    }
-    Ok(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn simple_forward_and_inverse() {
-        let input = [1.0, 2.0, 3.0, 4.0].map(|x| C64::new(x, 0.0));
-        let got = c2c(&input, true, 1.0);
-        assert_eq!(
-            got,
-            vec![
-                C64::new(10.0, 0.0),
-                C64::new(-2.0, 2.0),
-                C64::new(-2.0, 0.0),
-                C64::new(-2.0, -2.0)
-            ]
-        );
-        let back = c2c(&got, false, 0.25);
-        for (a, b) in back.iter().zip(input) {
-            assert!((a - b).norm() < 1e-14);
-        }
-    }
-
-    #[test]
-    fn real_forward_and_inverse() {
-        let input = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let spectrum = r2c(&input, 1.0);
-        let back = c2r(&spectrum, input.len(), 1.0 / input.len() as f64);
-        assert_eq!(back, input);
-    }
 }

@@ -348,7 +348,15 @@ def broadcast_to(array, shape, subok=False):
 _rnp_asarray = asarray
 
 
-def asarray(obj, dtype=None):
+def asarray(obj, dtype=None, order=None, *, device=None, copy=None, like=None):
+    if device is not None and device != "cpu":
+        raise ValueError(
+            f'Device not understood. Only "cpu" is allowed, but received: {device}'
+        )
+    if order is not None or copy is not None:
+        return globals()["array"](
+            obj, dtype, copy=copy, order="K" if order is None else order
+        )
     _text = _text_scalar(obj, dtype)
     if _text is not None:
         return _text
