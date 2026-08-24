@@ -625,13 +625,18 @@ def _split(line, delimiter):
 
 def _dtype_converter(dt):
     kind = dt.kind
+    def numeric(converter, text):
+        text = text.strip()
+        if "_" in text or any(ch.isspace() for ch in text):
+            raise ValueError(f"invalid numeric token: {text!r}")
+        return converter(text)
+
     if kind == "f":
-        return float
+        return lambda s: numeric(float, s)
     if kind in "iu":
-        return lambda s: int(float(s)) if ("." in s or "e" in s or "E" in s) \
-            else int(s)
+        return lambda s: numeric(int, s)
     if kind == "c":
-        return lambda s: complex(s.replace(" ", ""))
+        return lambda s: numeric(complex, s.replace("+-", "-"))
     if kind == "b":
         return lambda s: bool(_bool_from_text(s))
     if kind in "US":
@@ -641,6 +646,8 @@ def _dtype_converter(dt):
 
 def _bool_from_text(s):
     t = s.strip().lower()
+    if "_" in t:
+        raise ValueError(f"invalid boolean token: {s!r}")
     if t in ("true", "1", "t", "yes"):
         return True
     if t in ("false", "0", "f", "no", ""):
@@ -705,6 +712,66 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
     """Load data from a text file."""
     if like is not None:
         raise NotImplementedError("loadtxt: `like=` is not supported")
+
+    def text_control(value):
+        return (value.decode("latin-1")
+                if isinstance(value, (bytes, bytearray)) else value)
+
+    delimiter = text_control(delimiter)
+    quotechar = text_control(quotechar)
+    if comments is None:
+        comment_list = []
+    elif isinstance(comments, (str, bytes, bytearray)):
+        comment_list = [text_control(comments)]
+    else:
+        comment_list = [text_control(item) for item in comments]
+
+    if any(comment == "" for comment in comment_list):
+        raise ValueError("comments cannot be an empty string")
+    for name, control in (("delimiter", delimiter),
+                          ("quotechar", quotechar)):
+        if isinstance(control, str) and len(control) != 1:
+            raise TypeError(
+                "Text reading control character must be a single unicode "
+                f"character or None; but got: {control!r}")
+        if control in ("\n", "\r"):
+            raise TypeError(
+                f"control character {name!r} cannot be a newline")
+    if any(comment in ("\n", "\r") for comment in comment_list):
+        raise TypeError("control character 'comment' cannot be a newline")
+    if quotechar is not None and (
+            len(comment_list) > 1 or any(len(c) != 1 for c in comment_list)):
+        raise ValueError(
+            "when multiple comments or a multi-character comment is given, "
+            "quotes are not supported.")
+    if isinstance(delimiter, str):
+        if delimiter in comment_list:
+            if len(comment_list) > 1:
+                raise TypeError(
+                    "Comment characters cannot include the delimiter")
+            raise TypeError(
+                "The values for control characters 'comment' and "
+                "'delimiter' are incompatible")
+        if quotechar == delimiter:
+            raise TypeError(
+                "The values for control characters 'quote' and 'delimiter' "
+                "are incompatible")
+    elif delimiter is None:
+        if any(c.isspace() for c in comment_list):
+            raise TypeError(
+                "The values for control characters 'comment' and "
+                "'delimiter' are incompatible")
+        if isinstance(quotechar, str) and quotechar.isspace():
+            raise TypeError(
+                "The values for control characters 'quote' and 'delimiter' "
+                "are incompatible")
+    if quotechar is not None and quotechar in comment_list:
+        raise TypeError(
+            "The values for control characters 'comment' and 'quote' are "
+            "incompatible")
+
+    comments = (None if comments is None else
+                comment_list[0] if len(comment_list) == 1 else comment_list)
     dt = _as_dtype(dtype)
     if dt.names is not None:
         raise NotImplementedError(
