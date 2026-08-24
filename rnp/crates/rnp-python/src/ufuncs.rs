@@ -369,6 +369,19 @@ pub fn _ufunc_call<'py>(
             inputs = inputs.iter().map(|a| a.astype(dt)).collect();
         }
     }
+    if let Some(o) = out.filter(|o| !o.is_none()) {
+        let target = o
+            .cast::<PyNdArray>()
+            .map_err(|_| PyTypeError::new_err("return arrays must be of ArrayType"))?
+            .borrow()
+            .arr
+            .shape
+            .clone();
+        inputs = inputs
+            .iter()
+            .map(|a| rnp_core::iter::broadcast_to(a, &target).map_err(crate::err))
+            .collect::<PyResult<_>>()?;
+    }
 
     let (res, res2) = match f {
         Ufn::Un(op) => {
