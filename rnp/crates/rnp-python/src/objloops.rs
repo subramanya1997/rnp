@@ -928,6 +928,11 @@ mod tests {
 
     #[test]
     fn no_loop_message_is_numpys() {
+        // `cargo test` links the extension without the `auto-initialize`
+        // feature, so the interpreter has to be started by hand before any
+        // Python API is touched. Idempotent, so it is safe with several
+        // tests sharing one process.
+        Python::initialize();
         let e = no_loop_error("isnan");
         Python::attach(|py| {
             assert_eq!(
