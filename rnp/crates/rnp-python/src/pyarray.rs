@@ -18,7 +18,7 @@ use crate::convert::{array_from_any, flexible_to_py, npflexible_to_py, npscalar_
 use rnp_core::printing;
 use crate::pydtype::{descr_from_any, dtype_from_any, PyDType};
 
-#[pyclass(name = "ndarray", module = "_rnp", subclass)]
+#[pyclass(name = "ndarray", module = "_rnp", subclass, weakref)]
 pub struct PyNdArray {
     pub arr: NdArray,
     /// numpy's `a.base`: the object that actually owns the memory. Views of
@@ -1141,6 +1141,174 @@ impl PyNdArray {
 
     fn __copy__(&self, py: Python<'_>) -> PyResult<Py<PyNdArray>> {
         self.copy(py)
+    }
+
+    // ---- straggler cluster (see `straggler.rs` for the contracts) -------
+
+    #[pyo3(signature = (order = None))]
+    fn tobytes<'py>(
+        &self,
+        py: Python<'py>,
+        order: Option<&str>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        crate::straggler::tobytes_impl(py, &self.arr, order)
+    }
+
+    #[pyo3(signature = (order = None))]
+    fn tostring<'py>(
+        &self,
+        py: Python<'py>,
+        order: Option<&str>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        crate::straggler::tobytes_impl(py, &self.arr, order)
+    }
+
+    #[pyo3(signature = (min = None, max = None, out = None, **kwargs))]
+    fn clip<'py>(
+        &self,
+        py: Python<'py>,
+        min: Option<&Bound<'py, PyAny>>,
+        max: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = kwargs;
+        crate::straggler::clip_impl(py, &self.arr, min, max, out)
+    }
+
+    #[pyo3(signature = (out = None))]
+    fn conjugate<'py>(
+        slf: &Bound<'py, Self>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::straggler::conjugate_impl(slf, out)
+    }
+
+    #[pyo3(signature = (out = None))]
+    fn conj<'py>(
+        slf: &Bound<'py, Self>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::straggler::conjugate_impl(slf, out)
+    }
+
+    #[pyo3(signature = (*shape, refcheck = None))]
+    fn resize(
+        slf: &Bound<'_, Self>,
+        shape: &Bound<'_, PyTuple>,
+        refcheck: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        // numpy accepts `a.resize(2, 3)`, `a.resize((2, 3))` and `a.resize()`
+        // / `a.resize(None)` (both no-ops), and nothing else.
+        let check = match refcheck {
+            None => true,
+            Some(o) => o.extract::<isize>().map(|v| v != 0).map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    o.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+                ))
+            })?,
+        };
+        let want = if shape.is_empty() {
+            return Ok(());
+        } else if shape.len() == 1 && shape.get_item(0)?.is_none() {
+            return Ok(());
+        } else if shape.len() == 1 && !shape.get_item(0)?.extract::<isize>().is_ok() {
+            shape_from_any(&shape.get_item(0)?)?
+        } else {
+            shape_from_args(shape)?
+        };
+        crate::straggler::resize_impl(slf, want, check)
+    }
+
+    #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
+                        where_ = None, mean = None, correction = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn var<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        ddof: f64,
+        keepdims: bool,
+        where_: Option<&Bound<'py, PyAny>>,
+        mean: Option<&Bound<'py, PyAny>>,
+        correction: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = mean;
+        let dd = correction.unwrap_or(ddof);
+        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, where_, false)
+    }
+
+    #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
+                        where_ = None, mean = None, correction = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn std<'py>(
+        &self,
+        py: Python<'py>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+        ddof: f64,
+        keepdims: bool,
+        where_: Option<&Bound<'py, PyAny>>,
+        mean: Option<&Bound<'py, PyAny>>,
+        correction: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = mean;
+        let dd = correction.unwrap_or(ddof);
+        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, where_, true)
+    }
+
+    #[pyo3(signature = (dtype, offset = 0))]
+    fn getfield(
+        slf: &Bound<'_, Self>,
+        dtype: &Bound<'_, PyAny>,
+        offset: isize,
+    ) -> PyResult<Py<PyNdArray>> {
+        crate::straggler::getfield_impl(slf, dtype, offset)
+    }
+
+    #[pyo3(signature = (val, dtype, offset = 0))]
+    fn setfield(
+        slf: &Bound<'_, Self>,
+        val: &Bound<'_, PyAny>,
+        dtype: &Bound<'_, PyAny>,
+        offset: isize,
+    ) -> PyResult<()> {
+        crate::straggler::setfield_impl(slf, val, dtype, offset)
+    }
+
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        crate::straggler::reduce_impl(slf)
+    }
+
+    fn __setstate__(slf: &Bound<'_, Self>, state: &Bound<'_, PyAny>) -> PyResult<()> {
+        crate::straggler::setstate_impl(slf, state)
+    }
+
+    /// `a.dumps()` — the pickled array as bytes.
+    fn dumps<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        py.import("pickle")?.call_method1("dumps", (slf,))
+    }
+
+    /// `a.dump(file)` — pickle the array to a path or open file object.
+    fn dump(slf: &Bound<'_, Self>, file: &Bound<'_, PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let pickle = py.import("pickle")?;
+        if file.hasattr("write")? {
+            pickle.call_method1("dump", (slf, file))?;
+            return Ok(());
+        }
+        let f = py
+            .import("builtins")?
+            .call_method1("open", (file, "wb"))?;
+        let res = pickle.call_method1("dump", (slf, &f));
+        f.call_method0("close")?;
+        res?;
+        Ok(())
     }
 
     fn fill(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {

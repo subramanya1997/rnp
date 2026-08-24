@@ -18,6 +18,7 @@ mod pyarray;
 mod objects;
 mod objloops;
 mod pydtype;
+mod straggler;
 mod ufuncs;
 
 use convert::{any_scalar, array_from_any, array_from_any_descr, scalar_from_py};
@@ -938,6 +939,9 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(itemsel::where_, m)?)?;
     m.add_function(wrap_pyfunction!(itemsel::broadcast_to, m)?)?;
     m.add_function(wrap_pyfunction!(itemsel::_as_strided, m)?)?;
+    m.add_function(wrap_pyfunction!(straggler::lexsort, m)?)?;
+    m.add_function(wrap_pyfunction!(straggler::_reconstruct, m)?)?;
+    m.add_function(wrap_pyfunction!(straggler::_c_concat, m)?)?;
 
     m.add_function(wrap_pyfunction!(_set_error_factories, m)?)?;
 

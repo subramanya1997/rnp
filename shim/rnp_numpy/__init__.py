@@ -673,6 +673,104 @@ def swapaxes(a, axis1, axis2):
     return _asarr(a).swapaxes(axis1, axis2)
 
 
+# ---- straggler cluster -----------------------------------------------------
+
+from _rnp import lexsort as lexsort  # noqa: E402
+from _rnp import _reconstruct as _reconstruct  # noqa: E402
+from _rnp import _c_concat as _c_concat  # noqa: E402
+
+_NoValue = _sc._NoValue if hasattr(_sc, "_NoValue") else None
+
+
+def clip(a, a_min=_builtins.Ellipsis, a_max=_builtins.Ellipsis, out=None, **kwargs):
+    """`np.clip`. numpy 2 accepts positional-or-keyword `min`/`max` aliases."""
+    if a_min is _builtins.Ellipsis:
+        a_min = kwargs.pop("min", None)
+    if a_max is _builtins.Ellipsis:
+        a_max = kwargs.pop("max", None)
+    kwargs.pop("casting", None)
+    return _asarr(a).clip(a_min, a_max, out, **kwargs)
+
+
+def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
+        where=None, mean=None, correction=None):
+    return _asarr(a).var(axis, dtype, out, ddof, keepdims,
+                         where_=where, mean=mean, correction=correction)
+
+
+def std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
+        where=None, mean=None, correction=None):
+    return _asarr(a).std(axis, dtype, out, ddof, keepdims,
+                         where_=where, mean=mean, correction=correction)
+
+
+def conjugate(a, out=None):
+    return _asarr(a).conjugate(out)
+
+
+conj = conjugate
+
+
+def resize(a, new_shape):
+    """`np.resize` — a *new* array, tiling `a` to fill it (unlike the method,
+    which zero-fills in place)."""
+    a = _asarr(a)
+    if isinstance(new_shape, (int, _sc.integer)):
+        new_shape = (int(new_shape),)
+    new_shape = tuple(int(d) for d in new_shape)
+    total = 1
+    for d in new_shape:
+        total *= d
+    flat = _flat_values(a)
+    if not flat:
+        return zeros(new_shape, a.dtype)
+    filled = [flat[i % len(flat)] for i in range(total)]
+    return array(filled, dtype=a.dtype).reshape(new_shape)
+
+
+def save(file, arr, allow_pickle=True, fix_imports=_builtins.bool(True)):
+    """`np.save` — this port stores the pickle stream, which `np.load` reads
+    back. numpy's own `.npy` container is not reproduced."""
+    import pickle as _pickle
+
+    arr = _asarr(arr)
+    if hasattr(file, "write"):
+        _pickle.dump(arr, file)
+        return
+    name = _builtins.str(file)
+    if not name.endswith(".npy"):
+        name += ".npy"
+    with _builtins.open(name, "wb") as fh:
+        _pickle.dump(arr, fh)
+
+
+def load(file, mmap_mode=None, allow_pickle=False, fix_imports=True,
+         encoding="ASCII", *, max_header_size=None):
+    import pickle as _pickle
+
+    if hasattr(file, "read"):
+        return _pickle.load(file)
+    name = _builtins.str(file)
+    try:
+        fh = _builtins.open(name, "rb")
+    except FileNotFoundError:
+        fh = _builtins.open(name + ".npy", "rb")
+    with fh:
+        return _pickle.load(fh)
+
+
+class _CClass:
+    """`np.c_` — column-wise concatenation of the indexed operands."""
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        return _c_concat(key)
+
+
+c_ = _CClass()
+
+
 class _IndexExpression:
     """numpy's `np.s_` / `np.index_exp`."""
 
@@ -1139,13 +1237,13 @@ for _name in (
     "vdot", "inner", "outer", "tensordot", "einsum", "cross", "trace",
     "diagonal", "cumsum", "cumprod", "diff", "gradient", "histogram",
     "linspace", "logspace", "geomspace", "meshgrid", "roll", "rot90", "flip",
-    "tile", "unique", "sort_complex", "clip", "round", "around", "ptp",
-    "var", "std", "median", "average", "correlate", "convolve", "count_nonzero",
+    "tile", "unique", "sort_complex", "round", "around", "ptp",
+    "median", "average", "correlate", "convolve", "count_nonzero",
     "isclose", "allclose", "array_equiv", "moveaxis", "rollaxis", "expand_dims",
     "split", "array_split", "dsplit", "hsplit", "vsplit", "dstack", "column_stack",
-    "append", "insert", "delete", "resize", "trim_zeros", "fromfunction",
+    "append", "insert", "delete", "trim_zeros", "fromfunction",
     "frombuffer", "fromfile", "fromiter", "fromstring", "loadtxt", "savetxt",
-    "save", "load", "matmul", "vecdot", "packbits", "unpackbits", "digitize",
+    "matmul", "vecdot", "packbits", "unpackbits", "digitize",
     "select", "piecewise", "extract", "place", "copyto", "shares_memory",
     "may_share_memory", "apply_along_axis", "asanyarray", "ascontiguousarray",
     "asfortranarray", "require", "nan_to_num",  "angle",
@@ -1154,7 +1252,7 @@ for _name in (
     "base_repr", "binary_repr", "info", "who",
     "from_dlpack",
     "nested_iters",
-    "lexsort", "bincount", "ravel_multi_index", "unravel_index",
+    "bincount", "ravel_multi_index", "unravel_index",
     "setdiff1d", "union1d", "intersect1d", "in1d", "isin", "genfromtxt",
     "memmap", "nditer", "broadcast", "errstate_unavailable",
 ):
