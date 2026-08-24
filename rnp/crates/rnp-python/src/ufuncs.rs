@@ -346,6 +346,9 @@ pub fn _ufunc_call<'py>(
     casting: Option<&str>,
     dtype: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // A cast performed while constructing an earlier operand must never be
+    // attributed to this ufunc.  Every ufunc owns a fresh accumulator window.
+    fpe::clear();
     let _ = casting;
     let objs: Vec<Bound<'py, PyAny>> = args.iter().collect();
     // Object operands take the object loop, which dispatches to the elements'
@@ -953,7 +956,9 @@ pub fn _scalar_cast<'py>(
             }
         },
     };
-    crate::convert::scalar_to_py(py, s.cast(dt))
+    let out = crate::convert::scalar_to_py(py, s.cast(dt))?;
+    report_fpe(py, "cast")?;
+    Ok(out)
 }
 
 /// `scalar OP scalar` / `scalar OP python-number`, with NEP 50 weakness.

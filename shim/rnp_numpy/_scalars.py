@@ -231,6 +231,30 @@ class generic(metaclass=_ScalarMeta):
         a = _rnp.array(self._v, dtype=self.dtype)
         return a if dtype is None else a.astype(dtype)
 
+    def __buffer__(self, flags):
+        """Export the immutable PEP 3118 view used by NumPy scalars."""
+        if self.dtype.kind in "Mm":
+            # NumPy exposes datetime/timedelta scalar storage as eight raw
+            # bytes because PEP 3118 has no datetime format code.
+            raw = _builtins.int(self._v).to_bytes(
+                8, "little", signed=True)
+            return memoryview(raw)
+        if self.dtype.kind == "V" and self.dtype.fields is not None:
+            def has_datetime(d):
+                if d.kind in "Mm":
+                    return True
+                if d.subdtype is not None:
+                    return has_datetime(d.subdtype[0])
+                if d.fields is not None:
+                    return any(has_datetime(d.fields[name][0])
+                               for name in d.names)
+                return False
+
+            if has_datetime(self.dtype):
+                raise ValueError(
+                    "cannot include dtype 'M' in a buffer")
+        return memoryview(self.__array__()).toreadonly()
+
     def __len__(self):
         raise TypeError(f"len() of unsized object")
 

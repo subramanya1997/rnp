@@ -30,6 +30,29 @@ for _n in _NAMES:
     globals()[_n] = _missing(_n)
 
 
+def get_buffer_info(obj, flags):
+    """Request a buffer and return its ``(shape, strides)`` pair.
+
+    This is the observable part of NumPy's C test helper.  A writable request
+    against a scalar has NumPy's scalar-specific error text.
+    """
+    from .. import ndarray
+    known = {
+        "SIMPLE", "WRITABLE", "STRIDES", "ND", "C_CONTIGUOUS",
+        "F_CONTIGUOUS", "ANY_CONTIGUOUS", "INDIRECT", "FORMAT",
+        "STRIDED", "STRIDED_RO", "RECORDS", "RECORDS_RO", "FULL",
+        "FULL_RO", "CONTIG", "CONTIG_RO",
+    }
+    if any(flag not in known for flag in flags):
+        raise ValueError("invalid flag used.")
+    if "WRITABLE" in flags and not isinstance(obj, ndarray):
+        raise BufferError("scalar buffer is readonly")
+    view = memoryview(obj)
+    if "WRITABLE" in flags and view.readonly:
+        raise BufferError("Object is not writable")
+    return view.shape, view.strides
+
+
 # ---------------------------------------------------------------------------
 # npy_argparse — the C fast-call argument parser, exercised by test_argparse.py
 # ---------------------------------------------------------------------------

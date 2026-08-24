@@ -10,6 +10,15 @@ from . import _dtype_table, dtype
 __all__ = []
 
 
+def register_dlpack_dtype(dlpack_key, dtype, /):
+    """Register a third-party ``(DLPack code, bits)`` dtype mapping."""
+    from _rnp import _register_dlpack_dtype
+    return _register_dlpack_dtype(dlpack_key, dtype)
+
+
+__all__.append("register_dlpack_dtype")
+
+
 class _DTypeMeta(type):
     def __repr__(cls):
         return f"<class 'numpy.dtypes.{cls.__name__}'>"
