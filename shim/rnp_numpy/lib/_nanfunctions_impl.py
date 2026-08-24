@@ -571,12 +571,26 @@ def nanargmin(a, axis=None, out=None, *, keepdims=np._NoValue):
     array([1, 0])
 
     """
+    subtype = (type(a) if isinstance(a, np.ndarray) and
+               type(a) is not np.ndarray else None)
     a, mask = _replace_nan(a, np.inf)
     if mask is not None and mask.size:
         mask = np.all(mask, axis=axis)
         if np.any(mask):
             raise ValueError("All-NaN slice encountered")
-    res = np.argmin(a, axis=axis, out=out, keepdims=keepdims)
+    kwargs = {} if keepdims is np._NoValue else {"keepdims": keepdims}
+    try:
+        res = np.argmin(a, axis=axis, **kwargs)
+    except ValueError as exc:
+        if "zero-size array" in str(exc):
+            raise ValueError(
+                "attempt to get argmin of an empty sequence") from None
+        raise
+    if isinstance(res, np.ndarray) and subtype is not None:
+        res = res.view(subtype)
+    if out is not None:
+        out[...] = res
+        return out
     return res
 
 
@@ -633,12 +647,26 @@ def nanargmax(a, axis=None, out=None, *, keepdims=np._NoValue):
     array([1, 1])
 
     """
+    subtype = (type(a) if isinstance(a, np.ndarray) and
+               type(a) is not np.ndarray else None)
     a, mask = _replace_nan(a, -np.inf)
     if mask is not None and mask.size:
         mask = np.all(mask, axis=axis)
         if np.any(mask):
             raise ValueError("All-NaN slice encountered")
-    res = np.argmax(a, axis=axis, out=out, keepdims=keepdims)
+    kwargs = {} if keepdims is np._NoValue else {"keepdims": keepdims}
+    try:
+        res = np.argmax(a, axis=axis, **kwargs)
+    except ValueError as exc:
+        if "zero-size array" in str(exc):
+            raise ValueError(
+                "attempt to get argmax of an empty sequence") from None
+        raise
+    if isinstance(res, np.ndarray) and subtype is not None:
+        res = res.view(subtype)
+    if out is not None:
+        out[...] = res
+        return out
     return res
 
 
