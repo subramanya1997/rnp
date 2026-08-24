@@ -10,6 +10,7 @@ use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod adopt;
 mod convert;
+mod dlpack;
 mod fields;
 mod index;
 mod itemsel;
@@ -1251,6 +1252,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_register_datetime_factory, m)?)?;
     ufuncs::register(m)?;
     linalgops::register(m)?;
+    dlpack::register(m)?;
 
     m.add("__version__", "0.1.0")?;
     Ok(())

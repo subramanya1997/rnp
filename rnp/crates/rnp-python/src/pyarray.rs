@@ -949,6 +949,22 @@ impl PyNdArray {
         PyNdArray::into_py_any(self.arr.copy(), py)
     }
 
+    /// Export this CPU array using the legacy or versioned DLPack capsule ABI.
+    #[pyo3(signature = (stream = None, *, max_version = None, dl_device = None, copy = None))]
+    fn __dlpack__(
+        slf: &Bound<'_, Self>,
+        stream: Option<&Bound<'_, PyAny>>,
+        max_version: Option<&Bound<'_, PyAny>>,
+        dl_device: Option<&Bound<'_, PyAny>>,
+        copy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::dlpack::export(slf, stream, max_version, dl_device, copy)
+    }
+
+    fn __dlpack_device__(&self) -> (i32, i32) {
+        (1, 0)
+    }
+
     /// numpy's array interface (version 3). `strides` is `None` exactly when
     /// the array is C-contiguous, which is what numpy reports.
     #[getter]

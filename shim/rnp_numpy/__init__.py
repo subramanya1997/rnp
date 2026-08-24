@@ -32,6 +32,7 @@ from _rnp import (
     flatiter,
     flatnonzero,
     frombuffer,
+    from_dlpack,
     full,
     greater,
     greater_equal,
@@ -56,6 +57,7 @@ from _rnp import (
     true_divide,
     zeros,
 )
+from _rnp import _dlpack_registry_replace, _register_dlpack_dtype
 from _rnp import where_ as where
 from _rnp import _dtype_table as _dtype_table
 import _rnp
@@ -1452,7 +1454,6 @@ for _name in (
     "asmatrix", "bmat", "poly1d", "recarray", "chararray",
     "vectorize", "frompyfunc",
     "base_repr", "binary_repr", "info", "who",
-    "from_dlpack",
     "nested_iters",
     "bincount", "ravel_multi_index", "unravel_index",
     "setdiff1d", "union1d", "intersect1d", "in1d", "isin", "genfromtxt",

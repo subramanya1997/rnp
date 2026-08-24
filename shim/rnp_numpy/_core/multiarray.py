@@ -15,6 +15,7 @@ from .. import (  # noqa: F401
     flatiter,
     flatnonzero,
     frombuffer,
+    from_dlpack,
     full,
     ndarray,
     nonzero,
@@ -27,6 +28,7 @@ from .. import (  # noqa: F401
     where,
     zeros,
 )
+from _rnp import _dlpack_registry_replace, _register_dlpack_dtype  # noqa: F401
 from .._stubs import not_implemented
 
 # numpy exposes the ABI/API version numbers of the C extension here. The port
