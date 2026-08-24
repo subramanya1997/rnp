@@ -8,7 +8,8 @@ use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::{OnceLock, RwLock};
 use pyo3::types::{
-    PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyMappingProxy, PyString, PyTuple, PyType,
+    PyBool, PyBytes, PyComplex, PyDict, PyFloat, PyInt, PyList, PyMappingProxy, PyString, PyTuple,
+    PyType,
 };
 use pyo3::PyTypeInfo;
 
@@ -327,6 +328,21 @@ pub fn descr_from_any_aligned(obj: &Bound<'_, PyAny>, align: bool) -> PyResult<D
     }
     if let Ok(s) = obj.cast::<PyString>() {
         let name = s.to_str()?;
+        return Descr::parse(name)
+            .ok_or_else(|| PyTypeError::new_err(format!("data type '{}' not understood", name)));
+    }
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        let bytes = b.as_bytes();
+        let legacy = [
+            "?", "b", "B", "h", "H", "i", "I", "l", "L", "q", "Q", "f", "d", "g", "F",
+            "D", "G", "O", "S", "U", "V", "M8", "m8", "e",
+        ];
+        let name = if bytes.len() == 1 && (bytes[0] as usize) < legacy.len() {
+            legacy[bytes[0] as usize]
+        } else {
+            std::str::from_utf8(bytes)
+                .map_err(|_| PyTypeError::new_err("data type not understood"))?
+        };
         return Descr::parse(name)
             .ok_or_else(|| PyTypeError::new_err(format!("data type '{}' not understood", name)));
     }
