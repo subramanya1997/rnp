@@ -1,22 +1,14 @@
-//! The two CBLAS entry points numpy's `matmul.c.src` reaches for the
-//! *conjugating* dot product, bound to the same library numpy is linked
-//! against.
+//! The Accelerate CBLAS entry points numpy's `matmul.c.src` reaches for
+//! complex `vecdot` and `vecmat`, bound to the same library and ABI as numpy.
 //!
 //! Everything else in this crate is from-scratch Rust, and deliberately so.
 //! This module is the one exception, for a reason that is not a shortcut:
-//! `@TYPE@_dotc` routes to `cblas_?dotc_sub` whenever both operand strides are
-//! usable, so on this platform numpy's answer for `vecdot`/`vecmat` on complex
-//! input is *literally* Apple Accelerate's answer. That answer is not
-//! reproducible by transcription. Concretely, for `vecmat` over the
-//! special-value grid Accelerate returns an imaginary part of `-nan` for
-//! `x = nan+0j, y = nan+0j` but `+nan` for `x = inf+0j, y = nan+0j`, while in
-//! both cases every f64 intermediate is bit-identical (`nan*0` and `inf*0`
-//! both yield `+0x7ff8000000000000`, and `xi`/`yi` are `+0.0`). Only an
-//! explicit `FNEG` can produce a negative NaN on AArch64, so no straight-line
-//! expression can separate the two -- verified by an exhaustive search over
-//! the plain and fused formulations of `xr*yi - xi*yr`. Calling the same
-//! routine numpy calls is therefore the only faithful option, and it is the
-//! same choice already made for the complex libm functions.
+//! `@TYPE@_dotc` routes to `cblas_?dotc_sub` whenever both iterator-provided
+//! operand strides are usable. Complex `vecmat` first tries
+//! `cblas_?gemm(..., CblasConjTrans, ...)` and reaches `dotc` only when that
+//! 2-D predicate fails. The iterator detail matters: a length-1 core axis has
+//! stride zero even when the source ndarray reports an item-sized stride, so
+//! that case stays in numpy's scalar fallback.
 //!
 //! Which symbol: the numpy wheel in `.venv` links
 //! `_cblas_zdotc_sub$NEWLAPACK$ILP64` (checked with `nm -u` on
@@ -25,9 +17,12 @@
 //! `CBLAS_INT_MAX` `NPY_MAX_INT64` and `NPY_CBLAS_CHUNK` `NPY_MAX_INTP`, which
 //! is why the chunking loop in `dotc` never actually splits a call here.
 
-#![allow(clippy::missing_safety_doc)]
-
 use crate::element::{C32, C64v};
+
+const CBLAS_ROW_MAJOR: i32 = 101;
+const CBLAS_NO_TRANS: i32 = 111;
+const CBLAS_TRANS: i32 = 112;
+const CBLAS_CONJ_TRANS: i32 = 113;
 
 /// numpy's `NPY_CBLAS_CHUNK`. With ILP64 `CBLAS_INT_MAX == NPY_MAX_INTP`, so
 /// `npy_cblas.h` takes the `#else` branch and the chunk is the whole range.
@@ -83,6 +78,42 @@ mod sys {
             incy: i64,
             out: *mut c_void,
         );
+
+        #[link_name = "cblas_cgemm$NEWLAPACK$ILP64"]
+        pub fn cblas_cgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i64,
+            n: i64,
+            k: i64,
+            alpha: *const c_void,
+            a: *const c_void,
+            lda: i64,
+            b: *const c_void,
+            ldb: i64,
+            beta: *const c_void,
+            c: *mut c_void,
+            ldc: i64,
+        );
+
+        #[link_name = "cblas_zgemm$NEWLAPACK$ILP64"]
+        pub fn cblas_zgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i64,
+            n: i64,
+            k: i64,
+            alpha: *const c_void,
+            a: *const c_void,
+            lda: i64,
+            b: *const c_void,
+            ldb: i64,
+            beta: *const c_void,
+            c: *mut c_void,
+            ldc: i64,
+        );
     }
 }
 
@@ -112,13 +143,18 @@ pub unsafe fn zdotc(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) 
         }
         sum[0] += tmp[0];
         sum[1] += tmp[1];
-        // numpy advances with the *byte* strides here.
-        // SAFETY: `chunk <= left`, so this lands at or one past the run's end.
-        unsafe {
-            xp = xp.offset(chunk as isize * incx as isize * 16);
-            yp = yp.offset(chunk as isize * incy as isize * 16);
-        }
         left -= chunk;
+        if left > 0 {
+            // numpy advances with the *byte* strides here. The caller's
+            // in-bounds-run contract guarantees the next chunk starts inside
+            // each allocation.
+            // SAFETY: `left > 0`, so neither pointer advances past the final
+            // element of its run.
+            unsafe {
+                xp = xp.offset(chunk as isize * incx as isize * 16);
+                yp = yp.offset(chunk as isize * incy as isize * 16);
+            }
+        }
     }
     C64v::new(sum[0], sum[1])
 }
@@ -148,14 +184,97 @@ pub unsafe fn cdotc(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) 
         }
         sum[0] += tmp[0] as f64;
         sum[1] += tmp[1] as f64;
-        // SAFETY: as in `zdotc`, with an 8-byte element.
-        unsafe {
-            xp = xp.offset(chunk as isize * incx as isize * 8);
-            yp = yp.offset(chunk as isize * incy as isize * 8);
-        }
         left -= chunk;
+        if left > 0 {
+            // SAFETY: as in `zdotc`, with an 8-byte element.
+            unsafe {
+                xp = xp.offset(chunk as isize * incx as isize * 8);
+                yp = yp.offset(chunk as isize * incy as isize * 8);
+            }
+        }
     }
     C32::new(sum[0] as f32, sum[1] as f32)
+}
+
+/// `CFLOAT_vecmat_via_gemm`, with `x` as a conjugate-transposed 1-by-`n`
+/// row and `y` as an `n`-by-`m` matrix.
+///
+/// # Safety
+/// `x`, `y`, and `out` must satisfy the CBLAS matrix extents described by
+/// `n`, `m`, `lda`, and `ldb`; `out` must hold `m` writable `npy_cfloat`s.
+#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+pub unsafe fn cgemm_vecmat(
+    x: *const u8,
+    lda: i64,
+    y: *const u8,
+    ldb: i64,
+    transpose_y: bool,
+    out: *mut u8,
+    n: usize,
+    m: usize,
+) {
+    let alpha = [1.0f32, 0.0f32];
+    let beta = [0.0f32, 0.0f32];
+    // SAFETY: the caller guarantees all three matrix extents. The scalar
+    // arrays are live complex values for the duration of the call, and the
+    // enum values are the definitions in numpy's `npy_cblas.h`.
+    unsafe {
+        sys::cblas_cgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_CONJ_TRANS,
+            if transpose_y { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            1,
+            m as i64,
+            n as i64,
+            alpha.as_ptr() as *const _,
+            x as *const _,
+            lda,
+            y as *const _,
+            ldb,
+            beta.as_ptr() as *const _,
+            out as *mut _,
+            m as i64,
+        );
+    }
+}
+
+/// `CDOUBLE_vecmat_via_gemm`; see [`cgemm_vecmat`].
+///
+/// # Safety
+/// As [`cgemm_vecmat`], for `npy_cdouble` elements.
+#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+pub unsafe fn zgemm_vecmat(
+    x: *const u8,
+    lda: i64,
+    y: *const u8,
+    ldb: i64,
+    transpose_y: bool,
+    out: *mut u8,
+    n: usize,
+    m: usize,
+) {
+    let alpha = [1.0f64, 0.0f64];
+    let beta = [0.0f64, 0.0f64];
+    // SAFETY: the caller guarantees the matrix extents and writable output;
+    // the remaining arguments exactly transcribe `CDOUBLE_vecmat_via_gemm`.
+    unsafe {
+        sys::cblas_zgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_CONJ_TRANS,
+            if transpose_y { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            1,
+            m as i64,
+            n as i64,
+            alpha.as_ptr() as *const _,
+            x as *const _,
+            lda,
+            y as *const _,
+            ldb,
+            beta.as_ptr() as *const _,
+            out as *mut _,
+            m as i64,
+        );
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
@@ -166,4 +285,46 @@ pub unsafe fn zdotc(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: us
 #[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
 pub unsafe fn cdotc(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: usize) -> C32 {
     unreachable!("HAVE_CBLAS is false off Apple platforms")
+}
+
+#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+pub unsafe fn cgemm_vecmat(
+    _x: *const u8,
+    _lda: i64,
+    _y: *const u8,
+    _ldb: i64,
+    _transpose_y: bool,
+    _out: *mut u8,
+    _n: usize,
+    _m: usize,
+) {
+    unreachable!("HAVE_CBLAS is false off Apple platforms")
+}
+
+#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+pub unsafe fn zgemm_vecmat(
+    _x: *const u8,
+    _lda: i64,
+    _y: *const u8,
+    _ldb: i64,
+    _transpose_y: bool,
+    _out: *mut u8,
+    _n: usize,
+    _m: usize,
+) {
+    unreachable!("HAVE_CBLAS is false off Apple platforms")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numpy_blas_stride_rejects_nonpositive_and_unaligned_strides() {
+        assert_eq!(blas_stride(16, 16), Some(1));
+        assert_eq!(blas_stride(32, 16), Some(2));
+        assert_eq!(blas_stride(0, 16), None);
+        assert_eq!(blas_stride(-16, 16), None);
+        assert_eq!(blas_stride(17, 16), None);
+    }
 }

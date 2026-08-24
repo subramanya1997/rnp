@@ -78,7 +78,44 @@ pub(crate) fn err(e: rnp_core::Error) -> PyErr {
             dtypes,
             message,
         } => binary_resolution_err(ufunc, dtypes, message),
+        rnp_core::Error::UFuncInputCasting {
+            ufunc,
+            casting,
+            from_,
+            to,
+            i,
+            message,
+        } => factory_err(
+            "ufunc_input_casting",
+            (ufunc, casting, from_, to, i),
+            message,
+        ),
     }
+}
+
+/// Build an exception through one of the shim's registered factories, falling
+/// back to a plain `TypeError` carrying the engine's own message when the shim
+/// is absent (i.e. `_rnp` used bare).
+fn factory_err<A>(name: &str, args: A, fallback: String) -> PyErr
+where
+    A: for<'py> pyo3::IntoPyObject<'py, Target = PyTuple, Output = Bound<'py, PyTuple>>,
+{
+    Python::attach(|py| {
+        let Some(d) = ERROR_FACTORIES.get() else {
+            return PyTypeError::new_err(fallback);
+        };
+        let tuple = match args.into_pyobject(py) {
+            Ok(t) => t,
+            Err(e) => return e.into(),
+        };
+        match d.bind(py).get_item(name) {
+            Ok(Some(f)) => match f.call1(tuple) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(e) => e,
+            },
+            _ => PyTypeError::new_err(fallback),
+        }
+    })
 }
 
 /// numpy's `_UFuncBinaryResolutionError`, built through the shim's factory so
@@ -884,7 +921,7 @@ fn _datetime_objects(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>
     let dt = arr.dtype();
     let meta = dtm::meta_of(dt)
         .ok_or_else(|| PyTypeError::new_err("not a datetime array"))?;
-    let dtmod = py.import("datetime")?;
+    let _ = meta;
     let n = arr.to_native();
     let out = PyList::empty(py);
     for off in rnp_core::iter::offsets(&n.shape, &n.strides, n.byte_offset) {
@@ -892,44 +929,7 @@ fn _datetime_objects(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>
             rnp_core::Scalar::Int(i) => i,
             s => s.as_f64() as i64,
         };
-        if v == dtm::NAT {
-            out.append(py.None())?;
-            continue;
-        }
-        if dt.is_timedelta() {
-            match dtm::timedelta_parts(meta, v) {
-                Some((days, secs, us)) => {
-                    let td = dtmod.getattr("timedelta")?.call1((days, secs, us))?;
-                    out.append(td)?;
-                }
-                // Y/M and the sub-microsecond units have no `timedelta`
-                // representation, so numpy hands back the raw integer.
-                None => out.append(v)?,
-            }
-            continue;
-        }
-        // Years and months are out of `datetime`'s range as *offsets*, and
-        // anything finer than microseconds cannot be represented, so numpy
-        // returns the raw integer for those.
-        if meta.base < dtm::UNIT_D || meta.base > dtm::UNIT_US {
-            out.append(v)?;
-            continue;
-        }
-        let dts = dtm::dt64_to_dts(meta, v).map_err(err)?;
-        if dts.year < 1 || dts.year > 9999 {
-            out.append(v)?;
-            continue;
-        }
-        let obj = if meta.base <= dtm::UNIT_D {
-            dtmod
-                .getattr("date")?
-                .call1((dts.year, dts.month, dts.day))?
-        } else {
-            dtmod.getattr("datetime")?.call1((
-                dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.us,
-            ))?
-        };
-        out.append(obj)?;
+        out.append(crate::convert::datetime_object(py, dt, v)?)?;
     }
     Ok(out.into_any().unbind())
 }

@@ -22,18 +22,13 @@
 //! summation this cannot match bit for bit; `harness/dev_check_matmul.py`
 //! measures the resulting ULP gap rather than assuming it away.
 //!
-//! One consequence of that is worth naming, because it is the port's only
-//! known bit-level divergence here. `vecdot`/`vecmat` on complex operands run
-//! numpy's `@TYPE@_dotc`, which hands a *unit-stride* operand to
-//! `cblas_?dotc_sub`. At an inner length of exactly 1, Apple Accelerate's
-//! `dotc` produces a NaN whose **sign bit** differs from the one the same
-//! expression produces in C -- and no straight-line f64 expression reproduces
-//! it (searched: 4096 complex pairs and the 121-point special-value grid; the
-//! closest candidate still misses 3 cells, and adopting it would introduce
-//! 588 fresh divergences on the non-BLAS path, measured). This module
-//! therefore transcribes numpy's own C source, which matches numpy exactly on
-//! every path numpy does not route through BLAS (0/2401 pairs), and leaves
-//! the Accelerate n == 1 NaN sign as a documented platform artifact.
+//! Complex `vecdot` and `vecmat` also preserve numpy's BLAS split. Positive,
+//! element-aligned iterator strides reach Accelerate's ILP64 `dotc`; a
+//! BLAS-layout `vecmat` reaches `gemm` with `CblasConjTrans`. Length-1 core
+//! axes are a subtle exception: numpy's gufunc iterator supplies stride zero,
+//! so they use the scalar loop. On AArch64 clang contracts that loop's
+//! `xr*yi - xi*yr` to `fnmsub`; the helper below emits that same instruction
+//! so NaN signs match too.
 
 use std::borrow::Cow;
 
@@ -494,6 +489,74 @@ trait MatElem: Element + Copy {
     ) -> Option<Self> {
         None
     }
+
+    /// Complex `@TYPE@_vecmat_via_gemm`; `None` for every dtype without that
+    /// CBLAS loop.
+    ///
+    /// # Safety
+    /// `x` and `y` must describe the matrices encoded by `n`, `m`, `lda`, and
+    /// `ldb`, and `out` must address `m` writable elements of `Self`.
+    unsafe fn vecmat_cblas(
+        _x: *const u8,
+        _lda: i64,
+        _y: *const u8,
+        _ldb: i64,
+        _transpose_y: bool,
+        _out: *mut u8,
+        _n: usize,
+        _m: usize,
+    ) -> Option<()> {
+        None
+    }
+}
+
+/// clang's contraction of `a * b - c` in numpy's complex `dotc` fallback.
+/// Keeping this as one hardware operation is observable for NaN sign bits.
+#[inline(always)]
+fn numpy_mul_sub_f32(mut a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        // SAFETY: `fnmsub` is a scalar floating-point instruction with no
+        // memory access or control-flow effects. Its operands and result stay
+        // entirely in compiler-allocated FP registers.
+        unsafe {
+            std::arch::asm!(
+                "fnmsub {a:s}, {a:s}, {b:s}, {c:s}",
+                a = inout(vreg) a,
+                b = in(vreg) b,
+                c = in(vreg) c,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        a
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        a * b - c
+    }
+}
+
+#[inline(always)]
+fn numpy_mul_sub_f64(mut a: f64, b: f64, c: f64) -> f64 {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        // SAFETY: as in `numpy_mul_sub_f32`; the `d` register view selects
+        // the double-precision form of the same side-effect-free instruction.
+        unsafe {
+            std::arch::asm!(
+                "fnmsub {a:d}, {a:d}, {b:d}, {c:d}",
+                a = inout(vreg) a,
+                b = in(vreg) b,
+                c = in(vreg) c,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        a
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        a * b - c
+    }
 }
 
 /// The `ConjAcc` half of the trait for every type where conjugation does
@@ -675,7 +738,7 @@ impl MatElem for C32 {
     fn conj_add(acc: (f64, f64), x: C32, y: C32) -> (f64, f64) {
         (
             acc.0 + (x.re * y.re + x.im * y.im) as f64,
-            acc.1 + (x.re * y.im - x.im * y.re) as f64,
+            acc.1 + numpy_mul_sub_f32(x.re, y.im, x.im * y.re) as f64,
         )
     }
     #[inline]
@@ -690,6 +753,25 @@ impl MatElem for C32 {
         }
         // SAFETY: forwarded from this method's own contract.
         Some(unsafe { crate::blas::cdotc(x, incx, y, incy, n) })
+    }
+
+    #[inline]
+    unsafe fn vecmat_cblas(
+        x: *const u8,
+        lda: i64,
+        y: *const u8,
+        ldb: i64,
+        transpose_y: bool,
+        out: *mut u8,
+        n: usize,
+        m: usize,
+    ) -> Option<()> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own matrix-extent contract.
+        unsafe { crate::blas::cgemm_vecmat(x, lda, y, ldb, transpose_y, out, n, m) };
+        Some(())
     }
 }
 
@@ -721,7 +803,7 @@ impl MatElem for C64v {
     fn conj_add(acc: C64v, x: C64v, y: C64v) -> C64v {
         C64v::new(
             acc.re + (x.re * y.re + x.im * y.im),
-            acc.im + (x.re * y.im - x.im * y.re),
+            acc.im + numpy_mul_sub_f64(x.re, y.im, x.im * y.re),
         )
     }
     #[inline]
@@ -742,6 +824,25 @@ impl MatElem for C64v {
         }
         // SAFETY: forwarded from this method's own contract.
         Some(unsafe { crate::blas::zdotc(x, incx, y, incy, n) })
+    }
+
+    #[inline]
+    unsafe fn vecmat_cblas(
+        x: *const u8,
+        lda: i64,
+        y: *const u8,
+        ldb: i64,
+        transpose_y: bool,
+        out: *mut u8,
+        n: usize,
+        m: usize,
+    ) -> Option<()> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own matrix-extent contract.
+        unsafe { crate::blas::zgemm_vecmat(x, lda, y, ldb, transpose_y, out, n, m) };
+        Some(())
     }
 }
 
@@ -771,33 +872,76 @@ fn is_blasable2d(
     itemsize: usize,
 ) -> bool {
     let isz = itemsize as isize;
+    let blas_max = if isize::BITS == 64 {
+        isize::MAX - 1
+    } else {
+        isize::MAX
+    };
     if byte_stride2 != isz {
         return false;
     }
-    byte_stride1 % isz == 0 && byte_stride1 / isz >= d2
+    let unit_stride1 = byte_stride1 / isz;
+    byte_stride1 % isz == 0
+        && unit_stride1 >= d2
+        && unit_stride1 <= blas_max
 }
 
-/// Does numpy reach `@TYPE@_dotc` for this call, or does it go through gemm?
-///
-/// `@TYPE@_vecdot` always calls `dotc` element by element. `@TYPE@_vecmat`
-/// prefers `@TYPE@_vecmat_via_gemm` (gemm, because gemv cannot conjugate) and
-/// only falls back to a per-column `dotc` when its `blasable` test fails --
-/// which it does for any `dn == 1` or `dm == 1`, the shape the special-value
-/// grid produces. `matmul`/`matvec` never conjugate, so they never get here.
-fn routes_through_dotc(kind: MatKind, a: &NdArray, b: &NdArray, p: &Plan, itemsize: usize) -> bool {
+/// The gufunc iterator normalises a size-1 core axis to stride zero. These are
+/// the `steps[...]` values the generated loops receive and run through
+/// `blas_stride`, not the source ndarray's cosmetic stride for that axis.
+#[inline]
+fn gufunc_core_stride(byte_stride: isize, dim: isize) -> isize {
+    if dim == 1 { 0 } else { byte_stride }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ConjRoute {
+    Dotc,
+    Gemm {
+        lda: i64,
+        ldb: i64,
+        transpose_y: bool,
+    },
+    Scalar,
+}
+
+/// Select the generated complex inner loop numpy actually registers.
+fn conjugating_route(
+    kind: MatKind,
+    a: &NdArray,
+    b: &NdArray,
+    p: &Plan,
+    itemsize: usize,
+) -> ConjRoute {
     match kind {
-        MatKind::VecDot => true,
+        MatKind::VecDot => ConjRoute::Dotc,
         MatKind::VecMat => {
             let nl = p.loop_shape.len();
             let (dn, dm) = (p.inner, p.cols);
-            let is1_n = a.strides[nl + 1];
-            let (is2_n, is2_m) = (b.strides[nl], b.strides[nl + 1]);
+            let is1_n = gufunc_core_stride(a.strides[nl + 1], dn);
+            let is2_n = gufunc_core_stride(b.strides[nl], dn);
+            let is2_m = gufunc_core_stride(b.strides[nl + 1], dm);
             let i1 = is_blasable2d(is1_n, itemsize as isize, dn, 1, itemsize);
             let i2c = is_blasable2d(is2_n, is2_m, dn, dm, itemsize);
             let i2f = is_blasable2d(is2_m, is2_n, dm, dn, itemsize);
-            !(i1 && (i2c || i2f) && dn > 1 && dm > 1)
+            let blas_max = if isize::BITS == 64 {
+                isize::MAX - 1
+            } else {
+                isize::MAX
+            };
+            let too_big = dn > blas_max || dm > blas_max;
+            if i1 && (i2c || i2f) && !too_big && dn > 1 && dm > 1 {
+                let isz = itemsize as isize;
+                ConjRoute::Gemm {
+                    lda: (is1_n / isz) as i64,
+                    ldb: (if i2c { is2_n } else { is2_m } / isz) as i64,
+                    transpose_y: !i2c,
+                }
+            } else {
+                ConjRoute::Dotc
+            }
         }
-        MatKind::MatMul | MatKind::MatVec => false,
+        MatKind::MatMul | MatKind::MatVec => ConjRoute::Scalar,
     }
 }
 
@@ -806,7 +950,7 @@ fn kernel<T: MatElem>(
     b: &NdArray,
     out: &mut NdArray,
     conj_a: bool,
-    dotc_route: bool,
+    conj_route: ConjRoute,
     p: &Plan,
 ) {
     let (r, k, c) = (p.rows as usize, p.inner as usize, p.cols as usize);
@@ -862,16 +1006,42 @@ fn kernel<T: MatElem>(
         let dst = &mut out_slice[bi * r * c..(bi + 1) * r * c];
 
         if conj_a {
-            // `@TYPE@_dotc` tries CBLAS first, and its test is on the
-            // *original* operand strides -- so it has to run against `a`/`b`
-            // themselves, not the packed `ap`/`bp` copies above. One call per
-            // output element, exactly as `@TYPE@_vecdot`/`@TYPE@_vecmat` issue
-            // them: `dotc(x_row_i, is1 = sa_k, y_col_j, is2 = sb_k, n = k)`.
-            if std::env::var_os("RNP_DBG_DOTC").is_some() { eprintln!("DBG conj_a route={} k={} sa_k={} sb_k={} isz={}", dotc_route, k, sa_k, sb_k, isz); }
-            if dotc_route && k > 0 {
+            if let ConjRoute::Gemm {
+                lda,
+                ldb,
+                transpose_y,
+            } = conj_route
+            {
+                debug_assert_eq!(r, 1);
+                // SAFETY: the route is selected only after numpy's exact
+                // `is_blasable2d` checks on the original operand strides.
+                // `ao`/`bo` start this batch, and `dst` is `c` writable
+                // contiguous elements.
+                let used = unsafe {
+                    T::vecmat_cblas(
+                        a_base.offset(ao),
+                        lda,
+                        b_base.offset(bo),
+                        ldb,
+                        transpose_y,
+                        dst.as_mut_ptr() as *mut u8,
+                        k,
+                        c,
+                    )
+                };
+                if used.is_some() {
+                    continue;
+                }
+            }
+
+            // `@TYPE@_dotc` tests the iterator's original inner strides and
+            // calls CBLAS on the original memory, not the packed copies.
+            if conj_route == ConjRoute::Dotc && k > 0 {
+                let is1 = gufunc_core_stride(sa_k, p.inner);
+                let is2 = gufunc_core_stride(sb_k, p.inner);
                 if let (Some(incx), Some(incy)) = (
-                    crate::blas::blas_stride(sa_k, isz),
-                    crate::blas::blas_stride(sb_k, isz),
+                    crate::blas::blas_stride(is1, isz),
+                    crate::blas::blas_stride(is2, isz),
                 ) {
                     let mut all = true;
                     for i in 0..r {
@@ -1007,25 +1177,40 @@ pub fn matmul(
     let bv = crate::iter::broadcast_to(&b2, &b_target)?;
 
     let mut out = NdArray::empty_descr(p.out_shape.clone(), Descr::native(dt))?;
-    // Whether numpy's loop for this call reaches `@TYPE@_dotc` (and so may
-    // hand the operands to CBLAS) rather than driving gemm itself.
-    let dotc_route = kind.conjugates_first()
-        && routes_through_dotc(kind, &av, &bv, &p, dt.itemsize());
+    let conj_route = if kind.conjugates_first() {
+        conjugating_route(kind, &av, &bv, &p, dt.itemsize())
+    } else {
+        ConjRoute::Scalar
+    };
     match dt {
-        DType::Bool => kernel::<NpBool>(&av, &bv, &mut out, false, false, &p),
-        DType::I8 => kernel::<i8>(&av, &bv, &mut out, false, false, &p),
-        DType::I16 => kernel::<i16>(&av, &bv, &mut out, false, false, &p),
-        DType::I32 => kernel::<i32>(&av, &bv, &mut out, false, false, &p),
-        DType::I64 => kernel::<i64>(&av, &bv, &mut out, false, false, &p),
-        DType::U8 => kernel::<u8>(&av, &bv, &mut out, false, false, &p),
-        DType::U16 => kernel::<u16>(&av, &bv, &mut out, false, false, &p),
-        DType::U32 => kernel::<u32>(&av, &bv, &mut out, false, false, &p),
-        DType::U64 => kernel::<u64>(&av, &bv, &mut out, false, false, &p),
-        DType::F16 => kernel::<F16>(&av, &bv, &mut out, false, false, &p),
-        DType::F32 => kernel::<f32>(&av, &bv, &mut out, false, false, &p),
-        DType::F64 => kernel::<f64>(&av, &bv, &mut out, false, false, &p),
-        DType::C64 => kernel::<C32>(&av, &bv, &mut out, kind.conjugates_first(), dotc_route, &p),
-        DType::C128 => kernel::<C64v>(&av, &bv, &mut out, kind.conjugates_first(), dotc_route, &p),
+        DType::Bool => kernel::<NpBool>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I8 => kernel::<i8>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I16 => kernel::<i16>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I32 => kernel::<i32>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::I64 => kernel::<i64>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U8 => kernel::<u8>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U16 => kernel::<u16>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U32 => kernel::<u32>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::U64 => kernel::<u64>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F16 => kernel::<F16>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F32 => kernel::<f32>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F64 => kernel::<f64>(&av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::C64 => kernel::<C32>(
+            &av,
+            &bv,
+            &mut out,
+            kind.conjugates_first(),
+            conj_route,
+            &p,
+        ),
+        DType::C128 => kernel::<C64v>(
+            &av,
+            &bv,
+            &mut out,
+            kind.conjugates_first(),
+            conj_route,
+            &p,
+        ),
         _ => {
             return Err(ufunc_no_loop(
                 kind.name(),
@@ -1294,15 +1479,6 @@ mod tests {
     }
 
     #[test]
-    /// `@TYPE@_dotc` is not "conjugate, then multiply": it is a distinct
-    /// expression, and the difference is observable in the sign bit of a NaN.
-    ///
-    /// Measured against real numpy 2.5.2 over all 2401 pairs drawn from
-    /// {nan, ±inf, ±0, 1, 2}^2 with non-unit strides (which is the path numpy
-    /// runs in C rather than in BLAS): the expression below matches on every
-    /// pair, while `conj(x) * y` -- and the algebraically identical
-    /// `x.re*y.im + (-x.im)*y.re` -- do not.
-    #[test]
     fn dotc_is_transcribed_not_synthesised() {
         let one = C64v::new(f64::NAN, 0.0);
         let mut a = NdArray::zeros(vec![2], DType::C128).unwrap();
@@ -1319,6 +1495,29 @@ mod tests {
         // `xr*yi - xi*yr` with xr = NaN, yi = +0 leaves the propagated NaN
         // positive; the `conj`-then-multiply form would negate it.
         assert!(!v.im.is_sign_negative(), "imaginary NaN sign flipped");
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn length_one_complex_core_uses_numpy_fnmsub_nan_sign() {
+        for dtype in [DType::C64, DType::C128] {
+            let value = C64v::new(f64::NAN, 0.0);
+            let mut vector = NdArray::zeros(vec![1], dtype).unwrap();
+            vector.set_flat(0, Scalar::Complex(value));
+            let matrix = vector.reshape(&[1, 1]).unwrap();
+
+            for (kind, rhs) in [(MatKind::VecDot, &vector), (MatKind::VecMat, &matrix)] {
+                let result = matmul(kind, &vector, rhs, None, None).unwrap();
+                let Scalar::Complex(got) = result.get_flat(0) else {
+                    panic!("expected a complex result")
+                };
+                assert!(got.re.is_nan());
+                assert!(got.im.is_nan());
+                assert!(got.im.is_sign_negative(), "{kind:?} {dtype:?}");
+            }
+        }
+        assert_eq!(gufunc_core_stride(16, 1), 0);
+        assert_eq!(gufunc_core_stride(-16, 2), -16);
     }
 
     /// float16 is the only dtype whose matmul loop numpy leaves the FP status

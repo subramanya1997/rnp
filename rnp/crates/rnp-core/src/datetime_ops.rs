@@ -11,7 +11,9 @@ use crate::array::NdArray;
 use crate::datetime::{self as dtm, NAT};
 use crate::dtype::DType;
 use crate::element::Scalar;
-use crate::error::{ufunc_binary_resolution, ufunc_no_loop, Error, Result};
+use crate::error::{
+    ufunc_binary_resolution, ufunc_input_casting, ufunc_no_loop, Error, Result,
+};
 use crate::iter::{broadcast_shapes, broadcast_to, offsets};
 use crate::ops::BinOp;
 
@@ -35,6 +37,27 @@ fn no_loop(op: BinOp, a: DType, b: DType) -> Error {
 
 fn reso_error(op: BinOp, a: &NdArray, b: &NdArray) -> Error {
     ufunc_binary_resolution(op.name(), &a.descr.str_code(), &b.descr.str_code())
+}
+
+/// numpy's default ufunc casting rule for the inputs.
+const UFUNC_CASTING: crate::casting::Casting = crate::casting::Casting::SameKind;
+
+/// Reject input `i` when it cannot reach the loop dtype the resolver picked,
+/// exactly as numpy's `PyUFunc_ValidateCasting` does.
+fn check_input_casting(ufunc: &str, from: DType, to: DType, i: usize) -> Result<()> {
+    use crate::descr::Descr;
+    if from == to || crate::casting::can_cast(Descr::native(from), Descr::native(to), UFUNC_CASTING)
+    {
+        return Ok(());
+    }
+    Err(ufunc_input_casting(
+        ufunc,
+        "same_kind",
+        &Descr::native(from).str_code(),
+        &Descr::native(to).str_code(),
+        i,
+        2,
+    ))
 }
 
 /// What the two operands must be cast to, and what comes out.
@@ -369,6 +392,14 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<Nd
         }
     };
 
+    // The resolver only names the loop; numpy's ufunc machinery then insists
+    // that every input reach that loop's dtype under the call's casting rule
+    // (`same_kind` by default). `M8[D] + m8[Y]` promotes to `M8[D]`, so input 1
+    // would have to become `m8[D]` -- which m8's nonlinear units forbid -- and
+    // numpy reports `_UFuncInputCastingError` rather than a resolution failure.
+    check_input_casting(op.name(), a.dtype(), lp.ain, 0)?;
+    check_input_casting(op.name(), b.dtype(), lp.bin, 1)?;
+
     let av = a.try_astype(lp.ain)?;
     let bv = b.try_astype(lp.bin)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
@@ -587,6 +618,8 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<Nd
 /// `np.divmod` on two timedelta64 operands: numpy's `TIMEDELTA_mm_qm_divmod`.
 pub fn divmod(a: &NdArray, b: &NdArray) -> Result<(NdArray, NdArray)> {
     let lp = resolve(BinOp::Mod, a, b)?;
+    check_input_casting("divmod", a.dtype(), lp.ain, 0)?;
+    check_input_casting("divmod", b.dtype(), lp.bin, 1)?;
     let av = a.try_astype(lp.ain)?;
     let bv = b.try_astype(lp.bin)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;

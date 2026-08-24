@@ -1398,6 +1398,13 @@ impl PyNdArray {
             let idx = shape_from_args(args)?;
             self.arr.get(&idx).map_err(crate::err)?
         };
+        if self.arr.dtype().is_datetime_like() {
+            let raw = match v {
+                rnp_core::Scalar::Int(i) => i,
+                other => other.as_f64() as i64,
+            };
+            return crate::convert::datetime_object(py, self.arr.dtype(), raw);
+        }
         scalar_to_py(py, v)
     }
 

@@ -103,7 +103,51 @@ pub fn element_to_py<'py>(
     if arr.dtype().is_flexible() {
         return flexible_to_py(py, arr, off);
     }
+    if arr.dtype().is_datetime_like() {
+        let v = match arr.read_at(off) {
+            Scalar::Int(i) => i,
+            s => s.as_f64() as i64,
+        };
+        return datetime_object(py, arr.dtype(), v);
+    }
     scalar_to_py(py, arr.read_at(off))
+}
+
+/// numpy's `DATETIME_getitem` / `TIMEDELTA_getitem`: the Python object one
+/// datetime-like element hands back — a `datetime.date` / `datetime.datetime` /
+/// `datetime.timedelta` where that is exact, `None` for NaT, and the raw
+/// integer for every unit or magnitude `datetime` cannot express.
+pub fn datetime_object<'py>(
+    py: Python<'py>,
+    dt: DType,
+    v: i64,
+) -> PyResult<Bound<'py, PyAny>> {
+    use rnp_core::datetime::PyDtObj;
+    let Some(what) = rnp_core::datetime::value_to_pyobj(dt, v) else {
+        return scalar_to_py(py, Scalar::Int(v));
+    };
+    let dtmod = || py.import(pyo3::intern!(py, "datetime"));
+    match what {
+        PyDtObj::Nothing => Ok(py.None().into_bound(py)),
+        PyDtObj::Int(i) => Ok(i.into_pyobject(py)?.into_any()),
+        PyDtObj::Date { year, month, day } => dtmod()?
+            .getattr(pyo3::intern!(py, "date"))?
+            .call1((year, month, day)),
+        PyDtObj::DateTime {
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec,
+            us,
+        } => dtmod()?
+            .getattr(pyo3::intern!(py, "datetime"))?
+            .call1((year, month, day, hour, min, sec, us)),
+        PyDtObj::Delta { days, secs, us } => dtmod()?
+            .getattr(pyo3::intern!(py, "timedelta"))?
+            .call1((days, secs, us)),
+    }
 }
 
 /// Build the numpy scalar object for one element, falling back to the plain
