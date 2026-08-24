@@ -794,13 +794,32 @@ def load(file, mmap_mode=None, allow_pickle=False, fix_imports=True,
     import pickle as _pickle
 
     if hasattr(file, "read"):
+        position = file.tell()
+        magic = file.read(6)
+        file.seek(position)
+        if magic.startswith((b"PK\x03\x04", b"\x93NUMPY")):
+            from .lib._npyio_impl import load as _format_load
+            return _format_load(
+                file, mmap_mode=mmap_mode, allow_pickle=allow_pickle,
+                fix_imports=fix_imports, encoding=encoding,
+                max_header_size=max_header_size)
         return _pickle.load(file)
     name = _builtins.str(file)
+    actual_name = name
     try:
         fh = _builtins.open(name, "rb")
     except FileNotFoundError:
-        fh = _builtins.open(name + ".npy", "rb")
+        actual_name = name + ".npy"
+        fh = _builtins.open(actual_name, "rb")
     with fh:
+        magic = fh.read(6)
+        fh.seek(0)
+        if magic.startswith((b"PK\x03\x04", b"\x93NUMPY")):
+            from .lib._npyio_impl import load as _format_load
+            return _format_load(
+                actual_name, mmap_mode=mmap_mode, allow_pickle=allow_pickle,
+                fix_imports=fix_imports, encoding=encoding,
+                max_header_size=max_header_size)
         return _pickle.load(fh)
 
 

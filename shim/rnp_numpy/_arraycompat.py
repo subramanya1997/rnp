@@ -817,6 +817,13 @@ def _make_str_inplace(name, fn):
 
 
 def install():
+    # Compatibility metadata exposed by NumPy's C-level flags and concrete
+    # DType classes.  The engine has one generic dtype class, and every dtype
+    # it currently supports is a legacy built-in dtype.
+    _rnp.flagsobj.fnc = property(
+        lambda flags: flags.f_contiguous and not flags.c_contiguous)
+    _rnp.dtype._legacy = True
+
     ndarray.astype = astype
     ndarray.__array__ = array_protocol
     ndarray.copy = copy_method
