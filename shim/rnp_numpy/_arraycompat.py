@@ -9,6 +9,7 @@ no numeric kernel is reimplemented here.
 """
 
 import builtins as _b
+import sys as _sys
 import warnings as _warnings
 
 import _rnp
@@ -27,6 +28,7 @@ from .exceptions import ComplexWarning
 
 _orig_astype = ndarray.astype
 _orig_copy = ndarray.copy
+_orig_getitem = ndarray.__getitem__
 _orig_setitem = ndarray.__setitem__
 
 _ORDERS = ("C", "F", "A", "K")
@@ -562,7 +564,42 @@ def _shape_of(obj):
     return tuple(shape)
 
 
+def _check_advanced_index_size(key):
+    """Reject an advanced-index iterator whose broadcast shape overflows.
+
+    The native engine aborts while constructing an iterator for shapes larger
+    than ``Py_ssize_t``.  NumPy detects that condition before allocation and
+    raises ``ValueError``.  Multi-array index tuples are the only way to form
+    such a shape without first allocating an impossibly large index array.
+    """
+    if not isinstance(key, _b.tuple):
+        return
+    shapes = [part.shape for part in key if isinstance(part, ndarray)]
+    if len(shapes) < 2:
+        return
+
+    ndim = max(map(len, shapes), default=0)
+    size = 1
+    for offset in _b.range(1, ndim + 1):
+        dim = 1
+        for shape in shapes:
+            candidate = shape[-offset] if offset <= len(shape) else 1
+            if candidate != 1:
+                if dim != 1 and candidate != dim:
+                    return  # Let the engine report the broadcast mismatch.
+                dim = candidate
+        if dim and size > _sys.maxsize // dim:
+            raise ValueError("iterator is too large")
+        size *= dim
+
+
+def getitem(self, key):
+    _check_advanced_index_size(key)
+    return _orig_getitem(self, key)
+
+
 def setitem(self, key, value):
+    _check_advanced_index_size(key)
     # `a[dst] = a[src]` must behave as if the right-hand side were read in
     # full before anything is written, exactly as numpy's PyArray_AssignArray
     # does: when source and destination alias, materialise the source first.
@@ -783,6 +820,7 @@ def install():
     ndarray.astype = astype
     ndarray.__array__ = array_protocol
     ndarray.copy = copy_method
+    ndarray.__getitem__ = getitem
     ndarray.__setitem__ = setitem
 
     def array_function(self, func, types, args, kwargs):
