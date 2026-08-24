@@ -881,6 +881,12 @@ pub fn cast_value_array(src: DType, dst: DType, v: i64) -> Result<i64> {
     if ms.base == md.base && ms.num == md.num {
         return Ok(v);
     }
+    // numpy computes the conversion factor *before* choosing a loop, and
+    // fails the whole cast when it overflows -- even for the nonlinear units
+    // that would then take the calendar path. `M8[Y] -> M8[ps]` is exactly
+    // that case: the Y->ps factor overflows, so numpy raises rather than
+    // going through the datetimestruct.
+    let (num, denom) = conversion_factor(ms, md)?;
     if v == NAT {
         return Ok(NAT);
     }
@@ -890,7 +896,6 @@ pub fn cast_value_array(src: DType, dst: DType, v: i64) -> Result<i64> {
         let dts = dt64_to_dts(ms, v)?;
         return dts_to_dt64(md, &dts);
     }
-    let (num, denom) = conversion_factor(ms, md)?;
     scale_with_overflow_check(v, num, denom, "datetime64")
 }
 
