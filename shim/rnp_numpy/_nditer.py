@@ -1,13 +1,28 @@
-"""A correctness-first implementation of :class:`numpy.nditer`.
+"""Correctness-first implementation of :class:`numpy.nditer`.
 
-The storage and view operations are supplied by ``_rnp.ndarray``.  This
-module is intentionally concerned only with iterator policy: broadcasting,
-axis order, iterator state, and (in later sections) buffering/casting.
+The ndarray storage and view operations come from ``_rnp.ndarray``.  Iterator
+policy deliberately lives here: broadcasting, traversal order, index state,
+temporary operands, and external loops.
 """
 
 from __future__ import annotations
 
-import builtins
+import copy as _copy
+
+
+_GLOBAL_FLAGS = frozenset((
+    "buffered", "c_index", "common_dtype", "copy_if_overlap",
+    "delay_bufalloc", "external_loop", "f_index", "grow_inner", "growinner",
+    "multi_index", "ranged", "reduce_ok", "refs_ok", "zerosize_ok",
+))
+_OP_FLAGS = frozenset((
+    "aligned", "allocate", "arraymask", "contig", "copy", "nbo",
+    "no_broadcast", "no_subtype", "overlap_assume_elementwise", "readonly",
+    "readwrite", "updateifcopy", "writemasked", "writeonly",
+    "writebackifcopy",
+))
+_ACCESS_FLAGS = frozenset(("readonly", "readwrite", "writeonly"))
+_CASTING = frozenset(("no", "equiv", "safe", "same_kind", "unsafe"))
 
 
 def _shape_tuple(shape):
@@ -21,6 +36,10 @@ def _shape_size(shape):
     return n
 
 
+def _compact_shape(shape):
+    return "(" + ",".join(str(x) for x in shape) + ")"
+
+
 def _broadcast_shape(shapes):
     ndim = max((len(shape) for shape in shapes), default=0)
     result = [1] * ndim
@@ -29,95 +48,205 @@ def _broadcast_shape(shapes):
             axis = ndim - 1 - j
             old = result[axis]
             if old != 1 and dim != 1 and old != dim:
-                compact = " ".join(str(tuple(s)) for s in shapes)
+                compact = " ".join(_compact_shape(s) for s in shapes)
                 raise ValueError(
                     "operands could not be broadcast together with shapes " + compact
                 )
-            result[axis] = max(old, dim)
+            if old == 1:
+                result[axis] = dim
+            elif dim != 1:
+                result[axis] = old
     return tuple(result)
 
 
-def _normalize_operands(op, ndarray_type, asarray):
-    # An ndarray is one operand, while list/tuple is numpy's multiple-operand
-    # constructor spelling.  Python scalars and numpy scalar objects are also
-    # a single operand.
-    if isinstance(op, (list, tuple)):
+def _raw_operands(op, ndarray_type):
+    if isinstance(op, (list, tuple)) and not isinstance(op, ndarray_type):
         raw = list(op)
     else:
         raw = [op]
     if not raw:
         raise ValueError("Must provide at least one operand")
-    arrays = []
-    scalar = []
-    for value in raw:
-        if value is None:
-            raise TypeError("Iterator operand required copying or buffering")
-        scalar.append(not isinstance(value, ndarray_type))
-        arrays.append(asarray(value))
-    return raw, arrays, scalar
+    return raw
 
 
 def _normalize_op_flags(op_flags, nop):
     if op_flags is None:
-        return [frozenset(("readonly",)) for _ in range(nop)]
-    if isinstance(op_flags, str):
-        return [frozenset((op_flags,)) for _ in range(nop)]
-    flags = list(op_flags)
-    # A flat list is applied to every operand; a nested list is per operand.
-    if not flags or isinstance(flags[0], str):
-        one = frozenset(flags)
-        return [one for _ in range(nop)]
-    if len(flags) != nop:
-        raise ValueError(
-            "op_flags must be a tuple or array of per-op flag-tuples"
-        )
-    return [frozenset(x) for x in flags]
+        result = [frozenset(("readonly",)) for _ in range(nop)]
+    elif isinstance(op_flags, str):
+        result = [frozenset((op_flags,)) for _ in range(nop)]
+    else:
+        flags = list(op_flags)
+        if not flags or isinstance(flags[0], str):
+            result = [frozenset(flags) for _ in range(nop)]
+        else:
+            if len(flags) != nop:
+                raise ValueError(
+                    "op_flags must be a tuple or array of per-op flag-tuples"
+                )
+            result = [frozenset(x) for x in flags]
+    for mode in result:
+        unknown = mode - _OP_FLAGS
+        if unknown:
+            raise ValueError(f"Unexpected per-op iterator flag {next(iter(unknown))!r}")
+        if len(mode & _ACCESS_FLAGS) != 1:
+            raise ValueError(
+                "Only one of the iterator flags READWRITE, READONLY, and "
+                "WRITEONLY may be specified for an operand"
+            )
+    return result
+
+
+def _normalize_dtypes(op_dtypes, nop, dtype):
+    if op_dtypes is None:
+        return [None] * nop
+    if isinstance(op_dtypes, (str, type)) or hasattr(op_dtypes, "kind"):
+        return [dtype(op_dtypes)] * nop
+    specs = list(op_dtypes)
+    if len(specs) != nop:
+        raise ValueError("op_dtypes must be a tuple or array of per-op dtypes")
+    return [None if spec is None else dtype(spec) for spec in specs]
 
 
 class nditer:
     """Iterate one or more rnp arrays using NumPy's nditer protocol."""
 
-    def __init__(
-        self,
-        op,
-        flags=None,
-        op_flags=None,
-        op_dtypes=None,
-        order="K",
-        casting="safe",
-        op_axes=None,
-        itershape=None,
-        buffersize=0,
-    ):
-        # Imports are delayed to avoid a cycle while rnp_numpy initializes.
-        from . import asarray, ndarray
+    def __init__(self, op, flags=None, op_flags=None, op_dtypes=None,
+                 order="K", casting="safe", op_axes=None, itershape=None,
+                 buffersize=0):
+        from . import asarray, can_cast, dtype, empty, ndarray, result_type
 
-        self._raw_operands, arrays, self._scalar_operands = _normalize_operands(
-            op, ndarray, asarray
-        )
-        self._op_flags = _normalize_op_flags(op_flags, len(arrays))
-        self._flags = frozenset(() if flags is None else flags)
+        raw = _raw_operands(op, ndarray)
+        self._raw_operands = tuple(raw)
+        self._op_flags = _normalize_op_flags(op_flags, len(raw))
+        self._flags = set(() if flags is None else flags)
+        unknown = self._flags - _GLOBAL_FLAGS
+        if unknown:
+            raise ValueError(f"Unexpected iterator global flag {next(iter(unknown))!r}")
+        if "c_index" in self._flags and "f_index" in self._flags:
+            raise ValueError("Iterator cannot track both a C and an F index")
+        if "external_loop" in self._flags and self._flags & {
+                "c_index", "f_index", "multi_index"}:
+            raise ValueError("Iterator flag EXTERNAL_LOOP cannot be used with an index")
+
         self._closed = False
         self._buffersize = int(buffersize)
+        self._casting = str(casting)
+        if self._casting not in _CASTING:
+            raise ValueError(f"casting must be one of {sorted(_CASTING)}")
         self._order = str(order).upper()
         if self._order not in ("C", "F", "A", "K"):
             raise ValueError("order must be one of 'C', 'F', 'A', or 'K'")
-        if op_dtypes is not None or op_axes is not None or itershape is not None:
-            raise NotImplementedError(
-                "op_dtypes, op_axes, and itershape require the extended nditer lane"
-            )
+        self._op_axes = op_axes
+        self._itershape_arg = itershape
+        self._requested_dtypes = _normalize_dtypes(op_dtypes, len(raw), dtype)
+        if op_flags is None:
+            self._op_flags = [
+                frozenset(("writeonly", "allocate"))
+                if value is None and requested is not None else mode
+                for value, requested, mode in zip(
+                    raw, self._requested_dtypes, self._op_flags
+                )
+            ]
 
+        arrays = []
+        scalar = []
+        for value, mode in zip(raw, self._op_flags):
+            if value is None:
+                if "allocate" not in mode:
+                    raise TypeError("Iterator operand required copying or buffering")
+                arrays.append(None)
+                scalar.append(False)
+                continue
+            is_scalar = not isinstance(value, ndarray)
+            if is_scalar and "readonly" not in mode:
+                raise TypeError("Iterator operand is flagged as writeable, but is an object")
+            arr = asarray(value)
+            if "readonly" not in mode and not arr.flags.writeable:
+                raise ValueError("operand array with iterator write flag set is read-only")
+            if arr.dtype.hasobject and "refs_ok" not in self._flags:
+                raise TypeError(
+                    "Iterator operand or requested dtype holds references, "
+                    "but the REFS_OK flag was not enabled"
+                )
+            arrays.append(arr)
+            scalar.append(is_scalar)
+        self._scalar_operands = tuple(scalar)
+
+        if op_axes is not None:
+            arrays, logical_shape = self._apply_op_axes(arrays, op_axes, itershape)
+        else:
+            input_shapes = [_shape_tuple(a.shape) for a in arrays if a is not None]
+            logical_shape = _broadcast_shape(input_shapes)
+            if itershape is not None:
+                requested = tuple(int(x) for x in itershape)
+                if any(x < -1 for x in requested):
+                    raise ValueError("invalid itershape dimension")
+                if len(requested) != len(logical_shape):
+                    if input_shapes:
+                        raise ValueError("operands could not be broadcast to requested shape")
+                    logical_shape = tuple(1 if x == -1 else x for x in requested)
+                else:
+                    logical_shape = tuple(
+                        inferred if asked == -1 else asked
+                        for inferred, asked in zip(logical_shape, requested)
+                    )
+
+        inputs = [a for a in arrays if a is not None]
+        inferred_dtype = result_type(*inputs) if inputs else None
+        allocation_order = self._allocation_order(inputs)
+        for i, (arr, mode, requested) in enumerate(
+                zip(arrays, self._op_flags, self._requested_dtypes)):
+            if arr is not None:
+                continue
+            if "readonly" in mode:
+                raise ValueError("An iterator operand was NULL, but was flagged READONLY")
+            target = requested if requested is not None else inferred_dtype
+            if target is None:
+                raise TypeError("cannot allocate an iterator output without a dtype")
+            arrays[i] = empty(logical_shape, dtype=target, order=allocation_order)
+
+        self._original_operands = tuple(arrays)
+        self._writebacks = []
+        arrays = self._prepare_temporary_operands(arrays, can_cast)
         self._operands = tuple(arrays)
-        self._logical_shape = _broadcast_shape(
-            [_shape_tuple(a.shape) for a in arrays]
-        )
+        self._logical_shape = tuple(logical_shape)
+        for arr, mode in zip(self._operands, self._op_flags):
+            if "no_broadcast" in mode:
+                padded = (1,) * (len(self._logical_shape) - arr.ndim) + tuple(arr.shape)
+                if padded != self._logical_shape:
+                    raise ValueError(
+                        f"non-broadcastable operand with shape {_compact_shape(arr.shape)} "
+                        f"doesn't match the broadcast shape "
+                        f"{_compact_shape(self._logical_shape)}"
+                    )
+
         self._removed_axes = set()
+        self._multi_index_removed = False
         self._axis_fast, self._axis_reverse = self._choose_axis_order()
         self._start = 0
         self._stop = _shape_size(self._logical_shape)
         self._pos = self._start
+        self._chunk_cache = None
+        self._chunk_start = None
+        self._chunk_len = 0
         if self._stop == 0 and "zerosize_ok" not in self._flags:
             raise ValueError("Iteration of zero-sized operands is not enabled")
+
+    def _allocation_order(self, inputs):
+        if self._order == "F":
+            return "F"
+        if self._order in ("A", "K") and inputs and all(
+                a.flags.f_contiguous and not a.flags.c_contiguous for a in inputs):
+            return "F"
+        return "C"
+
+    def _apply_op_axes(self, arrays, op_axes, itershape):
+        raise NotImplementedError("op_axes requires the extended axis-remapping lane")
+
+    def _prepare_temporary_operands(self, arrays, can_cast):
+        # Level 3 installs dtype conversion here.  Same-dtype operands retain
+        # identity, which is the required Level 2 copy/update-if-copy behavior.
+        return arrays
 
     def _mapped_stride(self, arr, axis):
         shift = len(self._logical_shape) - arr.ndim
@@ -134,19 +263,13 @@ class nditer:
             return list(range(ndim)), [False] * ndim
         if self._order == "A":
             use_f = all(a.flags.f_contiguous for a in self._operands)
-            if use_f:
-                return list(range(ndim)), [False] * ndim
-            return list(range(ndim - 1, -1, -1)), [False] * ndim
+            return (list(range(ndim)), [False] * ndim) if use_f else (
+                list(range(ndim - 1, -1, -1)), [False] * ndim)
 
-        # KEEPORDER: rank axes by the first operand that has a meaningful
-        # stride for both axes.  This reproduces the memory-increasing order
-        # for ordinary views, transposes, and negative-stride slices.
         def key(axis):
-            strides = [
-                abs(self._mapped_stride(arr, axis))
-                for arr in self._operands
-                if self._mapped_stride(arr, axis) != 0
-            ]
+            strides = [abs(self._mapped_stride(arr, axis))
+                       for arr in self._operands
+                       if self._mapped_stride(arr, axis) != 0]
             return (min(strides) if strides else 1 << 62, -axis)
 
         fast = sorted(range(ndim), key=key)
@@ -163,13 +286,26 @@ class nditer:
         coord = [0] * len(self._logical_shape)
         value = pos
         for axis in self._axis_fast:
+            if axis in self._removed_axes:
+                continue
             dim = self._logical_shape[axis]
             digit = value % dim if dim else 0
             value //= max(dim, 1)
             coord[axis] = dim - 1 - digit if self._axis_reverse[axis] else digit
-        for axis in self._removed_axes:
-            coord[axis] = 0
         return tuple(coord)
+
+    def _pos_for_coord(self, coord):
+        value = 0
+        multiplier = 1
+        for axis in self._axis_fast:
+            if axis in self._removed_axes:
+                continue
+            digit = coord[axis]
+            if self._axis_reverse[axis]:
+                digit = self._logical_shape[axis] - 1 - digit
+            value += digit * multiplier
+            multiplier *= self._logical_shape[axis]
+        return value
 
     def _operand_coord(self, arr, coord):
         shift = len(self._logical_shape) - arr.ndim
@@ -184,23 +320,111 @@ class nditer:
         if arr.ndim == 0:
             view = arr
         else:
-            slices = tuple(slice(i, i + 1) for i in coord)
-            view = arr[slices].reshape(())
+            view = arr[tuple(slice(i, i + 1) for i in coord)].reshape(())
         if not writeable:
-            # This changes only the yielded view header, never the operand.
             view.flags.writeable = False
         return view
+
+    def _external_chunk_len(self):
+        remaining = self._stop - self._pos
+        if remaining <= 0:
+            return 0
+        if "buffered" in self._flags and self._buffersize > 0:
+            return min(remaining, self._buffersize)
+        groups = self._coalesced_groups()
+        return min(remaining, groups[0] if groups else 1)
+
+    def _coalesced_groups(self):
+        axes = [axis for axis in self._axis_fast
+                if axis not in self._removed_axes
+                and self._logical_shape[axis] != 1]
+        if not axes:
+            return []
+        groups = [self._logical_shape[axes[0]]]
+        group_fast_axis = axes[0]
+        group_size = groups[0]
+        for axis in axes[1:]:
+            merge = True
+            for arr in self._operands:
+                fast_stride = abs(self._mapped_stride(arr, group_fast_axis))
+                slow_stride = abs(self._mapped_stride(arr, axis))
+                if fast_stride == slow_stride == 0:
+                    continue
+                if fast_stride == 0 or slow_stride != fast_stride * group_size:
+                    merge = False
+                    break
+            if merge:
+                group_size *= self._logical_shape[axis]
+                groups[-1] = group_size
+            else:
+                group_fast_axis = axis
+                group_size = self._logical_shape[axis]
+                groups.append(group_size)
+        return groups
+
+    def _make_external_chunks(self):
+        from . import array
+
+        n = self._external_chunk_len()
+        chunks = []
+        for arr, mode in zip(self._operands, self._op_flags):
+            if (len(self._logical_shape) == 1 and arr.ndim == 1
+                    and tuple(arr.shape) == self._logical_shape
+                    and not self._axis_reverse[0]):
+                chunk = arr[self._pos:self._pos + n]
+                if "readonly" in mode:
+                    chunk.flags.writeable = False
+                chunks.append(chunk)
+                continue
+            values = []
+            for offset in range(n):
+                coord = self._operand_coord(arr, self._coord_at(self._pos + offset))
+                values.append(arr[coord])
+            chunk = array(values, dtype=arr.dtype)
+            if "readonly" in mode:
+                chunk.flags.writeable = False
+            chunks.append(chunk)
+        self._chunk_start = self._pos
+        self._chunk_len = n
+        self._chunk_cache = tuple(chunks)
+
+    def _flush_external(self):
+        if self._chunk_cache is None:
+            return
+        for arr, mode, chunk in zip(self._operands, self._op_flags,
+                                    self._chunk_cache):
+            if "readonly" in mode or getattr(chunk, "base", None) is not None:
+                continue
+            for offset in range(self._chunk_len):
+                coord = self._operand_coord(
+                    arr, self._coord_at(self._chunk_start + offset))
+                arr[coord] = chunk[offset]
+        self._chunk_cache = None
+
+    def _flush_buffered_writebacks(self):
+        if "buffered" in self._flags:
+            for original, temporary in self._writebacks:
+                original[...] = temporary
 
     def _value_for_operand(self, operand):
         if self.finished:
             raise ValueError("Iterator is past the end")
+        if "external_loop" in self._flags:
+            if self._chunk_cache is None:
+                self._make_external_chunks()
+            return self._chunk_cache[operand]
         arr = self._operands[operand]
         coord = self._operand_coord(arr, self._coord_at(self._pos))
-        mode = self._op_flags[operand]
-        return self._cell_view(arr, coord, "readonly" not in mode)
+        return self._cell_view(arr, coord,
+                               "readonly" not in self._op_flags[operand])
+
+    def _check_open(self):
+        if self._closed:
+            raise ValueError("Iterator is invalid")
 
     @property
     def operands(self):
+        self._check_open()
         return self._operands
 
     @property
@@ -217,40 +441,114 @@ class nditer:
 
     @property
     def ndim(self):
-        # Multi-index tracking preserves the public broadcast dimensions.
         if "multi_index" in self._flags:
             return len(self._active_shape())
-        return 0 if not self._active_shape() else 1
+        return len(self._coalesced_groups())
 
     @property
     def shape(self):
+        if self._multi_index_removed:
+            raise ValueError("Iterator has no shape")
         if "multi_index" in self._flags:
             return self._active_shape()
         if not self._active_shape():
             return ()
-        return (self.itersize,)
+        return tuple(reversed(self._coalesced_groups()))
 
     def _active_shape(self):
-        return tuple(
-            dim
-            for axis, dim in enumerate(self._logical_shape)
-            if axis not in self._removed_axes
-        )
+        return tuple(dim for axis, dim in enumerate(self._logical_shape)
+                     if axis not in self._removed_axes)
 
     @property
     def finished(self):
-        return self._pos >= self._stop
+        return self._closed or self._pos >= self._stop
 
     @property
     def iterindex(self):
+        if not self._logical_shape:
+            return self._start
         return self._pos
 
     @iterindex.setter
     def iterindex(self, value):
+        if "external_loop" in self._flags or "buffered" in self._flags:
+            raise ValueError("Cannot jump to an iterator index with buffering")
         value = int(value)
         if value < self._start or value > self._stop:
             raise ValueError("Iterator index out of bounds")
+        self._flush_external()
         self._pos = value
+
+    @property
+    def iterrange(self):
+        return (self._start, self._stop)
+
+    @iterrange.setter
+    def iterrange(self, value):
+        if "ranged" not in self._flags:
+            raise ValueError("Iterator was not created with the RANGED flag")
+        start, stop = (int(x) for x in value)
+        total = _shape_size(self._active_shape())
+        if start < 0 or stop < start or stop > total:
+            raise ValueError("Iterator range is out of bounds")
+        self._flush_external()
+        self._start, self._stop, self._pos = start, stop, start
+
+    @property
+    def multi_index(self):
+        if "multi_index" not in self._flags:
+            raise ValueError("Iterator is not tracking a multi-index")
+        return self._coord_at(min(self._pos, max(self._stop - 1, 0)))
+
+    @multi_index.setter
+    def multi_index(self, value):
+        if "multi_index" not in self._flags or "external_loop" in self._flags \
+                or "buffered" in self._flags:
+            raise ValueError("Iterator is not tracking a writable multi-index")
+        coord = tuple(int(x) for x in value)
+        if len(coord) != len(self._logical_shape):
+            raise ValueError("Wrong number of indices")
+        if any(x < 0 or x >= dim for x, dim in zip(coord, self._logical_shape)):
+            raise ValueError("Iterator multi-index is out of bounds")
+        self._pos = self._pos_for_coord(coord)
+
+    def _flat_index(self, coord, fortran):
+        value = 0
+        multiplier = 1
+        axes = (range(len(self._logical_shape)) if fortran else
+                range(len(self._logical_shape) - 1, -1, -1))
+        for axis in axes:
+            value += coord[axis] * multiplier
+            multiplier *= self._logical_shape[axis]
+        return value
+
+    def _coord_from_flat(self, value, fortran):
+        size = _shape_size(self._logical_shape)
+        if value < 0 or value >= size:
+            raise ValueError("Iterator index is out of bounds")
+        coord = [0] * len(self._logical_shape)
+        axes = (range(len(coord)) if fortran else
+                range(len(coord) - 1, -1, -1))
+        for axis in axes:
+            dim = self._logical_shape[axis]
+            coord[axis] = value % dim
+            value //= dim
+        return tuple(coord)
+
+    @property
+    def index(self):
+        if not self._flags & {"c_index", "f_index"}:
+            raise ValueError("Iterator does not have an index")
+        coord = self._coord_at(min(self._pos, max(self._stop - 1, 0)))
+        return self._flat_index(coord, "f_index" in self._flags)
+
+    @index.setter
+    def index(self, value):
+        if not self._flags & {"c_index", "f_index"} \
+                or "external_loop" in self._flags or "buffered" in self._flags:
+            raise ValueError("Iterator does not have a writable index")
+        coord = self._coord_from_flat(int(value), "f_index" in self._flags)
+        self._pos = self._pos_for_coord(coord)
 
     @property
     def value(self):
@@ -263,12 +561,14 @@ class nditer:
 
     @property
     def has_delayed_bufalloc(self):
-        return False
+        return "delay_bufalloc" in self._flags and self._pos == self._start
 
     @property
     def itviews(self):
         from . import broadcast_to
-
+        if self._multi_index_removed:
+            return tuple(broadcast_to(a, self._logical_shape).reshape(-1)
+                         for a in self._operands)
         return tuple(broadcast_to(a, self._logical_shape) for a in self._operands)
 
     def __len__(self):
@@ -278,10 +578,12 @@ class nditer:
         return self
 
     def __next__(self):
+        self._flush_external()
+        self._flush_buffered_writebacks()
         if self.finished:
             raise StopIteration
         value = self.value
-        self._pos += 1
+        self._pos += self._chunk_len if "external_loop" in self._flags else 1
         return value
 
     def __getitem__(self, key):
@@ -301,20 +603,76 @@ class nditer:
         else:
             targets[...] = value
 
+    def __delitem__(self, key):
+        raise TypeError("iterator elements cannot be deleted")
+
     def iternext(self):
+        self._flush_external()
+        self._flush_buffered_writebacks()
         if not self.finished:
-            self._pos += 1
+            self._pos += self._chunk_len if "external_loop" in self._flags else 1
         return not self.finished
 
     def reset(self):
+        self._check_open()
+        self._flush_external()
+        self._flush_buffered_writebacks()
         self._pos = self._start
+
+    def remove_axis(self, axis):
+        if "multi_index" not in self._flags:
+            raise ValueError("Iterator is not tracking a multi-index")
+        axis = int(axis)
+        ndim = len(self._logical_shape)
+        if axis < 0:
+            axis += ndim
+        if axis < 0 or axis >= ndim:
+            raise ValueError("axis is out of bounds")
+        self._removed_axes.add(axis)
+        self._stop = self._start + _shape_size(self._active_shape())
+        self._pos = self._start
+
+    def remove_multi_index(self):
+        if "multi_index" not in self._flags:
+            raise ValueError("Iterator is not tracking a multi-index")
+        self._flags.remove("multi_index")
+        self._multi_index_removed = True
+        self._pos = self._start
+
+    def enable_external_loop(self):
+        if self._flags & {"multi_index", "c_index", "f_index"}:
+            raise ValueError(
+                "Iterator flag EXTERNAL_LOOP cannot be used if an index or "
+                "multi-index is being tracked"
+            )
+        self._flags.add("external_loop")
+        self._chunk_cache = None
+
+    def copy(self):
+        result = _copy.copy(self)
+        result._flags = set(self._flags)
+        result._removed_axes = set(self._removed_axes)
+        result._chunk_cache = None
+        result._writebacks = list(self._writebacks)
+        return result
 
     def close(self, *args, **kwargs):
         if args or kwargs:
             raise TypeError("close() takes no arguments")
+        if self._closed:
+            return
+        self._flush_external()
+        for original, temporary in self._writebacks:
+            original[...] = temporary
+            try:
+                original.flags.writeable = True
+            except Exception:
+                pass
         self._closed = True
 
     def __enter__(self):
+        if self._closed:
+            raise RuntimeError("Cannot enter a closed iterator")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -324,4 +682,3 @@ class nditer:
 
 def nested_iters(*args, **kwargs):
     raise NotImplementedError("numpy.nested_iters is not implemented yet")
-
