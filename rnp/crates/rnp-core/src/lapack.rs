@@ -92,6 +92,61 @@ mod sys {
                       s: *mut f64, rcond: *const f64, rank: *mut i64,
                       work: *mut C64v, lwork: *const i64, rwork: *mut f64,
                       iwork: *mut i64, info: *mut i64);
+
+        #[link_name = "dgesdd$NEWLAPACK$ILP64"]
+        pub fn dgesdd(jobz: *const u8, m: *const i64, n: *const i64,
+                      a: *mut f64, lda: *const i64, s: *mut f64,
+                      u: *mut f64, ldu: *const i64, vt: *mut f64,
+                      ldvt: *const i64, work: *mut f64, lwork: *const i64,
+                      iwork: *mut i64, info: *mut i64);
+        #[link_name = "zgesdd$NEWLAPACK$ILP64"]
+        pub fn zgesdd(jobz: *const u8, m: *const i64, n: *const i64,
+                      a: *mut C64v, lda: *const i64, s: *mut f64,
+                      u: *mut C64v, ldu: *const i64, vt: *mut C64v,
+                      ldvt: *const i64, work: *mut C64v, lwork: *const i64,
+                      rwork: *mut f64, iwork: *mut i64, info: *mut i64);
+
+        #[link_name = "dsyevd$NEWLAPACK$ILP64"]
+        pub fn dsyevd(jobz: *const u8, uplo: *const u8, n: *const i64,
+                      a: *mut f64, lda: *const i64, w: *mut f64,
+                      work: *mut f64, lwork: *const i64, iwork: *mut i64,
+                      liwork: *const i64, info: *mut i64);
+        #[link_name = "zheevd$NEWLAPACK$ILP64"]
+        pub fn zheevd(jobz: *const u8, uplo: *const u8, n: *const i64,
+                      a: *mut C64v, lda: *const i64, w: *mut f64,
+                      work: *mut C64v, lwork: *const i64, rwork: *mut f64,
+                      lrwork: *const i64, iwork: *mut i64,
+                      liwork: *const i64, info: *mut i64);
+
+        #[link_name = "dgeev$NEWLAPACK$ILP64"]
+        pub fn dgeev(jobvl: *const u8, jobvr: *const u8, n: *const i64,
+                     a: *mut f64, lda: *const i64, wr: *mut f64, wi: *mut f64,
+                     vl: *mut f64, ldvl: *const i64, vr: *mut f64,
+                     ldvr: *const i64, work: *mut f64, lwork: *const i64,
+                     info: *mut i64);
+        #[link_name = "zgeev$NEWLAPACK$ILP64"]
+        pub fn zgeev(jobvl: *const u8, jobvr: *const u8, n: *const i64,
+                     a: *mut C64v, lda: *const i64, w: *mut C64v,
+                     vl: *mut C64v, ldvl: *const i64, vr: *mut C64v,
+                     ldvr: *const i64, work: *mut C64v, lwork: *const i64,
+                     rwork: *mut f64, info: *mut i64);
+
+        #[link_name = "dgeqrf$NEWLAPACK$ILP64"]
+        pub fn dgeqrf(m: *const i64, n: *const i64, a: *mut f64,
+                      lda: *const i64, tau: *mut f64, work: *mut f64,
+                      lwork: *const i64, info: *mut i64);
+        #[link_name = "zgeqrf$NEWLAPACK$ILP64"]
+        pub fn zgeqrf(m: *const i64, n: *const i64, a: *mut C64v,
+                      lda: *const i64, tau: *mut C64v, work: *mut C64v,
+                      lwork: *const i64, info: *mut i64);
+        #[link_name = "dorgqr$NEWLAPACK$ILP64"]
+        pub fn dorgqr(m: *const i64, n: *const i64, k: *const i64,
+                      a: *mut f64, lda: *const i64, tau: *mut f64,
+                      work: *mut f64, lwork: *const i64, info: *mut i64);
+        #[link_name = "zungqr$NEWLAPACK$ILP64"]
+        pub fn zungqr(m: *const i64, n: *const i64, k: *const i64,
+                      a: *mut C64v, lda: *const i64, tau: *mut C64v,
+                      work: *mut C64v, lwork: *const i64, info: *mut i64);
     }
 }
 
@@ -100,6 +155,7 @@ trait LapackScalar: Copy + Default {
     fn from_scalar(value: Scalar) -> Self;
     fn to_scalar(self) -> Scalar;
     fn one() -> Self;
+    fn nan() -> Self;
     fn gesv(n: i64, nrhs: i64, a: &mut [Self], piv: &mut [i64], b: &mut [Self]) -> i64;
     fn getrf(n: i64, a: &mut [Self], piv: &mut [i64]) -> i64;
     fn potrf(uplo: u8, n: i64, a: &mut [Self]) -> i64;
@@ -114,6 +170,7 @@ macro_rules! impl_real_lapack {
             fn from_scalar(value: Scalar) -> Self { value.as_f64() as $t }
             fn to_scalar(self) -> Scalar { Scalar::Float(self as f64) }
             fn one() -> Self { 1.0 }
+            fn nan() -> Self { <$t>::NAN }
             fn gesv(n: i64, nrhs: i64, a: &mut [Self], piv: &mut [i64], b: &mut [Self]) -> i64 {
                 let lda = n.max(1);
                 let ldb = n.max(1);
@@ -169,6 +226,7 @@ macro_rules! impl_complex_lapack {
                 Scalar::Complex(C64v::new(self.re as f64, self.im as f64))
             }
             fn one() -> Self { Complex::new(1.0, 0.0) }
+            fn nan() -> Self { Complex::new(<$real>::NAN, <$real>::NAN) }
             fn gesv(n: i64, nrhs: i64, a: &mut [Self], piv: &mut [i64], b: &mut [Self]) -> i64 {
                 let lda = n.max(1);
                 let ldb = n.max(1);
@@ -312,6 +370,51 @@ impl_complex_gelsd!(C32, f32, sys::cgelsd);
 #[cfg(all(target_os = "macos", target_vendor = "apple"))]
 impl_complex_gelsd!(C64v, f64, sys::zgelsd);
 
+trait QrScalar: LapackScalar {
+    fn geqrf(m: i64, n: i64, a: &mut [Self], tau: &mut [Self]) -> i64;
+    fn gqr(m: i64, n: i64, k: i64, a: &mut [Self], tau: &mut [Self]) -> i64;
+}
+
+#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+impl QrScalar for f64 {
+    fn geqrf(m: i64, n: i64, a: &mut [Self], tau: &mut [Self]) -> i64 {
+        let lda=m.max(1);let mut query=0.0;let q=-1i64;let mut info=0i64;
+        // SAFETY: lwork=-1 query with m*n matrix and min(m,n) tau buffers.
+        unsafe{sys::dgeqrf(&m,&n,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),&mut query,&q,&mut info)};
+        if info!=0{return info;}let lw=(query as i64).max(n.max(1));let mut work=vec![0.0;lw as usize];
+        // SAFETY: `work` has the queried size and all data extents are unchanged.
+        unsafe{sys::dgeqrf(&m,&n,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),work.as_mut_ptr(),&lw,&mut info)};info
+    }
+    fn gqr(m:i64,n:i64,k:i64,a:&mut[Self],tau:&mut[Self])->i64{
+        let lda=m.max(1);let mut query=0.0;let q=-1i64;let mut info=0i64;
+        // SAFETY: lwork=-1 query with m*n Q storage and k reflector scalars.
+        unsafe{sys::dorgqr(&m,&n,&k,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),&mut query,&q,&mut info)};
+        if info!=0{return info;}let lw=(query as i64).max(n.max(1));let mut work=vec![0.0;lw as usize];
+        // SAFETY: `work` has the queried size and all other extents are unchanged.
+        unsafe{sys::dorgqr(&m,&n,&k,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),work.as_mut_ptr(),&lw,&mut info)};info
+    }
+}
+
+#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+impl QrScalar for C64v {
+    fn geqrf(m:i64,n:i64,a:&mut[Self],tau:&mut[Self])->i64{
+        let lda=m.max(1);let mut query=C64v::new(0.0,0.0);let q=-1i64;let mut info=0i64;
+        // SAFETY: lwork=-1 query with m*n matrix and min(m,n) tau buffers.
+        unsafe{sys::zgeqrf(&m,&n,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),&mut query,&q,&mut info)};
+        if info!=0{return info;}let lw=(query.re as i64).max(n.max(1));let mut work=vec![C64v::new(0.0,0.0);lw as usize];
+        // SAFETY: `work` has the queried size and all data extents are unchanged.
+        unsafe{sys::zgeqrf(&m,&n,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),work.as_mut_ptr(),&lw,&mut info)};info
+    }
+    fn gqr(m:i64,n:i64,k:i64,a:&mut[Self],tau:&mut[Self])->i64{
+        let lda=m.max(1);let mut query=C64v::new(0.0,0.0);let q=-1i64;let mut info=0i64;
+        // SAFETY: lwork=-1 query with m*n Q storage and k reflector scalars.
+        unsafe{sys::zungqr(&m,&n,&k,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),&mut query,&q,&mut info)};
+        if info!=0{return info;}let lw=(query.re as i64).max(n.max(1));let mut work=vec![C64v::new(0.0,0.0);lw as usize];
+        // SAFETY: `work` has the queried size and all other extents are unchanged.
+        unsafe{sys::zungqr(&m,&n,&k,a.as_mut_ptr(),&lda,tau.as_mut_ptr(),work.as_mut_ptr(),&lw,&mut info)};info
+    }
+}
+
 fn unavailable() -> Error {
     Error::NotImplemented("numpy.linalg requires Apple Accelerate LAPACK".into())
 }
@@ -336,7 +439,12 @@ fn rhs_to_col_major<T: LapackScalar>(b: &NdArray, base: isize, rows: usize, cols
     matrix_to_col_major::<T>(b, base, rows, cols)
 }
 
-fn solve_impl<T: LapackScalar>(a: &NdArray, b: &NdArray, vector: bool) -> Result<NdArray> {
+fn solve_impl<T: LapackScalar>(
+    a: &NdArray,
+    b: &NdArray,
+    vector: bool,
+    singular_nan: bool,
+) -> Result<NdArray> {
     let n = a.shape[a.ndim() - 1] as usize;
     let b_rows = if vector { b.shape[b.ndim() - 1] } else { b.shape[b.ndim() - 2] };
     if b_rows != n as isize {
@@ -366,7 +474,18 @@ fn solve_impl<T: LapackScalar>(a: &NdArray, b: &NdArray, vector: bool) -> Result
         let mut bb = rhs_to_col_major::<T>(&bv, bbase, n, nrhs, vector);
         let mut piv = vec![0i64; n];
         let info = T::gesv(n as i64, nrhs as i64, &mut aa, &mut piv, &mut bb);
-        if info != 0 { return Err(Error::ValueError("Singular matrix".into())); }
+        if info != 0 {
+            if !singular_nan {
+                return Err(Error::ValueError("Singular matrix".into()));
+            }
+            for row in 0..n {
+                for col in 0..nrhs {
+                    let flat = if vector { batch_i * n + row } else { batch_i * n * nrhs + row * nrhs + col };
+                    out.set_flat(flat, T::nan().to_scalar());
+                }
+            }
+            continue;
+        }
         for row in 0..n {
             for col in 0..nrhs {
                 let src = bb[row + col * n];
@@ -382,20 +501,27 @@ fn solve_impl<T: LapackScalar>(a: &NdArray, b: &NdArray, vector: bool) -> Result
 pub fn solve(a: &NdArray, b: &NdArray, vector: bool, dtype: DType) -> Result<NdArray> {
     if !HAVE_LAPACK { return Err(unavailable()); }
     match dtype {
-        DType::F32 => solve_impl::<f32>(a, b, vector),
-        DType::F64 => solve_impl::<f64>(a, b, vector),
-        DType::C64 => solve_impl::<C32>(a, b, vector),
-        DType::C128 => solve_impl::<C64v>(a, b, vector),
+        DType::F32 => solve_impl::<f32>(a, b, vector, false),
+        DType::F64 => solve_impl::<f64>(a, b, vector, false),
+        DType::C64 => solve_impl::<C32>(a, b, vector, false),
+        DType::C128 => solve_impl::<C64v>(a, b, vector, false),
         _ => Err(Error::TypeError("unsupported LAPACK dtype".into())),
     }
 }
 
 /// Invert square matrices by solving against an identity matrix.
-pub fn inv(a: &NdArray, dtype: DType) -> Result<NdArray> {
+pub fn inv(a: &NdArray, dtype: DType, singular_nan: bool) -> Result<NdArray> {
     let n = a.shape[a.ndim() - 1];
     let mut identity = NdArray::zeros(vec![n, n], dtype)?;
     for i in 0..n as usize { identity.set_flat(i * n as usize + i, Scalar::Int(1)); }
-    solve(a, &identity, false, dtype)
+    if !HAVE_LAPACK { return Err(unavailable()); }
+    match dtype {
+        DType::F32 => solve_impl::<f32>(a, &identity, false, singular_nan),
+        DType::F64 => solve_impl::<f64>(a, &identity, false, singular_nan),
+        DType::C64 => solve_impl::<C32>(a, &identity, false, singular_nan),
+        DType::C128 => solve_impl::<C64v>(a, &identity, false, singular_nan),
+        _ => Err(Error::TypeError("unsupported LAPACK dtype".into())),
+    }
 }
 
 fn slogdet_impl<T: LapackScalar>(a: &NdArray) -> Result<(NdArray, NdArray)> {
@@ -539,3 +665,238 @@ pub fn lstsq(a: &NdArray, b: &NdArray, rcond: f64, dtype: DType) -> Result<Lstsq
         _ => Err(Error::TypeError("unsupported LAPACK dtype".into())),
     }
 }
+
+pub struct SvdResult {
+    pub u: Option<NdArray>,
+    pub singular_values: NdArray,
+    pub vh: Option<NdArray>,
+}
+
+fn svd_real_one(mut a: Vec<f64>, m: usize, n: usize, jobz: u8)
+    -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    let k = m.min(n);
+    let (ucols, vtrows) = match jobz { b'A' => (m, n), b'S' => (k, k), _ => (0, 0) };
+    if k == 0 {
+        let mut u = vec![0.0; m * ucols];
+        let mut vt = vec![0.0; vtrows * n];
+        if jobz == b'A' {
+            for i in 0..m { u[i + i * m] = 1.0; }
+            for i in 0..n { vt[i + i * n] = 1.0; }
+        }
+        return Ok((u, Vec::new(), vt));
+    }
+    let lda = (m as i64).max(1);
+    let ldu = lda;
+    let ldvt = (vtrows as i64).max(1);
+    let mut s = vec![0.0; k];
+    let mut u = vec![0.0; (m * ucols).max(1)];
+    let mut vt = vec![0.0; (vtrows * n).max(1)];
+    let mut iwork = vec![0i64; (8 * k).max(1)];
+    let mut query = 0.0;
+    let mut info = 0i64;
+    let query_len = -1i64;
+    // SAFETY: all data arrays use the LAPACK dimensions above; lwork=-1 is
+    // the documented workspace query and the query scalar is writable.
+    unsafe { sys::dgesdd(&jobz, &(m as i64), &(n as i64), a.as_mut_ptr(), &lda,
+                         s.as_mut_ptr(), u.as_mut_ptr(), &ldu, vt.as_mut_ptr(),
+                         &ldvt, &mut query, &query_len, iwork.as_mut_ptr(), &mut info) };
+    if info != 0 { return Err(Error::ValueError("SVD did not converge".into())); }
+    let lwork = (query as i64).max(1);
+    let mut work = vec![0.0; lwork as usize];
+    // SAFETY: `work` has the queried size and every other buffer is unchanged.
+    unsafe { sys::dgesdd(&jobz, &(m as i64), &(n as i64), a.as_mut_ptr(), &lda,
+                         s.as_mut_ptr(), u.as_mut_ptr(), &ldu, vt.as_mut_ptr(),
+                         &ldvt, work.as_mut_ptr(), &lwork, iwork.as_mut_ptr(), &mut info) };
+    if info != 0 { return Err(Error::ValueError("SVD did not converge".into())); }
+    u.truncate(m * ucols);
+    vt.truncate(vtrows * n);
+    Ok((u, s, vt))
+}
+
+fn svd_complex_one(mut a: Vec<C64v>, m: usize, n: usize, jobz: u8)
+    -> Result<(Vec<C64v>, Vec<f64>, Vec<C64v>)> {
+    let k = m.min(n);
+    let (ucols, vtrows) = match jobz { b'A' => (m, n), b'S' => (k, k), _ => (0, 0) };
+    if k == 0 {
+        let mut u = vec![C64v::new(0.0, 0.0); m * ucols];
+        let mut vt = vec![C64v::new(0.0, 0.0); vtrows * n];
+        if jobz == b'A' {
+            for i in 0..m { u[i + i * m] = C64v::new(1.0, 0.0); }
+            for i in 0..n { vt[i + i * n] = C64v::new(1.0, 0.0); }
+        }
+        return Ok((u, Vec::new(), vt));
+    }
+    let lda = (m as i64).max(1);
+    let ldu = lda;
+    let ldvt = (vtrows as i64).max(1);
+    let mut s = vec![0.0; k];
+    let mut u = vec![C64v::new(0.0, 0.0); (m * ucols).max(1)];
+    let mut vt = vec![C64v::new(0.0, 0.0); (vtrows * n).max(1)];
+    let mut iwork = vec![0i64; (8 * k).max(1)];
+    let rcount = if jobz == b'N' { 7 * k } else { 5 * k * k + 5 * k };
+    let mut rwork = vec![0.0; (2 * rcount).max(1)];
+    let mut query = C64v::new(0.0, 0.0);
+    let mut info = 0i64;
+    let query_len = -1i64;
+    // SAFETY: as the real query, with complex element and real workspace.
+    unsafe { sys::zgesdd(&jobz, &(m as i64), &(n as i64), a.as_mut_ptr(), &lda,
+                         s.as_mut_ptr(), u.as_mut_ptr(), &ldu, vt.as_mut_ptr(),
+                         &ldvt, &mut query, &query_len, rwork.as_mut_ptr(),
+                         iwork.as_mut_ptr(), &mut info) };
+    if info != 0 { return Err(Error::ValueError("SVD did not converge".into())); }
+    let lwork = (query.re as i64).max(1);
+    let mut work = vec![C64v::new(0.0, 0.0); lwork as usize];
+    // SAFETY: `work` has the queried size and all other buffers retain their extents.
+    unsafe { sys::zgesdd(&jobz, &(m as i64), &(n as i64), a.as_mut_ptr(), &lda,
+                         s.as_mut_ptr(), u.as_mut_ptr(), &ldu, vt.as_mut_ptr(),
+                         &ldvt, work.as_mut_ptr(), &lwork, rwork.as_mut_ptr(),
+                         iwork.as_mut_ptr(), &mut info) };
+    if info != 0 { return Err(Error::ValueError("SVD did not converge".into())); }
+    u.truncate(m * ucols);
+    vt.truncate(vtrows * n);
+    Ok((u, s, vt))
+}
+
+fn write_col_major<T: LapackScalar>(out: &mut NdArray, batch_i: usize,
+                                     data: &[T], rows: usize, cols: usize) {
+    for row in 0..rows {
+        for col in 0..cols {
+            out.set_flat(batch_i * rows * cols + row * cols + col,
+                         data[row + col * rows].to_scalar());
+        }
+    }
+}
+
+pub fn svd(a: &NdArray, full: bool, vectors: bool, complex: bool) -> Result<SvdResult> {
+    if !HAVE_LAPACK { return Err(unavailable()); }
+    let m = a.shape[a.ndim() - 2] as usize;
+    let n = a.shape[a.ndim() - 1] as usize;
+    let k = m.min(n);
+    let batch = a.shape[..a.ndim() - 2].to_vec();
+    let jobz = if !vectors { b'N' } else if full { b'A' } else { b'S' };
+    let (ucols, vtrows) = if full { (m, n) } else { (k, k) };
+    let mut sshape = batch.clone(); sshape.push(k as isize);
+    let mut singular_values = NdArray::zeros(sshape, DType::F64)?;
+    let mut u = if vectors { let mut sh=batch.clone(); sh.extend([m as isize, ucols as isize]); Some(NdArray::zeros(sh, if complex {DType::C128}else{DType::F64})?) } else { None };
+    let mut vh = if vectors { let mut sh=batch.clone(); sh.extend([vtrows as isize, n as isize]); Some(NdArray::zeros(sh, if complex {DType::C128}else{DType::F64})?) } else { None };
+    let ao = offsets(&batch, &a.strides[..batch.len()], a.byte_offset);
+    for (batch_i, abase) in ao.enumerate() {
+        if complex {
+            let aa = matrix_to_col_major::<C64v>(a, abase, m, n);
+            let (uu, ss, vv) = svd_complex_one(aa, m, n, jobz)?;
+            for (i, value) in ss.into_iter().enumerate() { singular_values.set_flat(batch_i*k+i, Scalar::Float(value)); }
+            if let Some(out) = &mut u { write_col_major(out, batch_i, &uu, m, ucols); }
+            if let Some(out) = &mut vh { write_col_major(out, batch_i, &vv, vtrows, n); }
+        } else {
+            let aa = matrix_to_col_major::<f64>(a, abase, m, n);
+            let (uu, ss, vv) = svd_real_one(aa, m, n, jobz)?;
+            for (i, value) in ss.into_iter().enumerate() { singular_values.set_flat(batch_i*k+i, Scalar::Float(value)); }
+            if let Some(out) = &mut u { write_col_major(out, batch_i, &uu, m, ucols); }
+            if let Some(out) = &mut vh { write_col_major(out, batch_i, &vv, vtrows, n); }
+        }
+    }
+    Ok(SvdResult { u, singular_values, vh })
+}
+
+pub struct EigResult {
+    pub values: NdArray,
+    pub vectors: Option<NdArray>,
+}
+
+fn eig_real_one(mut a: Vec<f64>, n: usize, vectors: bool) -> Result<(Vec<C64v>, Vec<C64v>)> {
+    if n == 0 { return Ok((Vec::new(), Vec::new())); }
+    let jobvl = b'N'; let jobvr = if vectors { b'V' } else { b'N' };
+    let ni = n as i64; let lda=ni.max(1); let ldvl=1i64; let ldvr=if vectors {lda}else{1};
+    let mut wr=vec![0.0;n]; let mut wi=vec![0.0;n]; let mut vl=vec![0.0;1];
+    let mut vr=vec![0.0;if vectors {n*n}else{1}]; let mut query=0.0; let mut info=0i64; let q=-1i64;
+    // SAFETY: lwork=-1 workspace query with all LAPACK matrix/vector extents live.
+    unsafe { sys::dgeev(&jobvl,&jobvr,&ni,a.as_mut_ptr(),&lda,wr.as_mut_ptr(),wi.as_mut_ptr(),vl.as_mut_ptr(),&ldvl,vr.as_mut_ptr(),&ldvr,&mut query,&q,&mut info) };
+    if info != 0 { return Err(Error::ValueError("Eigenvalues did not converge".into())); }
+    let lwork=(query as i64).max(1); let mut work=vec![0.0;lwork as usize];
+    // SAFETY: `work` has the queried size; all other buffers retain their extents.
+    unsafe { sys::dgeev(&jobvl,&jobvr,&ni,a.as_mut_ptr(),&lda,wr.as_mut_ptr(),wi.as_mut_ptr(),vl.as_mut_ptr(),&ldvl,vr.as_mut_ptr(),&ldvr,work.as_mut_ptr(),&lwork,&mut info) };
+    if info != 0 { return Err(Error::ValueError("Eigenvalues did not converge".into())); }
+    let values=(0..n).map(|i| C64v::new(wr[i],wi[i])).collect();
+    let mut out=vec![C64v::new(0.0,0.0);if vectors {n*n}else{0}];
+    if vectors { let mut j=0; while j<n { if wi[j]==0.0 { for r in 0..n { out[r+j*n]=C64v::new(vr[r+j*n],0.0); } j+=1; } else { for r in 0..n { let z=C64v::new(vr[r+j*n],vr[r+(j+1)*n]); out[r+j*n]=z; out[r+(j+1)*n]=z.conj(); } j+=2; } } }
+    Ok((values,out))
+}
+
+fn eig_complex_one(mut a: Vec<C64v>, n: usize, vectors: bool) -> Result<(Vec<C64v>, Vec<C64v>)> {
+    if n == 0 { return Ok((Vec::new(), Vec::new())); }
+    let jobvl=b'N'; let jobvr=if vectors {b'V'} else {b'N'}; let ni=n as i64;
+    let lda=ni.max(1); let ldvl=1i64; let ldvr=if vectors {lda}else{1};
+    let mut w=vec![C64v::new(0.0,0.0);n]; let mut vl=vec![C64v::new(0.0,0.0);1];
+    let mut vr=vec![C64v::new(0.0,0.0);if vectors {n*n}else{1}]; let mut rw=vec![0.0;2*n];
+    let mut query=C64v::new(0.0,0.0); let mut info=0i64; let q=-1i64;
+    // SAFETY: lwork=-1 workspace query with valid complex and real work arrays.
+    unsafe { sys::zgeev(&jobvl,&jobvr,&ni,a.as_mut_ptr(),&lda,w.as_mut_ptr(),vl.as_mut_ptr(),&ldvl,vr.as_mut_ptr(),&ldvr,&mut query,&q,rw.as_mut_ptr(),&mut info) };
+    if info != 0 { return Err(Error::ValueError("Eigenvalues did not converge".into())); }
+    let lwork=(query.re as i64).max(1); let mut work=vec![C64v::new(0.0,0.0);lwork as usize];
+    // SAFETY: `work` has the queried size and all other extents are unchanged.
+    unsafe { sys::zgeev(&jobvl,&jobvr,&ni,a.as_mut_ptr(),&lda,w.as_mut_ptr(),vl.as_mut_ptr(),&ldvl,vr.as_mut_ptr(),&ldvr,work.as_mut_ptr(),&lwork,rw.as_mut_ptr(),&mut info) };
+    if info != 0 { return Err(Error::ValueError("Eigenvalues did not converge".into())); }
+    if !vectors { vr.clear(); }
+    Ok((w,vr))
+}
+
+pub fn eig(a: &NdArray, vectors: bool, complex_input: bool) -> Result<EigResult> {
+    if !HAVE_LAPACK { return Err(unavailable()); }
+    let n=a.shape[a.ndim()-1] as usize; let batch=a.shape[..a.ndim()-2].to_vec();
+    let mut vshape=batch.clone(); vshape.push(n as isize); let mut values=NdArray::zeros(vshape,DType::C128)?;
+    let mut vectors_out=if vectors { let mut sh=batch.clone(); sh.extend([n as isize,n as isize]); Some(NdArray::zeros(sh,DType::C128)?) } else {None};
+    for (bi,base) in offsets(&batch,&a.strides[..batch.len()],a.byte_offset).enumerate() {
+        let (w,v)=if complex_input {eig_complex_one(matrix_to_col_major::<C64v>(a,base,n,n),n,vectors)?} else {eig_real_one(matrix_to_col_major::<f64>(a,base,n,n),n,vectors)?};
+        for (i,z) in w.into_iter().enumerate(){values.set_flat(bi*n+i,Scalar::Complex(z));}
+        if let Some(out)=&mut vectors_out {write_col_major(out,bi,&v,n,n);}
+    }
+    Ok(EigResult{values,vectors:vectors_out})
+}
+
+fn eigh_real_one(mut a: Vec<f64>, n: usize, upper: bool, vectors: bool) -> Result<(Vec<f64>,Vec<f64>)> {
+    if n==0{return Ok((Vec::new(),Vec::new()));} let job=if vectors{b'V'}else{b'N'}; let uplo=if upper{b'U'}else{b'L'};
+    let ni=n as i64;let lda=ni.max(1);let mut w=vec![0.0;n];let mut qw=0.0;let mut qi=0i64;let mut info=0i64;let q=-1i64;
+    // SAFETY: both workspace lengths are -1 queries and all matrix buffers are live.
+    unsafe{sys::dsyevd(&job,&uplo,&ni,a.as_mut_ptr(),&lda,w.as_mut_ptr(),&mut qw,&q,&mut qi,&q,&mut info)};
+    if info!=0{return Err(Error::ValueError("Eigenvalues did not converge".into()));}let lw=(qw as i64).max(1);let li=qi.max(1);let mut work=vec![0.0;lw as usize];let mut iw=vec![0i64;li as usize];
+    // SAFETY: queried workspace sizes and unchanged matrix extents.
+    unsafe{sys::dsyevd(&job,&uplo,&ni,a.as_mut_ptr(),&lda,w.as_mut_ptr(),work.as_mut_ptr(),&lw,iw.as_mut_ptr(),&li,&mut info)};
+    if info!=0{return Err(Error::ValueError("Eigenvalues did not converge".into()));}if !vectors{a.clear();}Ok((w,a))
+}
+
+fn eigh_complex_one(mut a: Vec<C64v>, n: usize, upper: bool, vectors: bool) -> Result<(Vec<f64>,Vec<C64v>)> {
+    if n==0{return Ok((Vec::new(),Vec::new()));}let job=if vectors{b'V'}else{b'N'};let uplo=if upper{b'U'}else{b'L'};let ni=n as i64;let lda=ni.max(1);
+    let mut w=vec![0.0;n];let mut qw=C64v::new(0.0,0.0);let mut qr=0.0;let mut qi=0i64;let mut info=0i64;let q=-1i64;
+    // SAFETY: all three workspace lengths are -1 queries with writable scalars.
+    unsafe{sys::zheevd(&job,&uplo,&ni,a.as_mut_ptr(),&lda,w.as_mut_ptr(),&mut qw,&q,&mut qr,&q,&mut qi,&q,&mut info)};
+    if info!=0{return Err(Error::ValueError("Eigenvalues did not converge".into()));}let lw=(qw.re as i64).max(1);let lr=(qr as i64).max(1);let li=qi.max(1);
+    let mut work=vec![C64v::new(0.0,0.0);lw as usize];let mut rw=vec![0.0;lr as usize];let mut iw=vec![0i64;li as usize];
+    // SAFETY: queried workspace sizes and unchanged matrix extents.
+    unsafe{sys::zheevd(&job,&uplo,&ni,a.as_mut_ptr(),&lda,w.as_mut_ptr(),work.as_mut_ptr(),&lw,rw.as_mut_ptr(),&lr,iw.as_mut_ptr(),&li,&mut info)};
+    if info!=0{return Err(Error::ValueError("Eigenvalues did not converge".into()));}if !vectors{a.clear();}Ok((w,a))
+}
+
+pub fn eigh(a:&NdArray,upper:bool,vectors:bool,complex:bool)->Result<EigResult>{
+    if !HAVE_LAPACK{return Err(unavailable());}let n=a.shape[a.ndim()-1] as usize;let batch=a.shape[..a.ndim()-2].to_vec();let mut sh=batch.clone();sh.push(n as isize);let mut values=NdArray::zeros(sh,DType::F64)?;
+    let mut vo=if vectors{let mut s=batch.clone();s.extend([n as isize,n as isize]);Some(NdArray::zeros(s,if complex{DType::C128}else{DType::F64})?)}else{None};
+    for(bi,base)in offsets(&batch,&a.strides[..batch.len()],a.byte_offset).enumerate(){if complex{let(w,v)=eigh_complex_one(matrix_to_col_major::<C64v>(a,base,n,n),n,upper,vectors)?;for(i,x)in w.into_iter().enumerate(){values.set_flat(bi*n+i,Scalar::Float(x));}if let Some(out)=&mut vo{write_col_major(out,bi,&v,n,n);}}else{let(w,v)=eigh_real_one(matrix_to_col_major::<f64>(a,base,n,n),n,upper,vectors)?;for(i,x)in w.into_iter().enumerate(){values.set_flat(bi*n+i,Scalar::Float(x));}if let Some(out)=&mut vo{write_col_major(out,bi,&v,n,n);}}}
+    Ok(EigResult{values,vectors:vo})
+}
+
+fn qr_raw_impl<T:QrScalar>(a:&NdArray)->Result<NdArray>{
+    let m=a.shape[a.ndim()-2] as usize;let n=a.shape[a.ndim()-1] as usize;let k=m.min(n);let batch=a.shape[..a.ndim()-2].to_vec();let mut tshape=batch.clone();tshape.push(k as isize);let mut tau_out=NdArray::zeros(tshape,T::DTYPE)?;
+    for(bi,base)in offsets(&batch,&a.strides[..batch.len()],a.byte_offset).enumerate(){if k==0{continue;}let mut aa=matrix_to_col_major::<T>(a,base,m,n);let mut tau=vec![T::default();k];if T::geqrf(m as i64,n as i64,&mut aa,&mut tau)!=0{return Err(Error::ValueError("Incorrect argument found while performing QR factorization".into()));}
+        let rs=a.strides[a.ndim()-2];let cs=a.strides[a.ndim()-1];for row in 0..m{for col in 0..n{a.write_at(base+row as isize*rs+col as isize*cs,aa[row+col*m].to_scalar());}}for(i,value)in tau.into_iter().enumerate(){tau_out.set_flat(bi*k+i,value.to_scalar());}}
+    Ok(tau_out)
+}
+
+pub fn qr_raw(a:&NdArray,complex:bool)->Result<NdArray>{if !HAVE_LAPACK{return Err(unavailable());}if complex{qr_raw_impl::<C64v>(a)}else{qr_raw_impl::<f64>(a)}}
+
+fn qr_q_impl<T:QrScalar>(a:&NdArray,tau:&NdArray,complete:bool)->Result<NdArray>{
+    let m=a.shape[a.ndim()-2] as usize;let n=a.shape[a.ndim()-1] as usize;let k=m.min(n);let mc=if complete{m}else{k};let batch=a.shape[..a.ndim()-2].to_vec();let mut shape=batch.clone();shape.extend([m as isize,mc as isize]);let mut out=NdArray::zeros(shape,T::DTYPE)?;
+    let ao=offsets(&batch,&a.strides[..batch.len()],a.byte_offset);let to=offsets(&batch,&tau.strides[..batch.len()],tau.byte_offset);
+    for(bi,(base,tbase))in ao.zip(to).enumerate(){if mc==0{continue;}let mut q=vec![T::default();m*mc];let rs=a.strides[a.ndim()-2];let cs=a.strides[a.ndim()-1];for col in 0..n.min(mc){for row in 0..m{q[row+col*m]=T::from_scalar(a.read_at(base+row as isize*rs+col as isize*cs));}}let ts=tau.strides[tau.ndim()-1];let mut tv=(0..k).map(|i|T::from_scalar(tau.read_at(tbase+i as isize*ts))).collect::<Vec<_>>();if T::gqr(m as i64,mc as i64,k as i64,&mut q,&mut tv)!=0{return Err(Error::ValueError("Incorrect argument found while performing QR factorization".into()));}write_col_major(&mut out,bi,&q,m,mc);}
+    Ok(out)
+}
+
+pub fn qr_q(a:&NdArray,tau:&NdArray,complete:bool,complex:bool)->Result<NdArray>{if !HAVE_LAPACK{return Err(unavailable());}if complex{qr_q_impl::<C64v>(a,tau,complete)}else{qr_q_impl::<f64>(a,tau,complete)}}

@@ -2015,7 +2015,7 @@ def cond(x, p=None):
         result_t = _realType(result_t)  # condition number is always real
         signature = 'D->D' if isComplexType(t) else 'd->d'
         with errstate(all='ignore'):
-            invx = _umath_linalg.inv(x, signature=signature)
+            invx = _umath_linalg.inv_noraise(x, signature=signature)
             r = norm(x, p, axis=(-2, -1)) * norm(invx, p, axis=(-2, -1))
         r = r.astype(result_t, copy=False)
 
@@ -2136,6 +2136,12 @@ def matrix_rank(A, tol=None, hermitian=False, *, rtol=None):
         return int(not all(A == 0))
 
     S = svd(A, compute_uv=False, hermitian=hermitian)
+
+    # The rank of a matrix with no singular values is zero.  NumPy expresses
+    # the general case with max(initial=0), but rnp's reduction compatibility
+    # layer does not yet implement ``initial`` for empty reductions.
+    if S.shape[-1] == 0:
+        return count_nonzero(S, axis=-1)
 
     if tol is None:
         if rtol is None:
@@ -2263,7 +2269,11 @@ def pinv(a, rcond=None, hermitian=False, *, rtol=_NoValue):
     # discard small singular values
     cutoff = rcond[..., newaxis] * amax(s, axis=-1, keepdims=True)
     large = s > cutoff
-    s = divide(1, s, where=large, out=s)
+    # rnp's elementwise divide does not yet expose the ufunc ``where``
+    # keyword.  Ignoring the temporary divide-by-zero values is equivalent:
+    # all excluded entries are overwritten immediately below.
+    with errstate(all='ignore'):
+        s = 1 / s
     s[~large] = 0
 
     res = matmul(transpose(vt), multiply(s[..., newaxis], transpose(u)))
@@ -2802,11 +2812,11 @@ def norm(x, ord=None, axis=None, keepdims=False):
             )
         elif ord == 1:
             # special case for speedup
-            return add.reduce(abs(x), axis=axis, keepdims=keepdims)
+            return sum(abs(x), axis=axis, keepdims=keepdims)
         elif ord is None or ord == 2:
             # special case for speedup
             s = (x.conj() * x).real
-            return sqrt(add.reduce(s, axis=axis, keepdims=keepdims))
+            return sqrt(sum(s, axis=axis, keepdims=keepdims))
         # None of the str-type keywords for ord ('fro', 'nuc')
         # are valid for vectors
         elif isinstance(ord, str):
@@ -2814,7 +2824,7 @@ def norm(x, ord=None, axis=None, keepdims=False):
         else:
             absx = abs(x)
             absx **= ord
-            ret = add.reduce(absx, axis=axis, keepdims=keepdims)
+            ret = sum(absx, axis=axis, keepdims=keepdims)
             ret **= reciprocal(ord, dtype=ret.dtype)
             return ret
     elif len(axis) == 2:
@@ -2830,21 +2840,21 @@ def norm(x, ord=None, axis=None, keepdims=False):
         elif ord == 1:
             if col_axis > row_axis:
                 col_axis -= 1
-            ret = add.reduce(abs(x), axis=row_axis).max(axis=col_axis, initial=0)
+            ret = sum(abs(x), axis=row_axis).max(axis=col_axis, initial=0)
         elif ord == inf:
             if row_axis > col_axis:
                 row_axis -= 1
-            ret = add.reduce(abs(x), axis=col_axis).max(axis=row_axis, initial=0)
+            ret = sum(abs(x), axis=col_axis).max(axis=row_axis, initial=0)
         elif ord == -1:
             if col_axis > row_axis:
                 col_axis -= 1
-            ret = add.reduce(abs(x), axis=row_axis).min(axis=col_axis)
+            ret = sum(abs(x), axis=row_axis).min(axis=col_axis)
         elif ord == -inf:
             if row_axis > col_axis:
                 row_axis -= 1
-            ret = add.reduce(abs(x), axis=col_axis).min(axis=row_axis)
+            ret = sum(abs(x), axis=col_axis).min(axis=row_axis)
         elif ord in [None, 'fro', 'f']:
-            ret = sqrt(add.reduce((x.conj() * x).real, axis=axis))
+            ret = sqrt(sum((x.conj() * x).real, axis=axis))
         elif ord == 'nuc':
             ret = _multi_svd_norm(x, row_axis, col_axis, sum, 0)
         else:

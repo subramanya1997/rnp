@@ -235,10 +235,16 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_inner, m)?)?;
     m.add_function(wrap_pyfunction!(_lapack_solve, m)?)?;
     m.add_function(wrap_pyfunction!(_lapack_inv, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_inv_noraise, m)?)?;
     m.add_function(wrap_pyfunction!(_lapack_det, m)?)?;
     m.add_function(wrap_pyfunction!(_lapack_slogdet, m)?)?;
     m.add_function(wrap_pyfunction!(_lapack_cholesky, m)?)?;
     m.add_function(wrap_pyfunction!(_lapack_lstsq, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_svd, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_eig, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_eigh, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_qr_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_qr_q, m)?)?;
     Ok(())
 }
 
@@ -274,7 +280,18 @@ fn _lapack_inv(
     dtype: &str,
 ) -> PyResult<Py<PyAny>> {
     let aa = array_from_any(a, None, false)?;
-    let out = rnp_core::lapack::inv(&aa, lapack_dtype(dtype)?).map_err(crate::err)?;
+    let out = rnp_core::lapack::inv(&aa, lapack_dtype(dtype)?, false).map_err(crate::err)?;
+    PyNdArray::into_py_any(out, py).map(|value| value.into_any())
+}
+
+#[pyfunction]
+fn _lapack_inv_noraise(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    dtype: &str,
+) -> PyResult<Py<PyAny>> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::inv(&aa, lapack_dtype(dtype)?, true).map_err(crate::err)?;
     PyNdArray::into_py_any(out, py).map(|value| value.into_any())
 }
 
@@ -333,4 +350,66 @@ fn _lapack_lstsq(
         out.rank,
         PyNdArray::into_py_any(out.singular_values, py)?.into_any(),
     ))
+}
+
+#[pyfunction]
+fn _lapack_svd(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    full: bool,
+    vectors: bool,
+    complex: bool,
+) -> PyResult<(Option<Py<PyAny>>, Py<PyAny>, Option<Py<PyAny>>)> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::svd(&aa, full, vectors, complex).map_err(crate::err)?;
+    Ok((
+        out.u.map(|value| PyNdArray::into_py_any(value, py).map(|v| v.into_any())).transpose()?,
+        PyNdArray::into_py_any(out.singular_values, py)?.into_any(),
+        out.vh.map(|value| PyNdArray::into_py_any(value, py).map(|v| v.into_any())).transpose()?,
+    ))
+}
+
+#[pyfunction]
+fn _lapack_eig(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    vectors: bool,
+    complex: bool,
+) -> PyResult<(Py<PyAny>, Option<Py<PyAny>>)> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::eig(&aa, vectors, complex).map_err(crate::err)?;
+    Ok((
+        PyNdArray::into_py_any(out.values, py)?.into_any(),
+        out.vectors.map(|value| PyNdArray::into_py_any(value, py).map(|v| v.into_any())).transpose()?,
+    ))
+}
+
+#[pyfunction]
+fn _lapack_eigh(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    upper: bool,
+    vectors: bool,
+    complex: bool,
+) -> PyResult<(Py<PyAny>, Option<Py<PyAny>>)> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::eigh(&aa, upper, vectors, complex).map_err(crate::err)?;
+    Ok((
+        PyNdArray::into_py_any(out.values, py)?.into_any(),
+        out.vectors.map(|value| PyNdArray::into_py_any(value, py).map(|v| v.into_any())).transpose()?,
+    ))
+}
+
+#[pyfunction]
+fn _lapack_qr_raw(py:Python<'_>,a:&Bound<'_,PyAny>,complex:bool)->PyResult<Py<PyAny>>{
+    let aa=array_from_any(a,None,false)?;
+    let out=rnp_core::lapack::qr_raw(&aa,complex).map_err(crate::err)?;
+    PyNdArray::into_py_any(out,py).map(|value|value.into_any())
+}
+
+#[pyfunction]
+fn _lapack_qr_q(py:Python<'_>,a:&Bound<'_,PyAny>,tau:&Bound<'_,PyAny>,complete:bool,complex:bool)->PyResult<Py<PyAny>>{
+    let aa=array_from_any(a,None,false)?;let tt=array_from_any(tau,None,false)?;
+    let out=rnp_core::lapack::qr_q(&aa,&tt,complete,complex).map_err(crate::err)?;
+    PyNdArray::into_py_any(out,py).map(|value|value.into_any())
 }

@@ -163,6 +163,20 @@ def _flatten_nested_ndarrays(obj, dtypes):
     return obj
 
 
+def _nested_sequence_shape(obj):
+    """Infer a regular shape while retaining empty ndarray dimensions."""
+    if isinstance(obj, ndarray):
+        return obj.shape
+    if not isinstance(obj, (list, tuple)):
+        return ()
+    if not obj:
+        return (0,)
+    child_shapes = [_nested_sequence_shape(value) for value in obj]
+    if _builtins.any(shape != child_shapes[0] for shape in child_shapes[1:]):
+        return None
+    return (len(obj),) + child_shapes[0]
+
+
 #: Spellings of numpy's "character" typecode.  `np.dtype('c')` compares equal
 #: to `S1`, but the `'c'` typecode additionally means "unpack each string into
 #: its individual characters", which `S1` does not.  The engine's dtype object
@@ -283,7 +297,12 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
         if _as_text is not None:
             res = _as_text
         elif _NESTED_NDARRAY_MSG in str(exc) and isinstance(obj, (list, tuple)):
-            res = _rnp_array(*_unnest(obj, dtype), copy=_copy)
+            plain, nested_dtype = _unnest(obj, dtype)
+            nested_shape = _nested_sequence_shape(obj)
+            if nested_shape is not None and 0 in nested_shape:
+                res = empty(nested_shape, dtype=nested_dtype)
+            else:
+                res = _rnp_array(plain, nested_dtype, copy=_copy)
         elif _ac._has_none_error(exc):
             res = _ac.array_none_fallback(obj, dtype)
         elif hasattr(type(obj), "__array__"):
@@ -1671,6 +1690,23 @@ def _install_array_function_dispatch():
 
 
 _install_array_function_dispatch()
+
+
+class _NonBindingCallable:
+    """Callable wrapper with builtin-like, non-descriptor class behavior."""
+
+    def __init__(self, function):
+        import functools as _functools
+        self._function = function
+        _functools.update_wrapper(self, function)
+
+    def __call__(self, *args, **kwargs):
+        return self._function(*args, **kwargs)
+
+
+# Unlike a Python function, NumPy's builtin ``array`` does not become a bound
+# method when assigned as a class attribute (as upstream's linalg tests do).
+array = _NonBindingCallable(array)
 
 
 __all__ = [n for n in dir() if not n.startswith("_")]
