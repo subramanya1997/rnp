@@ -1,0 +1,16 @@
+import numpy as np
+import numpy._core._multiarray_umath as ncu
+print("MAXDIMS", ncu.MAXDIMS)
+print("PZERO", ncu.PZERO, "NZERO", ncu.NZERO)
+print("_arg", ncu._arg, type(ncu._arg))
+print("_arg(1+1j)", ncu._arg(np.complex128(1 + 1j)))
+print("dap 1", ncu._discover_array_parameters([1, 2, 3]))
+print("dap 2", ncu._discover_array_parameters([[1.0, 2]], np.dtype("f8")))
+print("dap 3", ncu._discover_array_parameters("abc"))
+print("dap 4", ncu._discover_array_parameters([1, 2], np.dtype("O")))
+print("cpu", type(np.__config__), list(ncu.__cpu_features__.items())[:5])
+ci = ncu._get_castingimpl(type(np.dtype("d")), type(np.dtype("f")))
+print("castingimpl", ci, type(ci))
+print("  name", ci.name, "nin", ci.nin, "nout", ci.nout, "casting", ci.casting)
+print("  resolve", ci._resolve_descriptors((np.dtype("d"), None)))
+print("  types", ci.types)
