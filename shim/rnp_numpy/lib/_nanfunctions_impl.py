@@ -49,6 +49,19 @@ array_function_dispatch = functools.partial(
     overrides.array_function_dispatch, module='numpy')
 
 
+def _without_no_value(**kwargs):
+    """Drop NumPy's private "argument omitted" sentinel from shim calls.
+
+    Real NumPy's C argument parsers treat ``np._NoValue`` exactly like a
+    keyword that was not supplied.  The Rust-backed Python callables receive
+    ordinary Python objects, so forwarding the sentinel would instead try to
+    convert it to ``bool`` or an array.  Keep the upstream call structure but
+    omit those keywords at this compatibility boundary.
+    """
+    return {name: value for name, value in kwargs.items()
+            if value is not np._NoValue}
+
+
 __all__ = [
     'nansum', 'nanmax', 'nanmin', 'nanargmax', 'nanargmin', 'nanmean',
     'nanmedian', 'nanpercentile', 'nanvar', 'nanstd', 'nanprod',
@@ -1074,8 +1087,10 @@ def nanmean(a, axis=None, dtype=None, out=None, keepdims=np._NoValue,
     """
     arr, mask = _replace_nan(a, 0)
     if mask is None:
-        return np.mean(arr, axis=axis, dtype=dtype, out=out, keepdims=keepdims,
-                       where=where)
+        return np.mean(
+            arr, axis=axis, dtype=dtype, out=out,
+            **_without_no_value(keepdims=keepdims, where=where),
+        )
 
     if dtype is not None:
         dtype = np.dtype(dtype)
@@ -1084,10 +1099,9 @@ def nanmean(a, axis=None, dtype=None, out=None, keepdims=np._NoValue,
     if out is not None and not issubclass(out.dtype.type, np.inexact):
         raise TypeError("If a is inexact, then out must be inexact")
 
-    cnt = np.sum(~mask, axis=axis, dtype=np.intp, keepdims=keepdims,
-                 where=where)
-    tot = np.sum(arr, axis=axis, dtype=dtype, out=out, keepdims=keepdims,
-                 where=where)
+    reduce_kw = _without_no_value(keepdims=keepdims, where=where)
+    cnt = np.sum(~mask, axis=axis, dtype=np.intp, **reduce_kw)
+    tot = np.sum(arr, axis=axis, dtype=dtype, out=out, **reduce_kw)
     avg = _divide_by_count(tot, cnt, out=out)
 
     isbad = (cnt == 0)
@@ -1845,9 +1859,13 @@ def nanvar(a, axis=None, dtype=None, out=None, ddof=0, keepdims=np._NoValue,
     """
     arr, mask = _replace_nan(a, 0)
     if mask is None:
-        return np.var(arr, axis=axis, dtype=dtype, out=out, ddof=ddof,
-                      keepdims=keepdims, where=where, mean=mean,
-                      correction=correction)
+        return np.var(
+            arr, axis=axis, dtype=dtype, out=out, ddof=ddof,
+            **_without_no_value(
+                keepdims=keepdims, where=where, mean=mean,
+                correction=correction,
+            ),
+        )
 
     if dtype is not None:
         dtype = np.dtype(dtype)
@@ -1870,8 +1888,9 @@ def nanvar(a, axis=None, dtype=None, out=None, ddof=0, keepdims=np._NoValue,
     else:
         _keepdims = True
 
+    where_kw = _without_no_value(where=where)
     cnt = np.sum(~mask, axis=axis, dtype=np.intp, keepdims=_keepdims,
-                     where=where)
+                 **where_kw)
 
     if mean is not np._NoValue:
         avg = mean
@@ -1881,21 +1900,23 @@ def nanvar(a, axis=None, dtype=None, out=None, ddof=0, keepdims=np._NoValue,
         # keepdims=True, however matrix now raises an error in this case, but
         # the reason that it drops the keepdims kwarg is to force keepdims=True
         # so this used to work by serendipity.
-        avg = np.sum(arr, axis=axis, dtype=dtype,
-                     keepdims=_keepdims, where=where)
+        avg = np.sum(arr, axis=axis, dtype=dtype, keepdims=_keepdims,
+                     **where_kw)
         avg = _divide_by_count(avg, cnt)
 
     # Compute squared deviation from mean.
-    np.subtract(arr, avg, out=arr, casting='unsafe', where=where)
+    np.subtract(arr, avg, out=arr, casting='unsafe', **where_kw)
     arr = _copyto(arr, 0, mask)
     if issubclass(arr.dtype.type, np.complexfloating):
-        sqr = np.multiply(arr, arr.conj(), out=arr, where=where).real
+        sqr = np.multiply(arr, arr.conj(), out=arr, **where_kw).real
     else:
-        sqr = np.multiply(arr, arr, out=arr, where=where)
+        sqr = np.multiply(arr, arr, out=arr, **where_kw)
 
     # Compute variance.
-    var = np.sum(sqr, axis=axis, dtype=dtype, out=out, keepdims=keepdims,
-                 where=where)
+    var = np.sum(
+        sqr, axis=axis, dtype=dtype, out=out,
+        **_without_no_value(keepdims=keepdims, where=where),
+    )
 
     # Precaution against reduced object arrays
     try:

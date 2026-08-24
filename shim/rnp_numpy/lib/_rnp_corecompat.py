@@ -1151,6 +1151,58 @@ def _make_reduction(name, ufunc, bool_result=False):
             kw["where"] = where
         if dtype is not None and not bool_result:
             kw["dtype"] = dtype
+        if axis is None and arr.ndim > 1:
+            arr = arr.reshape(-1)
+            if has_where:
+                kw["where"] = np.asarray(where).reshape(-1)
+            axis = 0
+        # The engine's multiply reduction currently folds ``initial`` into
+        # more than one internal partial product.  Apply it once to the final
+        # product, which is NumPy's contract for every output slice.
+        deferred_initial = _NoValue
+        if ufunc is np.multiply and has_initial:
+            deferred_initial = kw.pop("initial")
+        res = ufunc.reduce(arr, axis=axis, **kw)
+        if deferred_initial is not _NoValue:
+            res = ufunc(res, deferred_initial)
+        if out is not None:
+            out[...] = res
+            return out
+        return res
+
+    reduction.__name__ = name
+    return reduction
+
+
+def _make_minmax_reduction(name, ufunc):
+    """Add NumPy's omitted/``initial``/``where`` semantics to min/max."""
+    engine = getattr(np, name)
+
+    def reduction(a, axis=None, out=None, keepdims=_NoValue,
+                  initial=_NoValue, where=_NoValue):
+        has_where = where is not _NoValue and where is not True
+        has_initial = initial is not _NoValue
+        if not has_where and not has_initial:
+            kw = {}
+            if keepdims is not _NoValue:
+                kw["keepdims"] = keepdims
+            if out is not None:
+                kw["out"] = out
+            return engine(a, axis=axis, **kw)
+
+        arr = np.asanyarray(a)
+        kw = {}
+        if keepdims is not _NoValue:
+            kw["keepdims"] = keepdims
+        if has_initial:
+            kw["initial"] = initial
+        if has_where:
+            kw["where"] = where
+        if axis is None and arr.ndim > 1:
+            arr = arr.reshape(-1)
+            if has_where:
+                kw["where"] = np.asarray(where).reshape(-1)
+            axis = 0
         res = ufunc.reduce(arr, axis=axis, **kw)
         if out is not None:
             out[...] = res
@@ -1170,6 +1222,10 @@ def _install_reductions(namespace):
         ("any", np.logical_or, True),
     ):
         namespace[name] = _make_reduction(name, uf, is_bool)
+    for name, uf in (("amin", np.minimum), ("amax", np.maximum)):
+        namespace[name] = _make_minmax_reduction(name, uf)
+    namespace["min"] = namespace["amin"]
+    namespace["max"] = namespace["amax"]
 
 
 # ---------------------------------------------------------------------------

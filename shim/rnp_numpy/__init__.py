@@ -786,6 +786,8 @@ def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
     # `correction` is the array-API spelling of `ddof`; only the *function*
     # accepts it in 2.5.2, so it is passed through the private channel the
     # method understands rather than as a public keyword.
+    if correction is not None and ddof != 0:
+        raise ValueError("ddof and correction can't be provided simultaneously.")
     extra = {} if correction is None else {"_correction": correction}
     return _asarr(a).var(axis, dtype, out, ddof, keepdims,
                          where=where, mean=mean, **extra)
@@ -793,6 +795,8 @@ def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
 
 def std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
         where=None, mean=None, correction=None):
+    if correction is not None and ddof != 0:
+        raise ValueError("ddof and correction can't be provided simultaneously.")
     extra = {} if correction is None else {"_correction": correction}
     return _asarr(a).std(axis, dtype, out, ddof, keepdims,
                          where=where, mean=mean, **extra)

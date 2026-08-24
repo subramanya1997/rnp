@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T17:15:41.220510+00:00",
-  "overall_passed": 3491,
+  "timestamp": "2026-08-24T19:30:13.106124+00:00",
+  "overall_passed": 3834,
   "overall_total": 4759,
   "files": [
     {
@@ -117,8 +117,8 @@
     },
     {
       "file": "lib/test_nanfunctions.py",
-      "passed": 717,
-      "failed": 476,
+      "passed": 1060,
+      "failed": 133,
       "errors": 0,
       "skipped": 86,
       "total": 1279
