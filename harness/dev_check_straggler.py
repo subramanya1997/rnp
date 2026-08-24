@@ -644,6 +644,77 @@ def section_c_(rng):
 
 
 # ---------------------------------------------------------------------------
+# randomised sweep
+# ---------------------------------------------------------------------------
+
+def section_random(rng, rounds=240):
+    """Randomised shapes, dtypes and layouts across the whole cluster."""
+    for _ in range(rounds):
+        dt = rng.choice(NUMERIC)
+        shape = rng.choice([(6,), (2, 3), (3, 4), (2, 3, 4), (4, 1), (1, 6)])
+        n = 1
+        for d in shape:
+            n *= d
+        # Unsigned dtypes get non-negative data: real numpy refuses a negative
+        # Python int for an unsigned array at *construction* time, and this
+        # sweep is about the straggler cluster, not about array().
+        low = 0 if dt.startswith("uint") or dt == "bool" else -20
+        data = [rng.randrange(low, 20) for _ in range(n)]
+        layout = rng.choice(["C", "F", "T", "slice"])
+
+        def build(m, d=data, t=dt, s=shape, lay=layout):
+            a = m.array(d, dtype=t).reshape(s)
+            if lay == "F":
+                a = a.T.copy().T
+            elif lay == "T" and a.ndim > 1:
+                a = a.T
+            elif lay == "slice" and a.ndim >= 1 and a.shape[-1] > 1:
+                a = a[..., ::2]
+            return a
+
+        kind = rng.randrange(6)
+        if kind == 0:
+            order = rng.choice(["C", "F", "A", "K"])
+            check(f"rand tobytes {dt} {shape} {layout} {order}",
+                  lambda m, b=build, o=order: b(m).tobytes(o))
+        elif kind == 1:
+            lo = rng.choice([None, -5, 0, 3, 1.5])
+            hi = rng.choice([None, 2, 8, 4.5])
+            check(f"rand clip {dt} {shape} {layout} {lo},{hi}",
+                  lambda m, b=build, x=lo, y=hi: b(m).clip(x, y))
+        elif kind == 2:
+            ndim = len(shape)
+            axis = rng.choice([None] + list(range(-ndim, ndim)))
+            ddof = rng.choice([0, 1])
+            keep = rng.choice([False, True])
+            fn = rng.choice(["var", "std", "mean"])
+            kw = {"axis": axis, "keepdims": keep}
+            if fn != "mean":
+                kw["ddof"] = ddof
+            check(f"rand {fn} {dt} {shape} {layout} {kw}",
+                  lambda m, b=build, f=fn, k=kw: getattr(b(m), f)(**k))
+        elif kind == 3:
+            proto = rng.randrange(2, pickle.HIGHEST_PROTOCOL + 1)
+            check(f"rand pickle {dt} {shape} {layout} p{proto}",
+                  lambda m, b=build, p=proto: pickle.loads(
+                      pickle.dumps(b(m), p)))
+        elif kind == 4:
+            ndim = len(shape)
+            axis = rng.choice(list(range(-ndim, ndim)))
+            other = [rng.randrange(0, 4) for _ in range(n)]
+            check(f"rand lexsort {dt} {shape} axis={axis}",
+                  lambda m, d=data, o=other, t=dt, s=shape, a=axis: m.lexsort(
+                      (m.array(d, dtype=t).reshape(s),
+                       m.array(o, dtype=t).reshape(s)), axis=a))
+        else:
+            new = rng.choice([(n,), (n + 3,), (max(n // 2, 1),), (2, n)])
+            check(f"rand resize {dt} {shape} -> {new}",
+                  lambda m, d=data, t=dt, s=shape, ns=new: (
+                      lambda a: (a.resize(ns, refcheck=False), a))(
+                          m.array(d, dtype=t).reshape(s)))
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -655,6 +726,7 @@ def main():
         section_lexsort, section_tobytes, section_clip, section_resize,
         section_conjugate, section_varstd, section_pickle, section_weakref,
         section_fields, section_sizeof, section_frombuffer, section_c_,
+        section_random,
     ):
         section(rng)
 
