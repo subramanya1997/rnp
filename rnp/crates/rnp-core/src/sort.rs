@@ -60,25 +60,122 @@ fn check_axis(arr: &NdArray, axis: usize) -> Result<()> {
 }
 
 /// The sort key of one element: a scalar for numeric dtypes, the logical
-/// code units for the flexible ones.
+/// code units for the flexible ones, and -- for a *structured* dtype -- the
+/// keys of its fields in declaration order.
 enum Key {
     Num(Scalar),
     Text(Vec<u32>),
     /// datetime64 / timedelta64: NaT sorts last, like NaN.
     Time(i64),
+    /// Raw bytes compared with `memcmp`, which is what numpy's
+    /// `STRING_compare` does for a subarray or opaque-void field.
+    Raw(Vec<u8>),
+    /// A structured element: its fields' keys, compared in order.
+    Fields(Vec<Key>),
 }
 
-fn key_at(arr: &NdArray, off: isize) -> Key {
-    if arr.dtype().is_flexible() {
-        Key::Text(crate::ops::logical_bytes(arr, off))
-    } else if arr.dtype().is_datetime_like() {
-        Key::Time(match arr.read_at(off) {
+/// How to read one leaf of a (possibly nested) structured element.
+enum Leaf {
+    /// Read a scalar through this view's descriptor (which carries the
+    /// field's byte order, so a `'>i4'` field still compares numerically).
+    Num(NdArray),
+    /// datetime64 / timedelta64 leaf.
+    Time(NdArray),
+    /// An `'S'`/`'V'`/subarray leaf: `memcmp` over the field's whole width.
+    /// The view is relabelled `'V<width>'` so that `raw_bytes_at` hands back
+    /// exactly those bytes.
+    Raw(NdArray),
+    /// A `'U'` leaf: UCS-4 code units, not bytes -- numpy's
+    /// `UNICODE_compare` orders by code point, which a little-endian
+    /// `memcmp` would get wrong.
+    Text(NdArray),
+}
+
+/// The recipe for one array's sort keys, built once per sort.
+///
+/// For everything but a structured dtype this is a single leaf covering the
+/// whole element; for a structured dtype it is the depth-first list of leaves
+/// with their byte offsets, which is exactly the order numpy's `VOID_compare`
+/// walks (field by field, recursing into nested structs) -- see
+/// `VOID_compare` in `upstream/numpy/_core/src/multiarray/arraytypes.c.src`.
+struct KeyPlan {
+    leaves: Vec<(isize, Leaf)>,
+    /// True when the plan is a single whole-element leaf, so `key_at` can
+    /// skip building a `Fields` vector.
+    plain: bool,
+}
+
+/// The leaf for a non-structured descriptor, as seen through `arr`.
+fn leaf_of(arr: &NdArray, descr: crate::descr::Descr) -> Leaf {
+    use crate::dtype::DType;
+    // A subarray field, an opaque void and a bytes field are all raw memcmp:
+    // numpy routes each of them to `STRING_compare`.
+    match descr.dt {
+        DType::SubArray(_) | DType::Void(_) | DType::Bytes(_) => {
+            let raw = crate::descr::Descr::new(
+                DType::Void(descr.itemsize() as u32),
+                crate::descr::ByteOrder::NotApplicable,
+            );
+            Leaf::Raw(arr.field_view(raw, 0))
+        }
+        DType::Str(_) => Leaf::Text(arr.field_view(descr, 0)),
+        d if d.is_datetime_like() => Leaf::Time(arr.field_view(descr, 0)),
+        _ => Leaf::Num(arr.field_view(descr, 0)),
+    }
+}
+
+/// Append the leaves of `descr` (a field's descriptor) at `base`.
+fn push_leaves(
+    arr: &NdArray,
+    descr: crate::descr::Descr,
+    base: usize,
+    out: &mut Vec<(isize, Leaf)>,
+) {
+    match descr.struct_def() {
+        Some(def) => {
+            for f in def.fields.iter() {
+                push_leaves(arr, f.descr, base + f.offset, out);
+            }
+        }
+        None => out.push((base as isize, leaf_of(arr, descr))),
+    }
+}
+
+fn key_plan(arr: &NdArray) -> KeyPlan {
+    if arr.descr.is_struct() {
+        let mut leaves = Vec::new();
+        push_leaves(arr, arr.descr, 0, &mut leaves);
+        return KeyPlan { leaves, plain: false };
+    }
+    KeyPlan {
+        leaves: vec![(0, leaf_of(arr, arr.descr))],
+        plain: true,
+    }
+}
+
+fn leaf_key(leaf: &Leaf, off: isize) -> Key {
+    match leaf {
+        Leaf::Num(v) => Key::Num(v.read_at(off)),
+        Leaf::Time(v) => Key::Time(match v.read_at(off) {
             Scalar::Int(i) => i,
             s => s.as_f64() as i64,
-        })
-    } else {
-        Key::Num(arr.read_at(off))
+        }),
+        Leaf::Raw(v) => Key::Raw(v.raw_bytes_at(off).to_vec()),
+        Leaf::Text(v) => Key::Text(crate::ops::logical_bytes(v, off)),
     }
+}
+
+fn key_at(plan: &KeyPlan, off: isize) -> Key {
+    if plan.plain {
+        let (delta, leaf) = &plan.leaves[0];
+        return leaf_key(leaf, off + delta);
+    }
+    Key::Fields(
+        plan.leaves
+            .iter()
+            .map(|(delta, leaf)| leaf_key(leaf, off + delta))
+            .collect(),
+    )
 }
 
 /// numpy's datetime order: NaT is greater than everything and ties with
@@ -97,6 +194,18 @@ fn cmp_key(a: &Key, b: &Key) -> Ordering {
         (Key::Num(x), Key::Num(y)) => cmp_scalar(*x, *y),
         (Key::Time(x), Key::Time(y)) => cmp_time(*x, *y),
         (Key::Text(x), Key::Text(y)) => x.cmp(y),
+        (Key::Raw(x), Key::Raw(y)) => x.cmp(y),
+        // A structured element compares on its first field, then on the
+        // second when those tie, and so on -- numpy's `VOID_compare`.
+        (Key::Fields(x), Key::Fields(y)) => {
+            for (p, q) in x.iter().zip(y.iter()) {
+                let c = cmp_key(p, q);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            Ordering::Equal
+        }
         _ => Ordering::Equal,
     }
 }
@@ -115,13 +224,14 @@ pub fn sort_inplace(arr: &mut NdArray, axis: usize, _stable: bool) -> Result<()>
         ));
     }
     let isz = arr.itemsize();
+    let plan = key_plan(arr);
     // One scratch buffer for the whole sort, reused per lane: a `Vec` per
     // element turns a 1e6-element sort into a million allocations.
     let mut scratch: Vec<u8> = Vec::new();
     for lane in lanes(arr, axis) {
         let n = lane.len();
         let mut order: Vec<usize> = (0..n).collect();
-        let keys: Vec<Key> = lane.iter().map(|&o| key_at(arr, o)).collect();
+        let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
         order.sort_by(|&i, &j| cmp_key(&keys[i], &keys[j]));
         // Snapshot the raw bytes, then lay them back down in order; writing
         // in place would clobber sources still to be read.
@@ -153,8 +263,9 @@ pub fn argsort(arr: &NdArray, axis: usize, _stable: bool) -> Result<NdArray> {
     let out_step = strides[axis];
     strides.remove(axis);
     let out_bases: Vec<isize> = crate::iter::offsets(&shape, &strides, out.byte_offset).collect();
+    let plan = key_plan(arr);
     for (lane, &base) in lanes(arr, axis).iter().zip(out_bases.iter()) {
-        let keys: Vec<Key> = lane.iter().map(|&o| key_at(arr, o)).collect();
+        let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
         let mut order: Vec<usize> = (0..lane.len()).collect();
         order.sort_by(|&i, &j| cmp_key(&keys[i], &keys[j]));
         for k in 0..n as usize {
@@ -318,13 +429,14 @@ pub fn partition_inplace(arr: &mut NdArray, kth: &[usize], axis: usize) -> Resul
     }
     let ks = normalize_kths(kth);
     let isz = arr.itemsize();
+    let plan = key_plan(arr);
     let mut scratch: Vec<u8> = Vec::new();
     for lane in lanes(arr, axis) {
         let n = lane.len();
         if n <= 1 || ks.is_empty() {
             continue;
         }
-        let keys: Vec<Key> = lane.iter().map(|&o| key_at(arr, o)).collect();
+        let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
         let mut order: Vec<usize> = (0..n).collect();
         select_all(&mut order, &keys, &ks);
         scratch.clear();
@@ -355,8 +467,9 @@ pub fn argpartition(arr: &NdArray, kth: &[usize], axis: usize) -> Result<NdArray
     let out_step = strides[axis];
     strides.remove(axis);
     let out_bases: Vec<isize> = crate::iter::offsets(&shape, &strides, out.byte_offset).collect();
+    let plan = key_plan(arr);
     for (lane, &base) in lanes(arr, axis).iter().zip(out_bases.iter()) {
-        let keys: Vec<Key> = lane.iter().map(|&o| key_at(arr, o)).collect();
+        let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
         let mut order: Vec<usize> = (0..lane.len()).collect();
         select_all(&mut order, &keys, &ks);
         for k in 0..n as usize {
@@ -374,13 +487,14 @@ pub fn searchsorted(a: &NdArray, v: &NdArray, right: bool) -> Result<NdArray> {
         ));
     }
     let n = a.size();
+    let (aplan, vplan) = (key_plan(a), key_plan(v));
     let keys: Vec<Key> = (0..n)
-        .map(|i| key_at(a, a.byte_offset + i as isize * a.strides[0]))
+        .map(|i| key_at(&aplan, a.byte_offset + i as isize * a.strides[0]))
         .collect();
     let out = NdArray::zeros(v.shape.clone(), crate::dtype::DType::I64)?;
     let mut k = 0usize;
     for off in crate::iter::offsets(&v.shape, &v.strides, v.byte_offset) {
-        let key = key_at(v, off);
+        let key = key_at(&vplan, off);
         // `left` is the first slot where `a[i] >= key`, `right` the first
         // where `a[i] > key`.
         let (mut lo, mut hi) = (0usize, n);

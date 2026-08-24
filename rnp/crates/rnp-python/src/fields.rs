@@ -24,6 +24,7 @@ use pyo3::types::{PyList, PyString, PyTuple};
 use rnp_core::descr::{select_fields, Descr};
 use rnp_core::NdArray;
 
+use crate::convert::{array_from_any_descr, element_to_py, npflexible_to_py};
 use crate::pyarray::PyNdArray;
 
 /// numpy's message for a key that is not a valid array index at all.
@@ -276,18 +277,6 @@ fn cannot_cast(from: Descr, to: Descr) -> PyErr {
     ))
 }
 
-/// Copy `src` into `dst` element by element; both must already share a dtype
-/// and a shape.
-fn copy_into(dst: &NdArray, src: &NdArray) {
-    let d: Vec<isize> =
-        rnp_core::iter::offsets(&dst.shape, &dst.strides, dst.byte_offset).collect();
-    let s: Vec<isize> =
-        rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
-    for (&a, &b) in d.iter().zip(s.iter()) {
-        dst.write_raw_at(a, src.raw_bytes_at(b));
-    }
-}
-
 /// `astype` where either side is a structured dtype.
 ///
 /// Probed from numpy 2.5.2:
@@ -296,61 +285,237 @@ fn copy_into(dst: &NdArray, src: &NdArray) {
 ///   (`np.zeros(2,'i4,f8').astype([('x','f8'),('y','i4')])` swaps the types
 ///   over, and adding a third field is a `TypeError`);
 /// * unstructured -> structured broadcasts the source into *every* field;
-/// * structured -> unstructured is refused.
-pub fn struct_astype(arr: &NdArray, to: Descr) -> PyResult<NdArray> {
+/// * structured -> unstructured unwraps a single field, recursively, and is
+///   refused when there is more than one field.
+pub fn struct_astype(py: Python<'_>, arr: &NdArray, to: Descr) -> PyResult<NdArray> {
     let from = arr.descr;
     let out = NdArray::zeros_descr(arr.shape.clone(), to).map_err(crate::err)?;
-    match (from.struct_def(), to.struct_def()) {
-        (Some(sd), Some(dd)) => {
-            if sd.fields.len() != dd.fields.len() {
-                return Err(cannot_cast(from, to));
-            }
-            for (sf, df) in sd.fields.iter().zip(dd.fields.iter()) {
-                let sv = arr.field_view(sf.descr, sf.offset);
-                let dv = out.field_view(df.descr, df.offset);
-                if sv.shape != dv.shape {
-                    return Err(cannot_cast(from, to));
-                }
-                let cast = cast_leaf(&sv, dv.descr, from, to)?;
-                copy_into(&dv, &cast);
-            }
-        }
-        (None, Some(dd)) => {
-            for df in dd.fields.iter() {
-                let dv = out.field_view(df.descr, df.offset);
-                let src = if dv.shape == arr.shape {
-                    arr.clone()
-                } else {
-                    rnp_core::iter::broadcast_to(arr, &dv.shape).map_err(crate::err)?
-                };
-                let cast = cast_leaf(&src, dv.descr, from, to)?;
-                copy_into(&dv, &cast);
-            }
-        }
-        _ => return Err(cannot_cast(from, to)),
+    let src_offsets: Vec<isize> =
+        rnp_core::iter::offsets(&arr.shape, &arr.strides, arr.byte_offset).collect();
+    let dst_offsets: Vec<isize> =
+        rnp_core::iter::offsets(&out.shape, &out.strides, out.byte_offset).collect();
+    for (&src_off, &dst_off) in src_offsets.iter().zip(dst_offsets.iter()) {
+        transfer_value(py, arr, src_off, from, &out, dst_off, to, from, to)?;
     }
     Ok(out)
 }
 
-/// Cast one field's worth of data, recursing for nested structured fields.
-fn cast_leaf(src: &NdArray, to: Descr, whole_from: Descr, whole_to: Descr) -> PyResult<NdArray> {
-    if src.descr == to {
-        return Ok(src.copy());
-    }
-    if src.descr.is_struct() || to.is_struct() {
-        return struct_astype(src, to);
-    }
-    if src.descr.dt.is_flexible() != to.dt.is_flexible() {
-        return Err(cannot_cast(whole_from, whole_to));
-    }
-    if src.descr.dt.is_flexible() {
-        // S/U/V leaves: the engine has no value cast for these yet.
-        if src.descr.dt != to.dt {
-            return Err(cannot_cast(whole_from, whole_to));
+/// Transfer one record-local value. This mirrors numpy's VOID transfer stack:
+/// structured fields are paired by position, a scalar is broadcast into all
+/// destination fields, and subarrays are handled inside each record rather
+/// than by comparing the expanded ndarray field-view shapes.
+#[allow(clippy::too_many_arguments)]
+fn transfer_value(
+    py: Python<'_>,
+    src: &NdArray,
+    src_off: isize,
+    from: Descr,
+    dst: &NdArray,
+    dst_off: isize,
+    to: Descr,
+    whole_from: Descr,
+    whole_to: Descr,
+) -> PyResult<()> {
+    match (from.struct_def(), to.struct_def()) {
+        (Some(sd), Some(dd)) => {
+            if sd.fields.len() != dd.fields.len() {
+                return Err(cannot_cast(whole_from, whole_to));
+            }
+            for (sf, df) in sd.fields.iter().zip(dd.fields.iter()) {
+                transfer_value(
+                    py,
+                    src,
+                    src_off + sf.offset as isize,
+                    sf.descr,
+                    dst,
+                    dst_off + df.offset as isize,
+                    df.descr,
+                    whole_from,
+                    whole_to,
+                )?;
+            }
+            return Ok(());
         }
-        return Ok(src.copy());
+        (Some(sd), None) => {
+            if sd.fields.len() != 1 {
+                return Err(cannot_cast(whole_from, whole_to));
+            }
+            let field = &sd.fields[0];
+            return transfer_value(
+                py,
+                src,
+                src_off + field.offset as isize,
+                field.descr,
+                dst,
+                dst_off,
+                to,
+                whole_from,
+                whole_to,
+            );
+        }
+        (None, Some(dd)) => {
+            for field in &dd.fields {
+                transfer_value(
+                    py,
+                    src,
+                    src_off,
+                    from,
+                    dst,
+                    dst_off + field.offset as isize,
+                    field.descr,
+                    whole_from,
+                    whole_to,
+                )?;
+            }
+            return Ok(());
+        }
+        (None, None) => {}
     }
-    Ok(src.astype_descr(to))
+
+    let from_sub = from.subarray_def();
+    let to_sub = to.subarray_def();
+    if from_sub.is_some() || to_sub.is_some() {
+        let (from_base, from_shape): (Descr, &[isize]) = match from_sub.as_deref() {
+            Some(sub) => (sub.base, &sub.shape),
+            None => (from, &[]),
+        };
+        let (to_base, to_shape): (Descr, &[isize]) = match to_sub.as_deref() {
+            Some(sub) => (sub.base, &sub.shape),
+            None => (to, &[]),
+        };
+        let from_size = from_shape.iter().product::<isize>().max(1) as usize;
+        let to_size = to_shape.iter().product::<isize>().max(1) as usize;
+        for dst_index in 0..to_size {
+            let src_index = subarray_source_index(dst_index, from_shape, to_shape);
+            let Some(src_index) = src_index else {
+                // `out` starts zeroed, which is numpy's zero-padding rule.
+                continue;
+            };
+            debug_assert!(src_index < from_size);
+            transfer_value(
+                py,
+                src,
+                src_off + (src_index * from_base.itemsize()) as isize,
+                from_base,
+                dst,
+                dst_off + (dst_index * to_base.itemsize()) as isize,
+                to_base,
+                whole_from,
+                whole_to,
+            )?;
+        }
+        return Ok(());
+    }
+
+    cast_leaf(
+        py, src, src_off, from, dst, dst_off, to, whole_from, whole_to,
+    )
+}
+
+/// Map a flat destination subarray index to numpy's source index. Missing
+/// leading dimensions select coordinate zero; short source dimensions are
+/// truncated and out-of-range destination coordinates are zero-filled.
+fn subarray_source_index(
+    dst_flat: usize,
+    src_shape: &[isize],
+    dst_shape: &[isize],
+) -> Option<usize> {
+    let src_size = src_shape.iter().product::<isize>().max(1) as usize;
+    let dst_size = dst_shape.iter().product::<isize>().max(1) as usize;
+    if (src_size == 1 && dst_size == 1) || src_shape == dst_shape {
+        return Some(dst_flat);
+    }
+    if src_size == 1 {
+        return Some(0);
+    }
+
+    let ndim = src_shape.len().max(dst_shape.len());
+    let mut dst_index = dst_flat;
+    let mut src_index = 0usize;
+    let mut src_factor = 1usize;
+    for i in (0..ndim).rev() {
+        let mut coord = 0usize;
+        if i >= ndim - dst_shape.len() {
+            let shape = dst_shape[i - (ndim - dst_shape.len())] as usize;
+            coord = dst_index % shape;
+            dst_index /= shape;
+        }
+        if i >= ndim - src_shape.len() {
+            let shape = src_shape[i - (ndim - src_shape.len())] as usize;
+            if shape == 1 {
+                // A length-one source dimension broadcasts coordinate zero.
+            } else if coord < shape {
+                src_index += src_factor * coord;
+                src_factor *= shape;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(src_index)
+}
+
+fn scalar_view(owner: &NdArray, byte_offset: isize, descr: Descr) -> NdArray {
+    let mut view = owner.clone();
+    view.byte_offset = byte_offset;
+    view.shape.clear();
+    view.strides.clear();
+    view.descr = descr;
+    view.flags.owndata = false;
+    view
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cast_leaf(
+    py: Python<'_>,
+    src: &NdArray,
+    src_off: isize,
+    from: Descr,
+    dst: &NdArray,
+    dst_off: isize,
+    to: Descr,
+    _whole_from: Descr,
+    _whole_to: Descr,
+) -> PyResult<()> {
+    let src_view = scalar_view(src, src_off, from);
+    let dst_view = scalar_view(dst, dst_off, to);
+    if from == to {
+        dst_view.write_raw_at(dst_off, src_view.raw_bytes_at(src_off));
+        return Ok(());
+    }
+    if from.dt.is_flexible() || to.dt.is_flexible() {
+        // Flexible values live outside the core `Scalar` enum. Round-trip one
+        // leaf through Python, just as NumPy's text transfer loops do. Keep a
+        // numpy scalar wrapper for a text source: CPython then produces the
+        // exact public errors (`np.str_('x')` / `np.bytes_(b'x')`) when its
+        // numeric constructors reject the value.
+        let value = if from.dt.is_flexible() {
+            npflexible_to_py(py, &src_view, src_off)?
+        } else {
+            element_to_py(py, &src_view, src_off)?
+        };
+        let value = if from.dt.is_flexible() {
+            let constructor = match to.dt.kind() {
+                'b' => Some("bool"),
+                'i' | 'u' => Some("int"),
+                'f' => Some("float"),
+                'c' => Some("complex"),
+                _ => None,
+            };
+            match constructor {
+                Some(name) => py.import("builtins")?.getattr(name)?.call1((value,))?,
+                None => value,
+            }
+        } else {
+            value
+        };
+        let cast = array_from_any_descr(&value, Some(to), false)?;
+        dst_view.write_raw_at(dst_off, cast.raw_bytes_at(cast.byte_offset));
+        return Ok(());
+    }
+    let cast = src_view.astype_descr(to);
+    dst_view.write_raw_at(dst_off, cast.raw_bytes_at(cast.byte_offset));
+    Ok(())
 }
 
 /// `a.getfield(dtype, offset)`: reinterpret each item at a byte offset.

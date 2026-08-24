@@ -217,6 +217,11 @@ def _input_casting_error(ufunc_name, casting, from_, to, i):
         ufunc, casting, _dtype(from_), _dtype(to), i)
 
 
+def _dtype_promotion_error(message):
+    from ..exceptions import DTypePromotionError
+    return DTypePromotionError(message)
+
+
 def _install_error_factories():
     # The engine-side hook is optional: an older/mid-rebuild `_rnp` may not
     # export it yet.  Registering is a pure enhancement (it upgrades the
@@ -227,7 +232,8 @@ def _install_error_factories():
         return
     setter({"ufunc_no_loop": _no_loop_error,
             "ufunc_binary_resolution": _binary_resolution_error,
-            "ufunc_input_casting": _input_casting_error})
+            "ufunc_input_casting": _input_casting_error,
+            "dtype_promotion": _dtype_promotion_error})
 
 
 _install_error_factories()
