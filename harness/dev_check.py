@@ -1539,12 +1539,40 @@ def _dt_arrays(spec, values):
     return np.array(values, spec), rnp.array(values, spec)
 
 
+def _normalise(v):
+    """A comparable form of one result from either library.
+
+    Arrays and numpy scalars become `(dtype, shape, payload)`. For the
+    datetime kinds the payload is the *integer* storage rather than raw
+    bytes: neither library will export an `M8`/`m8` array through the buffer
+    protocol (real numpy answers "cannot include dtype 'm' in a buffer"), so
+    `np.asarray` on the port's array is not available as a byte source. The
+    int64 view is the same information -- dtype, shape and every stored
+    value are all still compared exactly.
+    """
+    dt = getattr(v, "dtype", None)
+    if dt is None:
+        return v
+    shape = tuple(getattr(v, "shape", ()))
+    if dt.kind in "mM":
+        ints = v.astype("int64")
+        return (str(dt), shape,
+                ints.tolist() if shape else int(ints))
+    if hasattr(v, "tobytes"):
+        return (str(dt), shape, v.tobytes())
+    return (str(dt), shape, np.asarray(v).tobytes())
+
+
 def _outcome(fn, *args):
-    """`("ok", raw(value))` or `("exc", ExceptionClassName)`."""
+    """`("ok", <comparable>)` or `("exc", ExceptionClassName)`."""
     try:
-        return ("ok", raw(fn(*args)))
+        v = fn(*args)
     except Exception as exc:  # noqa: BLE001
         return ("exc", type(exc).__name__)
+    try:
+        return ("ok", _normalise(v))
+    except Exception as exc:  # noqa: BLE001
+        return ("exc", "normalise:" + type(exc).__name__)
 
 
 def _agree(name, fn, np_args, rnp_args):
@@ -1628,10 +1656,10 @@ def check_datetime_unary(rng):
                 for label, fn in unary:
                     _agree(f"datetime {kind}[{u}] {label} #{trial}",
                            fn, (np, n), (rnp, p))
-                eq(f"datetime {kind}[{u}] repr #{trial}", repr(n), repr(p))
-                eq(f"datetime {kind}[{u}] str #{trial}", str(n), str(p))
-                eq(f"datetime {kind}[{u}] item #{trial}",
-                   [x for x in n.tolist()], [x for x in p.tolist()])
+                for label, fn in (("repr", repr), ("str", str),
+                                  ("tolist", lambda a: a.tolist())):
+                    _agree(f"datetime {kind}[{u}] {label} #{trial}",
+                           fn, (n,), (p,))
 
 
 def check_datetime_casts(rng):
@@ -1661,29 +1689,31 @@ def check_datetime_casts(rng):
                    lambda a, t: a.astype(t),
                    (np.array(vals, "int64"), f"{kind}[{u}]"),
                    (rnp.array(vals, "int64"), f"{kind}[{u}]"))
-            eq(f"datetime astype {kind}[{u}] -> U",
-               n.astype("U").tolist(), p.astype("U").tolist())
-            eq(f"datetime astype {kind}[{u}] -> U dtype",
-               str(n.astype("U").dtype), str(p.astype("U").dtype))
-            eq(f"datetime astype {kind}[{u}] -> object",
-               n.astype(object).tolist(), p.astype(object).tolist())
-            eq(f"datetime datetime_data {kind}[{u}]",
-               np.datetime_data(np.dtype(f"{kind}[{u}]")),
-               rnp.datetime_data(rnp.dtype(f"{kind}[{u}]")))
+            # `.astype(object)` can raise (a `datetime.timedelta` has a
+            # narrower day range than int64), so it goes through `_agree`
+            # like everything else rather than being evaluated bare.
+            _agree(f"datetime astype {kind}[{u}] -> U",
+                   lambda a: a.astype("U").tolist(), (n,), (p,))
+            _agree(f"datetime astype {kind}[{u}] -> U dtype",
+                   lambda a: str(a.astype("U").dtype), (n,), (p,))
+            _agree(f"datetime astype {kind}[{u}] -> object",
+                   lambda a: a.astype(object).tolist(), (n,), (p,))
+            _agree(f"datetime datetime_data {kind}[{u}]",
+                   lambda m, spec: m.datetime_data(m.dtype(spec)),
+                   (np, f"{kind}[{u}]"), (rnp, f"{kind}[{u}]"))
 
         # Unit multipliers are part of the metadata, not of the value.
         base = "s" if kind == "m8" else "D"
         for num in (1, 2, 7, 1000, 2 ** 31 - 1):
             spec = f"{kind}[{num}{base}]"
-            eq(f"datetime dtype repr {spec}",
-               repr(np.dtype(spec)), repr(rnp.dtype(spec)))
-            eq(f"datetime dtype str {spec}",
-               np.dtype(spec).str, rnp.dtype(spec).str)
-            eq(f"datetime dtype name {spec}",
-               np.dtype(spec).name, rnp.dtype(spec).name)
-            eq(f"datetime datetime_data {spec}",
-               np.datetime_data(np.dtype(spec)),
-               rnp.datetime_data(rnp.dtype(spec)))
+            for label, fn in (
+                ("repr", lambda m, x: repr(m.dtype(x))),
+                ("str", lambda m, x: m.dtype(x).str),
+                ("name", lambda m, x: m.dtype(x).name),
+                ("datetime_data", lambda m, x: m.datetime_data(m.dtype(x))),
+            ):
+                _agree(f"datetime dtype {label} {spec}", fn,
+                       (np, spec), (rnp, spec))
             for other in (f"{kind}[{base}]", f"{kind}[3{base}]"):
                 _agree(f"datetime promote {spec} {other}",
                        lambda m, x, y: str(m.promote_types(x, y)),
@@ -1692,7 +1722,7 @@ def check_datetime_casts(rng):
             _agree(f"datetime astype {spec} -> {kind}[{base}]",
                    lambda a, t: a.astype(t),
                    (na, f"{kind}[{base}]"), (pa, f"{kind}[{base}]"))
-            eq(f"datetime repr array {spec}", repr(na), repr(pa))
+            _agree(f"datetime repr array {spec}", repr, (na,), (pa,))
         # A multiplier numpy rejects (above INT_MAX).
         _agree(f"datetime dtype {kind}[3000000000ps]",
                lambda m: str(m.dtype(f"{kind}[3000000000ps]")), (np,), (rnp,))

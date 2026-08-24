@@ -1482,15 +1482,21 @@ def _unit_spec(unit):
     return str(unit)
 
 
-class _TimeScalar(generic):
+class _TimeScalar:
     """Shared implementation of `np.datetime64` and `np.timedelta64`.
+
+    This is a *method bundle*, not a base class: numpy's MROs are
+    ``(datetime64, generic, object)`` and ``(timedelta64, signedinteger,
+    integer, number, generic, object)``, with no shared time-scalar class in
+    between, and `test_abstract_scalar_types` compares them element by
+    element. `_install_time_scalar` copies these methods onto each concrete
+    class instead, so nothing extra appears in `__mro__`.
 
     The payload is the raw int64 (`_v`, which is also what the engine reads
     when one of these is used as an array element) plus the full dtype, since
     the unit lives in the dtype rather than in the value.
     """
 
-    __slots__ = ("_v", "_dtype")
     _char = "M8"
 
     def __new__(cls, value=None, unit=None):
@@ -1621,6 +1627,30 @@ def _time_ufunc(name, a, b):
     return _ufunc.ALL[name](a, b)
 
 
+#: The `_TimeScalar` members copied onto each concrete time-scalar class.
+#:
+#: `dtype` is deliberately absent: `_FlexMeta` exposes it as a *metaclass*
+#: property (so that `np.dtype(np.timedelta64)` is `dtype('m8')`), which makes
+#: `setattr(cls, "dtype", ...)` hit that property's missing setter. The two
+#: concrete classes declare their own instance-level `dtype` instead.
+_TIME_SCALAR_MEMBERS = (
+    "__new__", "_from_parts", "_unit", "__array__", "astype",
+    "item", "tolist", "__hash__", "__bool__", "__reduce__", "__format__",
+    "_op", "__neg__", "__pos__", "__abs__",
+)
+
+
+def _install_time_scalar(cls):
+    """Copy `_TimeScalar`'s implementation onto `cls`.
+
+    Inheriting would put a class numpy does not have into `__mro__`; copying
+    keeps `np.timedelta64.__mro__` exactly numpy's.
+    """
+    for name in _TIME_SCALAR_MEMBERS:
+        setattr(cls, name, _TimeScalar.__dict__[name])
+    return cls
+
+
 def _install_time_operators(cls):
     for op, name in (("add", "add"), ("sub", "subtract"),
                      ("mul", "multiply"), ("truediv", "divide"),
@@ -1652,10 +1682,14 @@ def _install_time_operators(cls):
     return cls
 
 
-class datetime64(_TimeScalar, metaclass=_FlexMeta, char="M8"):
+class datetime64(generic, metaclass=_FlexMeta, char="M8"):
     __module__ = "numpy"
-    __slots__ = ()
+    __slots__ = ("_v", "_dtype")
     _char = "M8"
+
+    @property
+    def dtype(self):
+        return self._dtype
 
     def _hash_value(self):
         import datetime as _pydt
@@ -1692,10 +1726,14 @@ class datetime64(_TimeScalar, metaclass=_FlexMeta, char="M8"):
             "number, not 'datetime.date'")
 
 
-class timedelta64(signedinteger, _TimeScalar, metaclass=_FlexMeta, char="m8"):
+class timedelta64(signedinteger, metaclass=_FlexMeta, char="m8"):
     __module__ = "numpy"
-    __slots__ = ()
+    __slots__ = ("_v", "_dtype")
     _char = "m8"
+
+    @property
+    def dtype(self):
+        return self._dtype
 
     def _hash_value(self):
         import datetime as _pydt
@@ -1746,6 +1784,8 @@ def _meta_str(meta):
     return unit if num == 1 else f"{num}{unit}"
 
 
+_install_time_scalar(datetime64)
+_install_time_scalar(timedelta64)
 _install_time_operators(datetime64)
 _install_time_operators(timedelta64)
 

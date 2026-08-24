@@ -32,7 +32,7 @@ sin cos tan arcsin arccos arctan asin acos atan
 sinh cosh tanh arcsinh arccosh arctanh asinh acosh atanh
 deg2rad rad2deg degrees radians
 conj conjugate invert bitwise_invert bitwise_not bitwise_count
-isnan isinf isfinite signbit spacing
+isnan isinf isfinite isnat signbit spacing
 frexp modf _ones_like
 matmul vecdot matvec vecmat
 """.split())

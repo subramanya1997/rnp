@@ -932,6 +932,11 @@ impl PyNdArray {
                 "astype from {} to {} is not implemented yet",
                 self.arr.dtype(), d.dt
             )));
+        } else if d.dt.is_datetime_like() || self.arr.dtype().is_datetime_like() {
+            // A datetime unit conversion can overflow int64, and numpy raises
+            // rather than substituting NaT, so this cast must not go through
+            // the infallible `astype_descr`.
+            self.arr.try_astype_descr(d).map_err(crate::err)?
         } else {
             self.arr.astype_descr(d)
         };
@@ -2369,6 +2374,15 @@ impl PyNdArray {
         }
         let me = slf.borrow();
         let arr = &me.arr;
+        if arr.dtype().is_datetime_like() {
+            // PEP 3118 has no datetime code, and numpy refuses the export
+            // rather than lying about the item size:
+            // `memoryview(np.array([1], 'm8[s]'))` is a ValueError.
+            return Err(PyValueError::new_err(format!(
+                "cannot include dtype '{}' in a buffer",
+                arr.dtype().kind()
+            )));
+        }
         if (flags & ffi::PyBUF_WRITABLE) == ffi::PyBUF_WRITABLE && !arr.flags.writeable {
             return Err(PyBufferError::new_err("Object is not writable"));
         }

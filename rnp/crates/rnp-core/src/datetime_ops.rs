@@ -345,10 +345,18 @@ fn resolve(op: BinOp, a: &NdArray, b: &NdArray) -> Result<Loop> {
 pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<NdArray>)> {
     let lp = match resolve(op, a, b) {
         Ok(l) => l,
-        // `==` / `!=` never raise: numpy's ufunc returns NotImplemented and
-        // `ndarray.__eq__` falls back to an all-False / all-True result.
+        // `==` / `!=` fall back to an all-False / all-True result when no
+        // *loop* fits (numpy's ufunc returns NotImplemented and
+        // `ndarray.__eq__` substitutes the constant). A metadata failure is
+        // different: `m8[Y] == m8[fs]` raises the TypeError and
+        // `m8[as] == m8[s]` the OverflowError, because those happen *while*
+        // promoting rather than instead of it.
         Err(e) => {
-            if matches!(op, BinOp::Eq | BinOp::Ne) {
+            let no_loop = matches!(
+                e,
+                Error::UFuncBinaryResolution { .. } | Error::UFuncNoLoop { .. }
+            );
+            if no_loop && matches!(op, BinOp::Eq | BinOp::Ne) {
                 let shape = broadcast_shapes(&a.shape, &b.shape)?;
                 let out = NdArray::full(
                     shape,

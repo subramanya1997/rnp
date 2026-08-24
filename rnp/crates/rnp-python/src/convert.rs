@@ -577,6 +577,13 @@ fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
 /// Probed from numpy 2.5.2: `int8 + 1 -> int8`, `int8 + 1.0 -> float64`,
 /// `float32 + 1j -> complex64`, `bool + 1 -> int64`.
 pub fn weak_promote(arr: DType, s: Scalar) -> DType {
+    if arr.is_datetime_like() {
+        // A weak Python number keeps its own dtype against a datetime-like
+        // array: the datetime type resolvers are what decide whether it is
+        // read as a count in the array's unit (`m8 + 3`, `m8 < 3`) or as a
+        // plain multiplier/divisor (`m8 * 3`, `m8 / 3` -> m8, not float64).
+        return s.natural_dtype();
+    }
     let arr_level = match arr {
         DType::Bool => 0,
         d if d.is_integer() => 1,

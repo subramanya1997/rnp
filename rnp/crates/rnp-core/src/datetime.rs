@@ -860,6 +860,45 @@ pub fn cast_timedelta(src: DtMeta, dst: DtMeta, v: i64) -> Result<i64> {
     scale_with_overflow_check(v, num, denom, "timedelta64")
 }
 
+/// Cast one element the way an *array* cast does, which is not quite the way
+/// a scalar conversion does.
+///
+/// numpy's `get_nbo_cast_datetime_transfer_function` picks the
+/// datetimestruct round trip only for a **datetime64** whose source or
+/// destination is a nonlinear unit; a timedelta64 always goes through the
+/// rational scale factor (so `m8[Y] -> m8[D]` uses the 400-year average).
+/// Either way the overflow message names `datetime64`, whatever the kind --
+/// probed: `np.array([-2**63+1], 'm8[as]').astype('m8[ms]')` reports
+/// "Overflow when converting between datetime64 units".
+pub fn cast_value_array(src: DType, dst: DType, v: i64) -> Result<i64> {
+    let ms = meta_of(src).expect("datetime dtype");
+    let md = meta_of(dst).expect("datetime dtype");
+    let same_kind = src.is_datetime() == dst.is_datetime();
+    if !same_kind {
+        // numpy's datetime <-> timedelta cast keeps the integer value.
+        return Ok(v);
+    }
+    if ms.base == md.base && ms.num == md.num {
+        return Ok(v);
+    }
+    // numpy computes the conversion factor *before* choosing a loop, and
+    // fails the whole cast when it overflows -- even for the nonlinear units
+    // that would then take the calendar path. `M8[Y] -> M8[ps]` is exactly
+    // that case: the Y->ps factor overflows, so numpy raises rather than
+    // going through the datetimestruct.
+    let (num, denom) = conversion_factor(ms, md)?;
+    if v == NAT {
+        return Ok(NAT);
+    }
+    if src.is_datetime()
+        && (ms.base == UNIT_Y || ms.base == UNIT_M || md.base == UNIT_Y || md.base == UNIT_M)
+    {
+        let dts = dt64_to_dts(ms, v)?;
+        return dts_to_dt64(md, &dts);
+    }
+    scale_with_overflow_check(v, num, denom, "datetime64")
+}
+
 /// Cast one element between two datetime-like dtypes (they must be the same
 /// kind; datetime<->timedelta is a bit-preserving reinterpretation in numpy).
 pub fn cast_value(src: DType, dst: DType, v: i64) -> Result<i64> {
