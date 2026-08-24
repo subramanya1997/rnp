@@ -233,6 +233,10 @@ class DistributionKernels:
             while True:
                 u = self.bit_generator.next_double()
                 v = self.bit_generator.next_double()
+                if a == 0.0:
+                    return 0.0
+                if b == 0.0:
+                    return 1.0
                 x = math.pow(u, 1.0 / a)
                 y = math.pow(v, 1.0 / b)
                 xpy = x + y
@@ -600,3 +604,76 @@ class DistributionKernels:
         negative = result < 0.0
         mod = math.fmod(abs(result) + math.pi, 2.0 * math.pi) - math.pi
         return -mod if negative else mod
+
+    def hypergeometric_sample(self, good, bad, sample):
+        total = good + bad
+        computed = total - sample if sample > total // 2 else sample
+        remaining_total = total
+        remaining_good = good
+        while computed > 0 and remaining_good > 0 and remaining_total > remaining_good:
+            remaining_total -= 1
+            # random_interval is inclusive; this is the exact C helper.
+            maximum = remaining_total
+            mask = maximum
+            mask |= mask >> 1
+            mask |= mask >> 2
+            mask |= mask >> 4
+            mask |= mask >> 8
+            mask |= mask >> 16
+            mask |= mask >> 32
+            while True:
+                if maximum <= 0xFFFFFFFF:
+                    value = self.bit_generator.next_uint32() & mask
+                else:
+                    value = self.bit_generator.next_uint64() & mask
+                if value <= maximum:
+                    break
+            if value < remaining_good:
+                remaining_good -= 1
+            computed -= 1
+        if remaining_total == remaining_good:
+            remaining_good -= computed
+        if sample > total // 2:
+            return remaining_good
+        return good - remaining_good
+
+    def hypergeometric(self, good, bad, sample):
+        if sample < 10 or sample > good + bad - 10:
+            return self.hypergeometric_sample(good, bad, sample)
+        popsize = good + bad
+        computed = min(sample, popsize - sample)
+        mingb = min(good, bad)
+        maxgb = max(good, bad)
+        p = mingb / popsize
+        q = maxgb / popsize
+        mu = computed * p
+        a = mu + 0.5
+        variance = (popsize - computed) * computed * p * q / (popsize - 1)
+        c = math.sqrt(variance + 0.5)
+        h = math.fma(1.7155277699214135, c, 0.8989161620588988)
+        m = math.floor((computed + 1.0) * (mingb + 1.0) / (popsize + 2.0))
+        logfact = lambda k: math.lgamma(k + 1.0)
+        g = (logfact(m) + logfact(mingb - m) + logfact(computed - m)
+             + logfact(maxgb - computed + m))
+        b = min(min(computed, mingb) + 1.0, math.floor(a + 16.0 * c))
+        while True:
+            u = self.bit_generator.next_double()
+            v = self.bit_generator.next_double()
+            x = math.fma(h / u, v - 0.5, a)
+            if x < 0.0 or x >= b:
+                continue
+            k = math.floor(x)
+            gp = (logfact(k) + logfact(mingb - k) + logfact(computed - k)
+                  + logfact(maxgb - computed + k))
+            t = g - gp
+            if math.fma(u, 4.0 - u, -3.0) <= t:
+                break
+            if u * (u - t) >= 1.0:
+                continue
+            if 2.0 * math.log(u) <= t:
+                break
+        if good > bad:
+            k = computed - k
+        if computed < sample:
+            k = good - k
+        return k

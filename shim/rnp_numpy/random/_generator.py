@@ -3,6 +3,7 @@
 import bisect
 import math
 import operator
+import warnings
 
 from .. import (
     arange,
@@ -507,6 +508,14 @@ class Generator:
     def _broadcast_kernel(self, params, size, validate, draw, dtype=float64):
         arrays = [asarray(value) for value in params]
         scalar = all(value.ndim == 0 for value in arrays)
+        if scalar:
+            scalar_values = tuple(float(value) for value in params)
+            validate(scalar_values)
+            if size is None:
+                return draw(scalar_values)
+            shape = _shape(size)
+            return array([draw(scalar_values) for _ in range(_count(shape))],
+                         dtype=dtype).reshape(shape)
         arrays = list(broadcast_arrays(*arrays))
         shape = tuple(arrays[0].shape) if size is None else _shape(size)
         try:
@@ -561,6 +570,21 @@ class Generator:
         return self._continuous(draw, size=size, dtype=dtype, out=out)
 
     def standard_gamma(self, shape, size=None, dtype=float64, out=None):
+        shape_arr = asarray(shape)
+        if shape_arr.ndim != 0:
+            if out is not None:
+                raise NotImplementedError("array shape with out is not supported")
+            def validate(values):
+                value = values[0]
+                if (math.isnan(value) or value < 0.0
+                        or (value == 0.0 and math.copysign(1.0, value) < 0.0)):
+                    raise ValueError("shape < 0")
+            kernel = (self._distributions.standard_gamma_f
+                      if _dtype_name(dtype) == "float32"
+                      else self._distributions.standard_gamma)
+            return self._broadcast_kernel(
+                (shape,), size, validate, lambda v: kernel(v[0]), dtype=dtype
+            )
         shape_value = float(shape)
         if (math.isnan(shape_value) or shape_value < 0.0
                 or (shape_value == 0.0 and math.copysign(1.0, shape_value) < 0.0)):
@@ -575,45 +599,39 @@ class Generator:
         )
 
     def normal(self, loc=0.0, scale=1.0, size=None):
-        loc = float(loc)
-        scale = float(scale)
-        if (scale < 0.0 or math.isnan(scale)
-                or (scale == 0.0 and math.copysign(1.0, scale) < 0.0)):
-            raise ValueError("scale < 0")
-        return self._continuous(lambda: math.fma(
-            scale, self._distributions.standard_normal(), loc
-        ), size=size)
+        def validate(v):
+            if (v[1] < 0.0 or math.isnan(v[1])
+                    or (v[1] == 0.0 and math.copysign(1.0, v[1]) < 0.0)):
+                raise ValueError("scale < 0")
+        return self._broadcast_kernel(
+            (loc, scale), size, validate,
+            lambda v: math.fma(v[1], self._distributions.standard_normal(), v[0]),
+        )
 
     def exponential(self, scale=1.0, size=None):
-        scale = float(scale)
-        if (scale < 0.0 or math.isnan(scale)
-                or (scale == 0.0 and math.copysign(1.0, scale) < 0.0)):
-            raise ValueError("scale < 0")
-        return self._continuous(
-            lambda: scale * self._distributions.standard_exponential(), size=size
+        def validate(v):
+            self._positive(v[0], "scale", allow_zero=True)
+        return self._broadcast_kernel(
+            (scale,), size, validate,
+            lambda v: v[0] * self._distributions.standard_exponential(),
         )
 
     def gamma(self, shape, scale=1.0, size=None):
-        shape = float(shape)
-        scale = float(scale)
-        if (shape < 0.0 or math.isnan(shape)
-                or (shape == 0.0 and math.copysign(1.0, shape) < 0.0)):
-            raise ValueError("shape < 0")
-        if (scale < 0.0 or math.isnan(scale)
-                or (scale == 0.0 and math.copysign(1.0, scale) < 0.0)):
-            raise ValueError("scale < 0")
-        return self._continuous(
-            lambda: scale * self._distributions.standard_gamma(shape), size=size
+        def validate(v):
+            self._positive(v[0], "shape", allow_zero=True)
+            self._positive(v[1], "scale", allow_zero=True)
+        return self._broadcast_kernel(
+            (shape, scale), size, validate,
+            lambda v: v[1] * self._distributions.standard_gamma(v[0]),
         )
 
     def beta(self, a, b, size=None):
-        a = float(a)
-        b = float(b)
-        if a <= 0.0 or math.isnan(a):
-            raise ValueError("a <= 0")
-        if b <= 0.0 or math.isnan(b):
-            raise ValueError("b <= 0")
-        return self._continuous(lambda: self._distributions.beta(a, b), size=size)
+        def validate(v):
+            self._positive(v[0], "a")
+            self._positive(v[1], "b")
+        return self._broadcast_kernel(
+            (a, b), size, validate, lambda v: self._distributions.beta(*v)
+        )
 
     @staticmethod
     def _positive(value, name, allow_zero=False):
@@ -626,67 +644,86 @@ class Generator:
         return value
 
     def chisquare(self, df, size=None):
-        df = self._positive(df, "df")
-        return self._continuous(lambda: self._distributions.chisquare(df), size=size)
+        return self._broadcast_kernel(
+            (df,), size, lambda v: self._positive(v[0], "df"),
+            lambda v: self._distributions.chisquare(v[0]),
+        )
 
     def f(self, dfnum, dfden, size=None):
-        dfnum = self._positive(dfnum, "dfnum")
-        dfden = self._positive(dfden, "dfden")
-        return self._continuous(lambda: self._distributions.f(dfnum, dfden), size=size)
+        def validate(v):
+            self._positive(v[0], "dfnum")
+            self._positive(v[1], "dfden")
+        return self._broadcast_kernel(
+            (dfnum, dfden), size, validate, lambda v: self._distributions.f(*v)
+        )
 
     def standard_cauchy(self, size=None):
         return self._continuous(self._distributions.standard_cauchy, size=size)
 
     def pareto(self, a, size=None):
-        a = self._positive(a, "a")
-        return self._continuous(lambda: self._distributions.pareto(a), size=size)
+        return self._broadcast_kernel(
+            (a,), size, lambda v: self._positive(v[0], "a"),
+            lambda v: self._distributions.pareto(v[0]),
+        )
 
     def weibull(self, a, size=None):
-        a = self._positive(a, "a", allow_zero=True)
-        return self._continuous(lambda: self._distributions.weibull(a), size=size)
+        return self._broadcast_kernel(
+            (a,), size, lambda v: self._positive(v[0], "a", allow_zero=True),
+            lambda v: self._distributions.weibull(v[0]),
+        )
 
     def power(self, a, size=None):
-        a = self._positive(a, "a")
-        return self._continuous(lambda: self._distributions.power(a), size=size)
+        return self._broadcast_kernel(
+            (a,), size, lambda v: self._positive(v[0], "a"),
+            lambda v: self._distributions.power(v[0]),
+        )
 
     def laplace(self, loc=0.0, scale=1.0, size=None):
-        loc = float(loc)
-        scale = self._positive(scale, "scale", allow_zero=True)
-        return self._continuous(lambda: self._distributions.laplace(loc, scale), size=size)
+        return self._location_scale(loc, scale, size, self._distributions.laplace)
 
     def gumbel(self, loc=0.0, scale=1.0, size=None):
-        loc = float(loc)
-        scale = self._positive(scale, "scale", allow_zero=True)
-        return self._continuous(lambda: self._distributions.gumbel(loc, scale), size=size)
+        return self._location_scale(loc, scale, size, self._distributions.gumbel)
 
     def logistic(self, loc=0.0, scale=1.0, size=None):
-        loc = float(loc)
-        scale = self._positive(scale, "scale", allow_zero=True)
-        return self._continuous(lambda: self._distributions.logistic(loc, scale), size=size)
+        return self._location_scale(loc, scale, size, self._distributions.logistic)
+
+    def _location_scale(self, loc, scale, size, kernel):
+        def validate(v):
+            self._positive(v[1], "scale", allow_zero=True)
+        return self._broadcast_kernel(
+            (loc, scale), size, validate, lambda v: kernel(*v)
+        )
 
     def lognormal(self, mean=0.0, sigma=1.0, size=None):
-        mean = float(mean)
-        sigma = self._positive(sigma, "sigma", allow_zero=True)
-        return self._continuous(lambda: self._distributions.lognormal(mean, sigma), size=size)
+        def validate(v):
+            self._positive(v[1], "sigma", allow_zero=True)
+        return self._broadcast_kernel(
+            (mean, sigma), size, validate, lambda v: self._distributions.lognormal(*v)
+        )
 
     def rayleigh(self, scale=1.0, size=None):
-        scale = self._positive(scale, "scale", allow_zero=True)
-        return self._continuous(lambda: self._distributions.rayleigh(scale), size=size)
+        return self._broadcast_kernel(
+            (scale,), size, lambda v: self._positive(v[0], "scale", allow_zero=True),
+            lambda v: self._distributions.rayleigh(v[0]),
+        )
 
     def standard_t(self, df, size=None):
-        df = self._positive(df, "df")
-        return self._continuous(lambda: self._distributions.standard_t(df), size=size)
+        return self._broadcast_kernel(
+            (df,), size, lambda v: self._positive(v[0], "df"),
+            lambda v: self._distributions.standard_t(v[0]),
+        )
 
     def triangular(self, left, mode, right, size=None):
-        left, mode, right = float(left), float(mode), float(right)
-        if left > mode:
-            raise ValueError("left > mode")
-        if mode > right:
-            raise ValueError("mode > right")
-        if left == right:
-            raise ValueError("left == right")
-        return self._continuous(
-            lambda: self._distributions.triangular(left, mode, right), size=size
+        def validate(v):
+            if v[0] > v[1]:
+                raise ValueError("left > mode")
+            if v[1] > v[2]:
+                raise ValueError("mode > right")
+            if v[0] == v[2]:
+                raise ValueError("left == right")
+        return self._broadcast_kernel(
+            (left, mode, right), size, validate,
+            lambda v: self._distributions.triangular(*v),
         )
 
     def _discrete(self, draw, size=None):
@@ -697,50 +734,69 @@ class Generator:
         return array(values, dtype=int64).reshape(shape)
 
     def geometric(self, p, size=None):
-        p = float(p)
-        if p <= 0.0 or p > 1.0 or math.isnan(p):
-            raise ValueError("p <= 0, p > 1 or p contains NaNs")
-        return self._discrete(lambda: self._distributions.geometric(p), size=size)
+        def validate(v):
+            if v[0] <= 0.0 or v[0] > 1.0 or math.isnan(v[0]):
+                raise ValueError("p <= 0, p > 1 or p contains NaNs")
+        return self._broadcast_kernel(
+            (p,), size, validate, lambda v: self._distributions.geometric(v[0]),
+            dtype=int64,
+        )
 
     def logseries(self, p, size=None):
-        p = float(p)
-        if p < 0.0 or p >= 1.0 or math.isnan(p):
-            raise ValueError("p < 0, p >= 1 or p is NaN")
-        return self._discrete(lambda: self._distributions.logseries(p), size=size)
+        def validate(v):
+            if v[0] < 0.0 or v[0] >= 1.0 or math.isnan(v[0]):
+                raise ValueError("p < 0, p >= 1 or p is NaN")
+        return self._broadcast_kernel(
+            (p,), size, validate, lambda v: self._distributions.logseries(v[0]),
+            dtype=int64,
+        )
 
     def zipf(self, a, size=None):
-        a = float(a)
-        if a <= 1.0 or math.isnan(a):
-            raise ValueError("a <= 1 or a is NaN")
-        return self._discrete(lambda: self._distributions.zipf(a), size=size)
+        def validate(v):
+            if v[0] <= 1.0 or math.isnan(v[0]):
+                raise ValueError("a <= 1 or a is NaN")
+        return self._broadcast_kernel(
+            (a,), size, validate, lambda v: self._distributions.zipf(v[0]),
+            dtype=int64,
+        )
 
     def poisson(self, lam=1.0, size=None):
-        lam = float(lam)
-        if lam < 0.0 or math.isnan(lam) or lam > self._poisson_lam_max:
-            raise ValueError("lam < 0 or lam is too large")
-        return self._discrete(lambda: self._distributions.poisson(lam), size=size)
+        def validate(v):
+            if v[0] < 0.0 or math.isnan(v[0]) or v[0] > self._poisson_lam_max:
+                raise ValueError("lam < 0 or lam is too large")
+        return self._broadcast_kernel(
+            (lam,), size, validate, lambda v: self._distributions.poisson(v[0]),
+            dtype=int64,
+        )
 
     def binomial(self, n, p, size=None):
-        n = int(float(n))
-        p = float(p)
-        if n < 0:
-            raise ValueError("n < 0")
-        if p < 0.0 or p > 1.0 or math.isnan(p):
-            raise ValueError("p < 0, p > 1 or p is NaN")
-        return self._discrete(lambda: self._distributions.binomial(n, p), size=size)
+        def validate(v):
+            if v[0] < 0.0:
+                raise ValueError("n < 0")
+            if v[1] < 0.0 or v[1] > 1.0 or math.isnan(v[1]):
+                raise ValueError("p < 0, p > 1 or p is NaN")
+        return self._broadcast_kernel(
+            (n, p), size, validate,
+            lambda v: self._distributions.binomial(int(v[0]), v[1]), dtype=int64,
+        )
 
     def negative_binomial(self, n, p, size=None):
-        n = float(n)
-        p = float(p)
-        if n <= 0.0 or math.isnan(n):
-            raise ValueError("n <= 0")
-        if p <= 0.0 or p > 1.0 or math.isnan(p):
-            raise ValueError("p <= 0, p > 1 or p contains NaNs")
-        return self._discrete(
-            lambda: self._distributions.negative_binomial(n, p), size=size
+        def validate(v):
+            if v[0] <= 0.0 or math.isnan(v[0]):
+                raise ValueError("n <= 0")
+            if v[1] <= 0.0 or v[1] > 1.0 or math.isnan(v[1]):
+                raise ValueError("p <= 0, p > 1 or p contains NaNs")
+            max_lam = (1.0 - v[1]) / v[1] * (v[0] + 10.0 * math.sqrt(v[0]))
+            if max_lam > self._poisson_lam_max:
+                raise ValueError("n too large or p too small")
+        return self._broadcast_kernel(
+            (n, p), size, validate,
+            lambda v: self._distributions.negative_binomial(*v), dtype=int64,
         )
 
     def multinomial(self, n, pvals, size=None):
+        if asarray(pvals).ndim == 0:
+            raise ValueError("pvals must be at least 1-dimensional")
         n = operator.index(n)
         probs = [float(v) for v in asarray(pvals).flat]
         if n < 0:
@@ -769,35 +825,159 @@ class Generator:
         return array(values, dtype=int64).reshape(shape)
 
     def noncentral_chisquare(self, df, nonc, size=None):
-        df = self._positive(df, "df")
-        nonc = float(nonc)
-        if nonc < 0.0:
-            raise ValueError("nonc < 0")
-        return self._continuous(
-            lambda: self._distributions.noncentral_chisquare(df, nonc), size=size
+        def validate(v):
+            self._positive(v[0], "df")
+            if v[1] < 0.0:
+                raise ValueError("nonc < 0")
+        return self._broadcast_kernel(
+            (df, nonc), size, validate,
+            lambda v: self._distributions.noncentral_chisquare(*v),
         )
 
     def noncentral_f(self, dfnum, dfden, nonc, size=None):
-        dfnum = self._positive(dfnum, "dfnum")
-        dfden = self._positive(dfden, "dfden")
-        nonc = float(nonc)
-        if nonc < 0.0:
-            raise ValueError("nonc < 0")
-        return self._continuous(
-            lambda: self._distributions.noncentral_f(dfnum, dfden, nonc), size=size
+        def validate(v):
+            self._positive(v[0], "dfnum")
+            self._positive(v[1], "dfden")
+            if v[2] < 0.0:
+                raise ValueError("nonc < 0")
+        return self._broadcast_kernel(
+            (dfnum, dfden, nonc), size, validate,
+            lambda v: self._distributions.noncentral_f(*v),
         )
 
     def wald(self, mean, scale, size=None):
-        mean = self._positive(mean, "mean")
-        scale = self._positive(scale, "scale")
-        return self._continuous(lambda: self._distributions.wald(mean, scale), size=size)
+        def validate(v):
+            self._positive(v[0], "mean")
+            self._positive(v[1], "scale")
+        return self._broadcast_kernel(
+            (mean, scale), size, validate, lambda v: self._distributions.wald(*v)
+        )
 
     def vonmises(self, mu, kappa, size=None):
-        mu = float(mu)
-        kappa = float(kappa)
-        if kappa < 0.0:
-            raise ValueError("kappa < 0")
-        return self._continuous(lambda: self._distributions.vonmises(mu, kappa), size=size)
+        def validate(v):
+            if v[1] < 0.0:
+                raise ValueError("kappa < 0")
+        return self._broadcast_kernel(
+            (mu, kappa), size, validate, lambda v: self._distributions.vonmises(*v)
+        )
+
+    def hypergeometric(self, ngood, nbad, nsample, size=None):
+        if all(asarray(value).ndim == 0 for value in (ngood, nbad, nsample)):
+            ngood, nbad, nsample = int(ngood), int(nbad), int(nsample)
+        def validate(v):
+            good, bad, sample = (int(x) for x in v)
+            if good < 0 or bad < 0 or sample < 0:
+                raise ValueError("ngood, nbad, and nsample must be nonnegative")
+            if good >= 10**9 or bad >= 10**9:
+                raise ValueError("both ngood and nbad must be less than 1000000000")
+            if sample > good + bad:
+                raise ValueError("nsample > ngood + nbad")
+        return self._broadcast_kernel(
+            (ngood, nbad, nsample), size, validate,
+            lambda v: self._distributions.hypergeometric(*(int(x) for x in v)),
+            dtype=int64,
+        )
+
+    def multivariate_hypergeometric(self, colors, nsample, size=None,
+                                    method="marginals"):
+        colors_arr = asarray(colors)
+        if colors_arr.ndim != 1:
+            raise ValueError("colors must be a one-dimensional sequence")
+        values = [operator.index(v) for v in colors_arr.flat]
+        nsample = operator.index(nsample)
+        if method not in ("count", "marginals"):
+            raise ValueError("method must be 'count' or 'marginals'")
+        if any(v < 0 for v in values):
+            raise ValueError("colors must be nonnegative")
+        total = sum(values)
+        if nsample < 0 or nsample > total:
+            raise ValueError("nsample must be nonnegative and no greater than colors.sum()")
+        out_shape = _shape(size) + (len(values),)
+        rows = 1 if size is None else _count(_shape(size))
+        result = []
+        more_than_half = nsample > total // 2
+        computed = total - nsample if more_than_half else nsample
+        if method == "count":
+            choices = []
+            for color, count in enumerate(values):
+                choices.extend([color] * count)
+            for _ in range(rows):
+                row = [0] * len(values)
+                for j in range(computed):
+                    k = j + self._random_interval(total - j - 1)
+                    choices[j], choices[k] = choices[k], choices[j]
+                for j in range(computed):
+                    row[choices[j]] += 1
+                if more_than_half:
+                    row = [count - draw for count, draw in zip(values, row)]
+                result.extend(row)
+        else:
+            for _ in range(rows):
+                row = [0] * len(values)
+                num_to_sample = computed
+                remaining = total
+                for j in range(max(len(values) - 1, 0)):
+                    if num_to_sample <= 0:
+                        break
+                    remaining -= values[j]
+                    draw = self._distributions.hypergeometric(
+                        values[j], remaining, num_to_sample
+                    )
+                    row[j] = draw
+                    num_to_sample -= draw
+                if num_to_sample > 0 and values:
+                    row[-1] = num_to_sample
+                if more_than_half:
+                    row = [count - draw for count, draw in zip(values, row)]
+                result.extend(row)
+        return array(result, dtype=int64).reshape(out_shape)
+
+    def multivariate_normal(self, mean, cov, size=None, check_valid="warn",
+                            tol=1e-8, *, method="svd"):
+        from .. import dot, sqrt
+        from ..linalg import cholesky, eigh, svd
+
+        mean = asarray(mean)
+        cov = asarray(cov)
+        if mean.dtype.kind == "c" or cov.dtype.kind == "c":
+            raise TypeError("mean and cov must not be complex")
+        if mean.ndim != 1:
+            raise ValueError("mean must be 1 dimensional")
+        if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+            raise ValueError("cov must be 2 dimensional and square")
+        if mean.shape[0] != cov.shape[0]:
+            raise ValueError("mean and cov must have same length")
+        if method not in ("svd", "eigh", "cholesky"):
+            raise ValueError("method must be 'svd', 'eigh', or 'cholesky'")
+        final_shape = _shape(size) + (mean.shape[0],)
+        x = self.standard_normal(final_shape).reshape(-1, mean.shape[0])
+        cov = cov.astype(float64)
+        if method == "cholesky":
+            factor = cholesky(cov)
+        elif method == "eigh":
+            eigenvalues, u = eigh(cov)
+            if check_valid != "ignore" and any(v < -tol for v in eigenvalues.flat):
+                if check_valid == "raise":
+                    raise ValueError("covariance is not symmetric positive-semidefinite")
+                warnings.warn("covariance is not symmetric positive-semidefinite.", RuntimeWarning)
+            factor = u * sqrt(abs(eigenvalues))
+        else:
+            u, singular, _ = svd(cov)
+            factor = u * sqrt(singular)
+        if check_valid not in ("warn", "raise", "ignore"):
+            raise ValueError("check_valid must equal 'warn', 'raise', or 'ignore'")
+        if check_valid != "ignore" and method != "cholesky":
+            symmetric = all(
+                abs(float(cov[i, j]) - float(cov[j, i])) <= tol
+                for i in range(cov.shape[0]) for j in range(cov.shape[1])
+            )
+            evals, _ = eigh(cov)
+            valid = symmetric and all(float(v) >= -tol for v in evals.flat)
+            if not valid:
+                if check_valid == "raise":
+                    raise ValueError("covariance is not symmetric positive-semidefinite")
+                warnings.warn("covariance is not symmetric positive-semidefinite.", RuntimeWarning)
+        return (mean + dot(x, factor.T)).reshape(final_shape)
 
     def dirichlet(self, alpha, size=None):
         values = [float(v) for v in asarray(alpha).flat]
@@ -818,7 +998,10 @@ class Generator:
                 acc = 1.0
                 if total > 0.0:
                     for j in range(len(values) - 1):
-                        v = self._distributions.beta(values[j], cumulative[j + 1])
+                        if cumulative[j + 1] == 0.0:
+                            v = 1.0
+                        else:
+                            v = self._distributions.beta(values[j], cumulative[j + 1])
                         row[j] = acc * v
                         acc *= 1.0 - v
                         if cumulative[j + 1] == 0.0:
