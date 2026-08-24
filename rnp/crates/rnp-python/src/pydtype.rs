@@ -582,6 +582,26 @@ impl PyDType {
         Ok(PyDType { d })
     }
 
+    #[classmethod]
+    fn __class_getitem__<'py>(
+        cls: &Bound<'py, PyType>,
+        item: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let arg = if let Ok(items) = item.cast::<PyTuple>() {
+            match items.len() {
+                0 => return Err(PyTypeError::new_err("Too few arguments for numpy.dtype")),
+                1 => items.get_item(0)?,
+                _ => return Err(PyTypeError::new_err("Too many arguments for numpy.dtype")),
+            }
+        } else {
+            item.clone()
+        };
+        cls.py()
+            .import("types")?
+            .getattr("GenericAlias")?
+            .call1((cls, arg))
+    }
+
     #[getter]
     fn name(&self) -> String {
         self.d.name()
