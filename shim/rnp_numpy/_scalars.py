@@ -520,7 +520,12 @@ def _mirror_ndarray_signature(name, impl):
             pos_only = []
         if p.kind is P.POSITIONAL_OR_KEYWORD:
             decl.append(spelling)
-            call.append(p.name)
+            # The first parameter is the bound scalar instance.  Python
+            # wrappers on our ndarray expose it as positional-or-keyword,
+            # unlike NumPy's positional-only C methods, but it must never be
+            # forwarded a second time.
+            if i:
+                call.append(p.name)
         elif p.kind is P.VAR_POSITIONAL:
             decl.append("*" + p.name)
             call.append("*" + p.name)
