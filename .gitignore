@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 harness/.report-*.json
 .pytest_cache/
+.DS_Store

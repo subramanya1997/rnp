@@ -550,6 +550,20 @@ def argsort(a, axis=-1, kind=None, order=None, *, stable=None):
     return _asarr(a).argsort(axis, kind, order, stable=stable)
 
 
+def partition(a, kth, axis=-1, kind="introselect", order=None):
+    """Return a partitioned copy of `a` (numpy returns a copy, not a view)."""
+    a = _asarr(a).copy()
+    if axis is None:
+        a = a.ravel()
+        axis = -1
+    a.partition(kth, axis, kind, order)
+    return a
+
+
+def argpartition(a, kth, axis=-1, kind="introselect", order=None):
+    return _asarr(a).argpartition(kth, axis, kind, order)
+
+
 def searchsorted(a, v, side="left", sorter=None):
     return _asarr(a).searchsorted(v, side, sorter)
 

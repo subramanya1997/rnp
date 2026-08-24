@@ -615,25 +615,116 @@ impl PyFlags {
     }
 }
 
+/// The text of a `kind=` argument. numpy accepts `str` and `bytes` (the C
+/// converter runs the bytes through the same path); anything else is a
+/// `TypeError` naming the operation. Probed against numpy 2.5.2.
+fn kind_text(kind: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
+    if let Ok(s) = kind.extract::<String>() {
+        return Ok(s);
+    }
+    if let Ok(b) = kind.extract::<Vec<u8>>() {
+        if kind.is_instance_of::<pyo3::types::PyBytes>() {
+            return Ok(String::from_utf8_lossy(&b).into_owned());
+        }
+    }
+    let ty = kind.get_type().name()?;
+    Err(PyTypeError::new_err(format!(
+        "{what} kind must be str, not {ty}"
+    )))
+}
+
+/// `repr()` of the offending `kind=`, for numpy's verbatim error text.
+fn kind_repr(kind: &Bound<'_, PyAny>) -> String {
+    kind.repr()
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "?".into())
+}
+
 /// numpy accepts `kind=` and `stable=` but not both; only the stability
 /// matters here.
+///
+/// numpy matches `kind=` on its **first character, case-insensitively**:
+/// `q`uicksort, `h`eapsort, `m`ergesort, `s`table — so `'quick'`, `'Q'` and
+/// `'sfoobar'` are all accepted, while `'timsort'`/`'radixsort'`/`'introsort'`
+/// are rejected. Probed from numpy 2.5.2, error text included.
 fn sort_stable(kind: Option<&Bound<'_, PyAny>>, stable: Option<bool>) -> PyResult<bool> {
     let k = match kind {
-        Some(o) if !o.is_none() => Some(o.extract::<String>()?),
+        Some(o) if !o.is_none() => Some((kind_text(o, "sort")?, o)),
         _ => None,
     };
     if k.is_some() && stable.is_some() {
         return Err(PyValueError::new_err(
-            "`kind` and `stable` parameters can't be provided at the same time. Use only one of them.",
+            "`kind` and keyword parameters can't be provided at the same time. Use only one of them.",
         ));
     }
-    match k.as_deref() {
-        None => Ok(stable.unwrap_or(false)),
-        Some("quicksort") | Some("introsort") => Ok(false),
-        Some("stable") | Some("mergesort") | Some("timsort") | Some("radixsort") => Ok(true),
-        Some("heapsort") => Ok(false),
-        Some(other) => Err(PyValueError::new_err(format!("{other} is an unrecognized kind of sort"))),
+    let Some((text, obj)) = k else {
+        return Ok(stable.unwrap_or(false));
+    };
+    match text.chars().next().map(|c| c.to_ascii_lowercase()) {
+        // quicksort and heapsort are not stable; mergesort is numpy's alias
+        // for the stable kind.
+        Some('q') | Some('h') => Ok(false),
+        Some('m') | Some('s') => Ok(true),
+        _ => Err(PyValueError::new_err(format!(
+            "sort kind must be one of 'quick', 'heap', or 'stable' (got {})",
+            kind_repr(obj)
+        ))),
     }
+}
+
+/// `partition`/`argpartition` accept only the exact string `'introselect'`
+/// — no prefix matching, case-sensitive, and `None` is a `TypeError` (unlike
+/// `sort`, whose `kind=None` means "default"). Probed from numpy 2.5.2.
+fn check_select_kind(kind: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    let Some(obj) = kind else { return Ok(()) };
+    let text = kind_text(obj, "select")?;
+    if text == "introselect" {
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "select kind must be 'introselect' (got {})",
+        kind_repr(obj)
+    )))
+}
+
+/// The length of `arr` along `axis`. A 0-d array behaves as length 1, which
+/// is the shape `norm_sort_axis` already pretends it has.
+fn axis_len(arr: &NdArray, axis: usize) -> usize {
+    arr.shape.get(axis).copied().unwrap_or(1) as usize
+}
+
+/// Normalise the `kth=` argument of `partition`/`argpartition` into in-range
+/// ranks. `kth` is a single index or a sequence of them; each may be negative
+/// and is taken modulo the axis length.
+///
+/// Two probed details numpy gets subtly right (verified against 2.5.2):
+///   * a non-integer index is `TypeError: Partition index must be integer`,
+///     raised before any bounds check — and it is the `__index__` protocol,
+///     so a `np.int64` or a `bool` is accepted while a float is not;
+///   * an out-of-bounds *negative* index is reported by its **normalised**
+///     value, not the one the caller passed: on a length-5 axis `kth=-6`
+///     raises `kth(=-1) out of bounds (5)`, while `kth=5` raises `kth(=5)`.
+fn norm_kths(kth: &Bound<'_, PyAny>, n: usize) -> PyResult<Vec<usize>> {
+    let items: Vec<Bound<'_, PyAny>> = if let Ok(seq) = kth.try_iter() {
+        seq.collect::<PyResult<Vec<_>>>()?
+    } else {
+        vec![kth.clone()]
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let raw = it
+            .call_method0("__index__")
+            .and_then(|i| i.extract::<isize>())
+            .map_err(|_| PyTypeError::new_err("Partition index must be integer"))?;
+        let k = if raw < 0 { raw + n as isize } else { raw };
+        if k < 0 || k >= n as isize {
+            return Err(PyValueError::new_err(format!(
+                "kth(={k}) out of bounds ({n})"
+            )));
+        }
+        out.push(k as usize);
+    }
+    Ok(out)
 }
 
 /// Normalise a (possibly negative) sort axis.
@@ -884,6 +975,56 @@ impl PyNdArray {
             }
         };
         let out = rnp_core::sort::argsort(&arr, ax, stable).map_err(crate::err)?;
+        PyNdArray::into_py_any(out, py)
+    }
+
+    /// `a.partition(kth, axis=-1, kind='introselect', order=None)`, in place.
+    #[pyo3(signature = (kth, axis = -1, kind = None, order = None))]
+    fn partition(
+        &mut self,
+        kth: &Bound<'_, PyAny>,
+        axis: isize,
+        kind: Option<&Bound<'_, PyAny>>,
+        order: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        if order.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "partition(order=) is not implemented yet",
+            ));
+        }
+        check_select_kind(kind)?;
+        let ax = norm_sort_axis(&self.arr, axis)?;
+        let n = axis_len(&self.arr, ax);
+        let kths = norm_kths(kth, n)?;
+        rnp_core::sort::partition_inplace(&mut self.arr, &kths, ax).map_err(crate::err)
+    }
+
+    /// `a.argpartition(kth, axis=-1, kind='introselect', order=None)`.
+    #[pyo3(signature = (kth, axis = Some(-1), kind = None, order = None))]
+    fn argpartition(
+        &self,
+        py: Python<'_>,
+        kth: &Bound<'_, PyAny>,
+        axis: Option<isize>,
+        kind: Option<&Bound<'_, PyAny>>,
+        order: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyNdArray>> {
+        if order.is_some_and(|o| !o.is_none()) {
+            return Err(PyNotImplementedError::new_err(
+                "argpartition(order=) is not implemented yet",
+            ));
+        }
+        check_select_kind(kind)?;
+        let (arr, ax) = match axis {
+            None => (self.arr.reshape(&[-1]).map_err(crate::err)?, 0),
+            Some(a) => {
+                let ax = norm_sort_axis(&self.arr, a)?;
+                (self.arr.clone(), ax)
+            }
+        };
+        let n = axis_len(&arr, ax);
+        let kths = norm_kths(kth, n)?;
+        let out = rnp_core::sort::argpartition(&arr, &kths, ax).map_err(crate::err)?;
         PyNdArray::into_py_any(out, py)
     }
 

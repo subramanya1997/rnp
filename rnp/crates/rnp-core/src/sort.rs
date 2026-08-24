@@ -145,6 +145,208 @@ pub fn argsort(arr: &NdArray, axis: usize, _stable: bool) -> Result<NdArray> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// introselect — `partition` / `argpartition`
+// ---------------------------------------------------------------------------
+
+/// Below this length quickselect stops paying for itself and a straight sort
+/// of the window is both faster and simpler.
+const SELECT_INSERTION_CUTOFF: usize = 24;
+
+/// Three-way (Dutch-flag) partition of `order[lo..hi]` around the element
+/// currently at `pivot_pos`. Returns `(lt, gt)` with `[lo, lt)` strictly less
+/// than the pivot, `[lt, gt)` equal to it, and `[gt, hi)` strictly greater.
+///
+/// Three-way matters here: numpy's `partition` is routinely called on arrays
+/// with heavy duplication, where a two-way split degrades to quadratic.
+fn partition3(order: &mut [usize], keys: &[Key], lo: usize, hi: usize, pivot_pos: usize) -> (usize, usize) {
+    order.swap(lo, pivot_pos);
+    // The pivot is identified by its *key index*, which is stable under the
+    // swaps below, unlike its position.
+    let pivot = order[lo];
+    let (mut lt, mut i, mut gt) = (lo, lo + 1, hi);
+    while i < gt {
+        match cmp_key(&keys[order[i]], &keys[pivot]) {
+            Ordering::Less => {
+                order.swap(lt, i);
+                lt += 1;
+                i += 1;
+            }
+            Ordering::Greater => {
+                gt -= 1;
+                order.swap(i, gt);
+            }
+            Ordering::Equal => i += 1,
+        }
+    }
+    (lt, gt)
+}
+
+fn median_of_3(order: &[usize], keys: &[Key], lo: usize, hi: usize) -> usize {
+    let mid = lo + (hi - lo) / 2;
+    let last = hi - 1;
+    let (a, b, c) = (&keys[order[lo]], &keys[order[mid]], &keys[order[last]]);
+    if cmp_key(a, b) == Ordering::Less {
+        if cmp_key(b, c) == Ordering::Less {
+            mid
+        } else if cmp_key(a, c) == Ordering::Less {
+            last
+        } else {
+            lo
+        }
+    } else if cmp_key(a, c) == Ordering::Less {
+        lo
+    } else if cmp_key(b, c) == Ordering::Less {
+        last
+    } else {
+        mid
+    }
+}
+
+/// Blum-Floyd-Pratt-Rivest-Tarjan median of medians: the guaranteed-linear
+/// pivot introselect falls back on when the cheap median-of-3 has produced
+/// too many lopsided splits. Leaves `order[lo..hi]` permuted and returns the
+/// position of a pivot with a constant-fraction rank guarantee.
+fn median_of_medians(order: &mut [usize], keys: &[Key], lo: usize, hi: usize) -> usize {
+    let n = hi - lo;
+    let ngroups = n.div_ceil(5);
+    for g in 0..ngroups {
+        let s = lo + g * 5;
+        let e = (s + 5).min(hi);
+        order[s..e].sort_by(|&i, &j| cmp_key(&keys[i], &keys[j]));
+        // Collect each group's median into `order[lo..lo + ngroups]`. Later
+        // groups start at `lo + 5g >= lo + g`, so this only ever overwrites
+        // slots whose median has already been harvested.
+        let med = s + (e - s) / 2;
+        order.swap(lo + g, med);
+    }
+    let mid = lo + ngroups / 2;
+    select_nth(order, keys, lo, lo + ngroups, mid);
+    mid
+}
+
+/// Introselect: place the element of rank `k` (relative to the whole slice)
+/// at `order[k]`, with everything in `[lo, k)` `<=` it and everything in
+/// `(k, hi)` `>=` it. Quickselect with a median-of-3 pivot, falling back to
+/// median-of-medians once the recursion depth exceeds `2*log2(n)` — which is
+/// exactly what numpy's `introselect` does.
+fn select_nth(order: &mut [usize], keys: &[Key], mut lo: usize, mut hi: usize, k: usize) {
+    debug_assert!(k >= lo && k < hi);
+    let mut budget = 2 * (usize::BITS - (hi - lo).max(1).leading_zeros()) as usize;
+    loop {
+        if hi <= lo + 1 {
+            return;
+        }
+        if hi - lo <= SELECT_INSERTION_CUTOFF {
+            order[lo..hi].sort_by(|&i, &j| cmp_key(&keys[i], &keys[j]));
+            return;
+        }
+        let pivot_pos = if budget == 0 {
+            median_of_medians(order, keys, lo, hi)
+        } else {
+            budget -= 1;
+            median_of_3(order, keys, lo, hi)
+        };
+        let (lt, gt) = partition3(order, keys, lo, hi, pivot_pos);
+        if k < lt {
+            hi = lt;
+        } else if k < gt {
+            // `k` landed in the run of pivot-equal elements: done.
+            return;
+        } else {
+            lo = gt;
+        }
+    }
+}
+
+/// Run introselect for every requested rank on one lane's index permutation.
+///
+/// The ranks are handled in increasing order, each one selected only within
+/// the suffix left of the previous one: after rank `k` is placed, everything
+/// at `[.., k]` is `<=` everything after it, so the next rank is still the
+/// correct *global* rank when sought in `[k+1, n)`. That is how numpy
+/// exploits the already-partitioned regions between multiple `kth`.
+fn select_all(order: &mut [usize], keys: &[Key], kths: &[usize]) {
+    let n = order.len();
+    let mut lo = 0usize;
+    for &k in kths {
+        if k >= n {
+            continue;
+        }
+        select_nth(order, keys, lo, n, k);
+        lo = k + 1;
+    }
+}
+
+/// The `kth` list, sorted and deduplicated — the form `select_all` wants.
+fn normalize_kths(kth: &[usize]) -> Vec<usize> {
+    let mut ks = kth.to_vec();
+    ks.sort_unstable();
+    ks.dedup();
+    ks
+}
+
+/// `a.partition(kth, axis)`, in place.
+pub fn partition_inplace(arr: &mut NdArray, kth: &[usize], axis: usize) -> Result<()> {
+    check_axis(arr, axis)?;
+    if arr.dtype().is_object() {
+        return Err(Error::NotImplemented("partition on object arrays".into()));
+    }
+    if !arr.flags.writeable {
+        return Err(Error::ValueError(
+            "assignment destination is read-only".into(),
+        ));
+    }
+    let ks = normalize_kths(kth);
+    let isz = arr.itemsize();
+    let mut scratch: Vec<u8> = Vec::new();
+    for lane in lanes(arr, axis) {
+        let n = lane.len();
+        if n <= 1 || ks.is_empty() {
+            continue;
+        }
+        let keys: Vec<Key> = lane.iter().map(|&o| key_at(arr, o)).collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        select_all(&mut order, &keys, &ks);
+        scratch.clear();
+        scratch.reserve(n * isz);
+        for &o in &lane {
+            scratch.extend_from_slice(arr.raw_bytes_at(o));
+        }
+        for (k, &src) in order.iter().enumerate() {
+            arr.write_raw_at(lane[k], &scratch[src * isz..(src + 1) * isz]);
+        }
+    }
+    Ok(())
+}
+
+/// `np.argpartition(a, kth, axis)` — the index permutation that
+/// `partition` would apply.
+pub fn argpartition(arr: &NdArray, kth: &[usize], axis: usize) -> Result<NdArray> {
+    check_axis(arr, axis)?;
+    if arr.dtype().is_object() {
+        return Err(Error::NotImplemented("argpartition on object arrays".into()));
+    }
+    let ks = normalize_kths(kth);
+    let mut out = NdArray::zeros(arr.shape.clone(), crate::dtype::DType::I64)?;
+    let n = arr.shape[axis].max(0);
+    let mut shape = arr.shape.clone();
+    let mut strides = out.strides.clone();
+    shape.remove(axis);
+    let out_step = strides[axis];
+    strides.remove(axis);
+    let out_bases: Vec<isize> = crate::iter::offsets(&shape, &strides, out.byte_offset).collect();
+    for (lane, &base) in lanes(arr, axis).iter().zip(out_bases.iter()) {
+        let keys: Vec<Key> = lane.iter().map(|&o| key_at(arr, o)).collect();
+        let mut order: Vec<usize> = (0..lane.len()).collect();
+        select_all(&mut order, &keys, &ks);
+        for k in 0..n as usize {
+            out.write_at(base + k as isize * out_step, Scalar::Int(order[k] as i64));
+        }
+    }
+    Ok(out)
+}
+
 /// `np.searchsorted(a, v, side)` on a sorted 1-D `a`.
 pub fn searchsorted(a: &NdArray, v: &NdArray, right: bool) -> Result<NdArray> {
     if a.ndim() != 1 {
@@ -218,6 +420,153 @@ mod tests {
         let o = argsort(&a, 0, false).unwrap();
         let got: Vec<i64> = (0..4).map(|i| o.get_flat(i).as_f64() as i64).collect();
         assert_eq!(got, vec![1, 3, 0, 2]);
+    }
+
+    /// A tiny xorshift so the randomised checks below are deterministic and
+    /// dependency-free.
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn i64_array(v: &[i64]) -> NdArray {
+        let s: Vec<Scalar> = v.iter().map(|&x| Scalar::Int(x)).collect();
+        NdArray::from_scalars(&s, DType::I64).unwrap()
+    }
+
+    fn f64_array(v: &[f64]) -> NdArray {
+        let s: Vec<Scalar> = v.iter().map(|&x| Scalar::Float(x)).collect();
+        NdArray::from_scalars(&s, DType::F64).unwrap()
+    }
+
+    fn to_i64(a: &NdArray) -> Vec<i64> {
+        (0..a.size()).map(|i| a.get_flat(i).as_f64() as i64).collect()
+    }
+
+    /// The only postcondition `partition` promises: `out[k]` is what a sorted
+    /// array would hold at `k`, everything before is `<=` and everything
+    /// after is `>=`. Order *within* each side is unspecified.
+    fn assert_partitioned(orig: &[i64], out: &[i64], kths: &[usize]) {
+        let mut sorted = orig.to_vec();
+        sorted.sort_unstable();
+        let mut check = out.to_vec();
+        check.sort_unstable();
+        assert_eq!(check, sorted, "partition must be a permutation of the input");
+        for &k in kths {
+            assert_eq!(out[k], sorted[k], "rank {k} misplaced in {out:?}");
+            assert!(out[..k].iter().all(|&x| x <= out[k]), "left of {k} in {out:?}");
+            assert!(out[k + 1..].iter().all(|&x| x >= out[k]), "right of {k} in {out:?}");
+        }
+    }
+
+    #[test]
+    fn partition_invariant_random() {
+        let mut state = 0x2545F491_4F6CDD1Du64;
+        for n in [2usize, 3, 5, 17, 24, 25, 64, 257, 1000] {
+            for trial in 0..12 {
+                // Trial 0 uses a tiny value range on purpose: heavy
+                // duplication is the case a two-way split gets wrong.
+                let modulus = if trial % 3 == 0 { 3 } else { 1000 };
+                let vals: Vec<i64> =
+                    (0..n).map(|_| (rng(&mut state) % modulus) as i64).collect();
+                for &k in &[0usize, n / 2, n - 1] {
+                    let mut a = i64_array(&vals);
+                    partition_inplace(&mut a, &[k], 0).unwrap();
+                    assert_partitioned(&vals, &to_i64(&a), &[k]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_multiple_kth() {
+        let mut state = 0x9E3779B9_7F4A7C15u64;
+        let n = 300usize;
+        let vals: Vec<i64> = (0..n).map(|_| (rng(&mut state) % 500) as i64).collect();
+        let kths = [0usize, 1, 7, 150, 151, 298, 299];
+        let mut a = i64_array(&vals);
+        partition_inplace(&mut a, &kths, 0).unwrap();
+        assert_partitioned(&vals, &to_i64(&a), &kths);
+
+        // Unsorted and duplicated `kth` must behave identically.
+        let mut b = i64_array(&vals);
+        partition_inplace(&mut b, &[299, 7, 150, 7, 0, 151, 1, 298], 0).unwrap();
+        assert_partitioned(&vals, &to_i64(&b), &kths);
+    }
+
+    #[test]
+    fn argpartition_invariant() {
+        let mut state = 0xDEADBEEF_CAFEF00Du64;
+        let n = 200usize;
+        let vals: Vec<i64> = (0..n).map(|_| (rng(&mut state) % 50) as i64).collect();
+        let a = i64_array(&vals);
+        let kths = [0usize, 99, 199];
+        let idx = argpartition(&a, &kths, 0).unwrap();
+        let perm = to_i64(&idx);
+        let mut seen = perm.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..n as i64).collect::<Vec<_>>(), "not a permutation");
+        let out: Vec<i64> = perm.iter().map(|&i| vals[i as usize]).collect();
+        assert_partitioned(&vals, &out, &kths);
+    }
+
+    #[test]
+    fn partition_nan_goes_last() {
+        // NaN is greater than everything under numpy's total order, so
+        // selecting the last rank must surface a NaN.
+        let vals = [3.0, f64::NAN, 1.0, f64::NAN, 2.0];
+        let mut a = f64_array(&vals);
+        partition_inplace(&mut a, &[2], 0).unwrap();
+        let got: Vec<f64> = (0..5).map(|i| a.get_flat(i).as_f64()).collect();
+        assert_eq!(&got[..3], &[1.0, 2.0, 3.0]);
+        assert!(got[3].is_nan() && got[4].is_nan());
+
+        let mut b = f64_array(&vals);
+        partition_inplace(&mut b, &[4], 0).unwrap();
+        assert!(b.get_flat(4).as_f64().is_nan());
+    }
+
+    #[test]
+    fn partition_dtypes_and_degenerate() {
+        // Empty and single-element lanes are no-ops, not errors.
+        for n in [0usize, 1] {
+            let vals: Vec<i64> = (0..n as i64).collect();
+            let mut a = i64_array(&vals);
+            partition_inplace(&mut a, &[0], 0).unwrap();
+            assert_eq!(to_i64(&a), vals);
+        }
+        // Unsigned, bool and complex all go through the same comparator.
+        let mut u = NdArray::from_scalars(
+            &[Scalar::Uint(9), Scalar::Uint(2), Scalar::Uint(5)],
+            DType::U64,
+        )
+        .unwrap();
+        partition_inplace(&mut u, &[1], 0).unwrap();
+        assert_eq!(u.get_flat(1).as_f64(), 5.0);
+
+        let mut b = NdArray::from_scalars(
+            &[Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+            DType::Bool,
+        )
+        .unwrap();
+        partition_inplace(&mut b, &[0], 0).unwrap();
+        assert_eq!(b.get_flat(0).as_f64(), 0.0);
+    }
+
+    #[test]
+    fn partition_matches_sort_at_every_rank() {
+        // Selecting every rank in turn must reproduce a full sort.
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let n = 120usize;
+        let vals: Vec<i64> = (0..n).map(|_| (rng(&mut state) % 40) as i64).collect();
+        let all: Vec<usize> = (0..n).collect();
+        let mut a = i64_array(&vals);
+        partition_inplace(&mut a, &all, 0).unwrap();
+        let mut sorted = vals.clone();
+        sorted.sort_unstable();
+        assert_eq!(to_i64(&a), sorted);
     }
 
     #[test]
