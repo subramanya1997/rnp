@@ -80,31 +80,36 @@ pub(crate) fn err(e: rnp_core::Error) -> PyErr {
         } => binary_resolution_err(ufunc, dtypes, message),
         rnp_core::Error::UFuncInputCasting {
             ufunc,
-            index,
-            from,
-            to,
             casting,
+            from_,
+            to,
+            i,
             message,
-        } => input_casting_err(ufunc, index, from, to, casting, message),
+        } => factory_err(
+            "ufunc_input_casting",
+            (ufunc, casting, from_, to, i),
+            message,
+        ),
     }
 }
 
-/// numpy's `_UFuncInputCastingError`, built through the shim's factory so the
-/// exception really is a `UFuncTypeError` subclass and not a bare `TypeError`.
-fn input_casting_err(
-    ufunc: String,
-    index: usize,
-    from: String,
-    to: String,
-    casting: String,
-    fallback: String,
-) -> PyErr {
+/// Build an exception through one of the shim's registered factories, falling
+/// back to a plain `TypeError` carrying the engine's own message when the shim
+/// is absent (i.e. `_rnp` used bare).
+fn factory_err<A>(name: &str, args: A, fallback: String) -> PyErr
+where
+    A: for<'py> pyo3::IntoPyObject<'py, Target = PyTuple, Output = Bound<'py, PyTuple>>,
+{
     Python::attach(|py| {
         let Some(d) = ERROR_FACTORIES.get() else {
             return PyTypeError::new_err(fallback);
         };
-        match d.bind(py).get_item("ufunc_input_casting") {
-            Ok(Some(f)) => match f.call1((ufunc, casting, from, to, index)) {
+        let tuple = match args.into_pyobject(py) {
+            Ok(t) => t,
+            Err(e) => return e.into(),
+        };
+        match d.bind(py).get_item(name) {
+            Ok(Some(f)) => match f.call1(tuple) {
                 Ok(exc) => PyErr::from_value(exc),
                 Err(e) => e,
             },
@@ -916,7 +921,7 @@ fn _datetime_objects(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>
     let dt = arr.dtype();
     let meta = dtm::meta_of(dt)
         .ok_or_else(|| PyTypeError::new_err("not a datetime array"))?;
-    let dtmod = py.import("datetime")?;
+    let _ = meta;
     let n = arr.to_native();
     let out = PyList::empty(py);
     for off in rnp_core::iter::offsets(&n.shape, &n.strides, n.byte_offset) {
@@ -924,65 +929,7 @@ fn _datetime_objects(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>
             rnp_core::Scalar::Int(i) => i,
             s => s.as_f64() as i64,
         };
-        if v == dtm::NAT {
-            out.append(py.None())?;
-            continue;
-        }
-        if dt.is_timedelta() {
-            match dtm::timedelta_parts(meta, v) {
-                // `datetime.timedelta` has a much narrower range than i64
-                // weeks/days/hours do, and it raises OverflowError rather
-                // than saturating. numpy hands back the raw integer for any
-                // value the type cannot hold, so a construction failure is
-                // an expected outcome here, not an error to propagate.
-                Some((days, secs, us)) => {
-                    match dtmod.getattr("timedelta")?.call1((days, secs, us)) {
-                        Ok(td) => out.append(td)?,
-                        Err(_) => out.append(v)?,
-                    }
-                }
-                // Y/M and the sub-microsecond units have no `timedelta`
-                // representation at all, so those are always the raw integer.
-                None => out.append(v)?,
-            }
-            continue;
-        }
-        // A datetime64 converts for every unit from years down to
-        // microseconds: `np.datetime64(0, 'Y').item()` is `date(1970, 1, 1)`,
-        // verified against 2.5.2 for Y/M/W as well as D. (The coarse units
-        // are only unrepresentable for *timedelta*, which is an offset and is
-        // handled above -- conflating the two was costing 3 units x 3 kinds
-        // of check here.) Anything finer than microseconds, and the generic
-        // unit, still come back as the raw integer.
-        if meta.base > dtm::UNIT_US {
-            out.append(v)?;
-            continue;
-        }
-        // Same rule as the timedelta branch: a value `datetime`/`date` cannot
-        // represent comes back as the raw integer rather than raising. That
-        // covers both a calendar conversion that overflows i64 arithmetic and
-        // a year outside 1..=9999.
-        let Ok(dts) = dtm::dt64_to_dts(meta, v) else {
-            out.append(v)?;
-            continue;
-        };
-        if dts.year < 1 || dts.year > 9999 {
-            out.append(v)?;
-            continue;
-        }
-        let built = if meta.base <= dtm::UNIT_D {
-            dtmod
-                .getattr("date")?
-                .call1((dts.year, dts.month, dts.day))
-        } else {
-            dtmod.getattr("datetime")?.call1((
-                dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.us,
-            ))
-        };
-        match built {
-            Ok(obj) => out.append(obj)?,
-            Err(_) => out.append(v)?,
-        }
+        out.append(crate::convert::datetime_object(py, dt, v)?)?;
     }
     Ok(out.into_any().unbind())
 }

@@ -410,10 +410,20 @@ fn units_overflow(m1: DtMeta, m2: DtMeta) -> Error {
 pub fn promote_meta(a: DType, b: DType) -> Result<DType> {
     let ma = meta_of(a).expect("datetime dtype");
     let mb = meta_of(b).expect("datetime dtype");
-    let is_dt = matches!(a, DType::DateTime(_)) || matches!(b, DType::DateTime(_));
-    let strict1 = matches!(a, DType::TimeDelta(_));
-    let strict2 = matches!(b, DType::TimeDelta(_));
-    let m = gcd_meta(ma, mb, strict1, strict2)?;
+    let a_is_td = matches!(a, DType::TimeDelta(_));
+    let b_is_td = matches!(b, DType::TimeDelta(_));
+    let is_dt = !a_is_td || !b_is_td;
+    // numpy 2.x promotes through the new DType machinery: `PyArray_PromoteTypes`
+    // first asks `datetime_common_dtype` for the common *DType class* (M8 wins
+    // over m8), then casts each descr into that class before handing the pair
+    // to `common_instance` (= `datetime_type_promotion`). So a mixed M8/m8 pair
+    // reaches the GCD as two *datetime* descrs, and the nonlinear-unit
+    // strictness that `datetime_type_promotion` derives from `type_num ==
+    // NPY_TIMEDELTA` is off for *both* operands. Only an m8/m8 pair is strict.
+    //   np.promote_types('M8[D]', 'm8[Y]') -> dtype('<M8[D]')
+    //   np.promote_types('m8[D]', 'm8[Y]') -> TypeError
+    let strict = a_is_td && b_is_td;
+    let m = gcd_meta(ma, mb, strict, strict)?;
     Ok(if is_dt { datetime(m) } else { timedelta(m) })
 }
 
@@ -1308,11 +1318,9 @@ pub fn make_iso8601(
             )));
         }
     }
-    // numpy formats the year with `%04lld`, which counts the sign toward the
-    // field width -- so year -1 prints as `-001`, not `-0001` (verified with a
-    // C probe: `printf("%04lld", -1LL)` gives `-001`). Rust's `{:04}` has the
-    // same rule, so this needs no special case for negative years; adding one
-    // is what produced `-0001-01-01`.
+    // numpy formats the year with `"%04" NPY_INT64_FMT`, whose field width
+    // counts the sign: year -1 prints as `-001`, not `-0001`. Rust's `{:04}`
+    // has exactly the same rule, so no special case is needed (nor allowed).
     let mut s = format!("{:04}", dts.year);
     if base == UNIT_Y {
         return Ok(s);
@@ -1560,9 +1568,202 @@ pub fn timedelta_parts(meta: DtMeta, td: i64) -> Option<(i64, i32, i32)> {
     Some((days, sec, us))
 }
 
+// ---------------------------------------------------------------------------
+// Conversion to Python's `datetime` objects
+// ---------------------------------------------------------------------------
+
+/// What numpy's `convert_datetime_to_pyobject` / `convert_timedelta_to_pyobject`
+/// hand back for a single datetime-like value. The Python layer turns this into
+/// the actual object; the rules for *which* object live here, next to the
+/// calendar code they depend on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PyDtObj {
+    /// NaT, or any value with generic units: `None`.
+    Nothing,
+    /// The raw stored integer, for the units and magnitudes Python's
+    /// `datetime` module cannot represent.
+    Int(i64),
+    /// `datetime.date(year, month, day)`.
+    Date { year: i64, month: i32, day: i32 },
+    /// `datetime.datetime(year, month, day, hour, min, sec, us)`.
+    DateTime {
+        year: i64,
+        month: i32,
+        day: i32,
+        hour: i32,
+        min: i32,
+        sec: i32,
+        us: i32,
+    },
+    /// `datetime.timedelta(days, seconds, microseconds)`.
+    Delta { days: i64, secs: i32, us: i32 },
+}
+
+/// numpy's `convert_datetime_to_pyobject` (`datetime.c`).
+pub fn datetime_to_pyobj(meta: DtMeta, dt: i64) -> PyDtObj {
+    if dt == NAT || meta.is_generic() {
+        return PyDtObj::Nothing;
+    }
+    // Anything finer than microseconds has no `datetime` representation.
+    if meta.base > UNIT_US {
+        return PyDtObj::Int(dt);
+    }
+    let Ok(dts) = dt64_to_dts(meta, dt) else {
+        return PyDtObj::Int(dt);
+    };
+    // Outside `datetime`'s year range, or on a leap second, numpy gives up and
+    // returns the raw integer.
+    if dts.year < 1 || dts.year > 9999 || dts.sec == 60 {
+        return PyDtObj::Int(dt);
+    }
+    if meta.base > UNIT_D {
+        PyDtObj::DateTime {
+            year: dts.year,
+            month: dts.month,
+            day: dts.day,
+            hour: dts.hour,
+            min: dts.min,
+            sec: dts.sec,
+            us: dts.us,
+        }
+    } else {
+        PyDtObj::Date {
+            year: dts.year,
+            month: dts.month,
+            day: dts.day,
+        }
+    }
+}
+
+/// numpy's `convert_timedelta_to_pyobject` (`datetime.c`).
+pub fn timedelta_to_pyobj(meta: DtMeta, td: i64) -> PyDtObj {
+    if td == NAT {
+        return PyDtObj::Nothing;
+    }
+    // Sub-microsecond precision, the nonlinear units and generic units all
+    // fall back to the raw integer.
+    if meta.base > UNIT_US
+        || meta.base == UNIT_Y
+        || meta.base == UNIT_M
+        || meta.is_generic()
+    {
+        return PyDtObj::Int(td);
+    }
+    let Some((days, secs, us)) = timedelta_parts(meta, td) else {
+        return PyDtObj::Int(td);
+    };
+    // `datetime.timedelta` tops out at +-999999999 days.
+    if days < -999_999_999 || days > 999_999_999 {
+        return PyDtObj::Int(td);
+    }
+    PyDtObj::Delta { days, secs, us }
+}
+
+/// [`datetime_to_pyobj`] / [`timedelta_to_pyobj`], dispatched on the dtype.
+/// `None` when `dt` is not a datetime-like dtype at all.
+pub fn value_to_pyobj(dt: DType, v: i64) -> Option<PyDtObj> {
+    let meta = meta_of(dt)?;
+    Some(match dt {
+        DType::TimeDelta(_) => timedelta_to_pyobj(meta, v),
+        _ => datetime_to_pyobj(meta, v),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negative_years_pad_like_numpy() {
+        // numpy's `%04lld` counts the sign toward the field width.
+        for (year, want) in [
+            (-1i64, "-001"),
+            (-12, "-012"),
+            (-123, "-123"),
+            (-1234, "-1234"),
+            (-12345, "-12345"),
+            (0, "0000"),
+            (1, "0001"),
+            (123, "0123"),
+            (12345, "12345"),
+        ] {
+            let dts = Dts {
+                year,
+                month: 1,
+                day: 1,
+                ..Default::default()
+            };
+            assert_eq!(
+                make_iso8601(&dts, Some(UNIT_Y), false, crate::casting::Casting::Unsafe).unwrap(),
+                want,
+                "year {year}"
+            );
+        }
+    }
+
+    #[test]
+    fn pyobj_conversion_matches_numpy() {
+        let m = DtMeta::unit;
+        // M8: date for D and coarser, datetime for h..us, int beyond.
+        assert_eq!(
+            datetime_to_pyobj(m(UNIT_Y), -1),
+            PyDtObj::Date {
+                year: 1969,
+                month: 1,
+                day: 1
+            }
+        );
+        assert!(matches!(
+            datetime_to_pyobj(m(UNIT_H), -7),
+            PyDtObj::DateTime { year: 1969, .. }
+        ));
+        assert_eq!(datetime_to_pyobj(m(UNIT_NS), 1000), PyDtObj::Int(1000));
+        // Out of `datetime`'s year range -> raw int.
+        assert_eq!(
+            datetime_to_pyobj(m(UNIT_Y), 2147483648),
+            PyDtObj::Int(2147483648)
+        );
+        assert_eq!(datetime_to_pyobj(m(UNIT_D), NAT), PyDtObj::Nothing);
+        // m8: Y/M and sub-us are ints, W..us are timedeltas.
+        assert_eq!(timedelta_to_pyobj(m(UNIT_Y), -1), PyDtObj::Int(-1));
+        assert_eq!(timedelta_to_pyobj(m(UNIT_M), 7), PyDtObj::Int(7));
+        assert_eq!(
+            timedelta_to_pyobj(m(UNIT_W), -1),
+            PyDtObj::Delta {
+                days: -7,
+                secs: 0,
+                us: 0
+            }
+        );
+        // Beyond timedelta's +-999999999 day range -> raw int.
+        assert_eq!(
+            timedelta_to_pyobj(m(UNIT_MS), i64::MAX),
+            PyDtObj::Int(i64::MAX)
+        );
+        assert_eq!(timedelta_to_pyobj(m(UNIT_NS), 1), PyDtObj::Int(1));
+        assert_eq!(timedelta_to_pyobj(m(UNIT_S), NAT), PyDtObj::Nothing);
+    }
+
+    #[test]
+    fn mixed_datetime_timedelta_promotion_is_nonstrict() {
+        // np.promote_types('M8[D]', 'm8[Y]') -> M8[D], but the same pair of
+        // timedeltas is a TypeError.
+        let m8y = timedelta(DtMeta::unit(UNIT_Y));
+        let m8d = timedelta(DtMeta::unit(UNIT_D));
+        let m8m = timedelta(DtMeta::unit(UNIT_M));
+        let dt_d = datetime(DtMeta::unit(UNIT_D));
+        let dt_ns = datetime(DtMeta::unit(UNIT_NS));
+        assert_eq!(promote_meta(dt_d, m8y).unwrap(), dt_d);
+        assert_eq!(promote_meta(m8y, dt_d).unwrap(), dt_d);
+        assert_eq!(promote_meta(m8m, dt_ns).unwrap(), dt_ns);
+        assert!(promote_meta(m8d, m8y).is_err());
+        // The overflow cases stay overflows.
+        let dt_as = datetime(DtMeta::unit(UNIT_AS));
+        assert!(matches!(
+            promote_meta(dt_as, m8m),
+            Err(Error::OverflowError(_))
+        ));
+    }
 
     #[test]
     fn civil_round_trips() {

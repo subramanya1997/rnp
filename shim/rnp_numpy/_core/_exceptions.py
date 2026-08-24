@@ -202,18 +202,19 @@ def _binary_resolution_error(ufunc_name, dtype_strs):
     return _UFuncBinaryResolutionError(ufunc, tuple(_dtype(s) for s in dtype_strs))
 
 
-def _input_casting_error(ufunc_name, casting, from_str, to_str, i):
-    """Build `_UFuncInputCastingError` from the engine's plain payload.
+def _input_casting_error(ufunc_name, casting, from_, to, i):
+    """Build `_UFuncInputCastingError` from the engine's dtype strings.
 
-    Reached when a datetime ufunc's units are incommensurate: numpy resolves
-    the loop to the datetime operand's unit and then fails casting the other
-    input into it, so the user sees a casting error rather than a metadata one.
+    Raised when the type resolver picked a loop but one input cannot reach that
+    loop's dtype under the ufunc's casting rule, e.g.
+    ``np.array([], 'M8[D]') + np.array([], 'm8[Y]')``, which resolves to
+    ``M8[D]`` and then cannot cast the ``m8[Y]`` input to ``m8[D]``.
     """
-    from .._ufunc import ALL as _UFUNCS
     from .. import dtype as _dtype
+    from .._ufunc import ALL as _UFUNCS
     ufunc = _UFUNCS[ufunc_name]
     return _UFuncInputCastingError(
-        ufunc, casting, _dtype(from_str), _dtype(to_str), i)
+        ufunc, casting, _dtype(from_), _dtype(to), i)
 
 
 def _install_error_factories():

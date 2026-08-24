@@ -33,22 +33,19 @@ pub enum Error {
         dtypes: Vec<String>,
         message: String,
     },
-    /// numpy's `_UFuncInputCastingError` (also a `UFuncTypeError`).
-    ///
-    /// The datetime resolvers reach this rather than a metadata error when the
-    /// two units are *incommensurate* -- `M8[D] + m8[Y]`. numpy does not look
-    /// for a common divisor there: it resolves the loop to the datetime
-    /// operand's own unit and then fails casting the other input into it, so
-    /// what surfaces is `Cannot cast ufunc 'add' input 1 from dtype('<m8[Y]')
-    /// to dtype('<m8[D]') with casting rule 'same_kind'`. Probed from 2.5.2.
+    /// numpy's `_UFuncInputCastingError` (also a `UFuncTypeError`): the type
+    /// resolver picked a loop, but one *input* cannot be cast to the dtype that
+    /// loop wants under the ufunc's casting rule.
     UFuncInputCasting {
         ufunc: String,
-        /// Which input failed to cast (0-based, as numpy numbers them).
-        index: usize,
-        /// `dtype.str`-style source and target, e.g. `"<m8[Y]"`, `"<m8[D]"`.
-        from: String,
-        to: String,
+        /// The casting rule name, e.g. `"same_kind"`.
         casting: String,
+        /// `dtype.str`-style spelling of the operand's own dtype.
+        from_: String,
+        /// `dtype.str`-style spelling of the dtype the loop needs.
+        to: String,
+        /// Which input (0-based).
+        i: usize,
         message: String,
     },
     OverflowError(String),
@@ -73,6 +70,35 @@ impl Error {
             Error::UFuncBinaryResolution { message, .. } => message,
             Error::UFuncInputCasting { message, .. } => message,
         }
+    }
+}
+
+/// Build numpy's `_UFuncInputCastingError` for input `i` of `ufunc`. `from_`
+/// and `to` are `dtype.str`-style spellings, e.g. `"<m8[Y]"`; `nin` is the
+/// ufunc's input count, because numpy omits the index for unary ufuncs.
+pub fn ufunc_input_casting(
+    ufunc: &str,
+    casting: &str,
+    from_: &str,
+    to: &str,
+    i: usize,
+    nin: usize,
+) -> Error {
+    let i_str = if nin != 1 {
+        format!("{i} ")
+    } else {
+        String::new()
+    };
+    Error::UFuncInputCasting {
+        ufunc: ufunc.to_string(),
+        casting: casting.to_string(),
+        from_: from_.to_string(),
+        to: to.to_string(),
+        i,
+        message: format!(
+            "Cannot cast ufunc {ufunc:?} input {i_str}from dtype({from_:?}) \
+             to dtype({to:?}) with casting rule {casting:?}"
+        ),
     }
 }
 

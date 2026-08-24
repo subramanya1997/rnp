@@ -11,7 +11,9 @@ use crate::array::NdArray;
 use crate::datetime::{self as dtm, NAT};
 use crate::dtype::DType;
 use crate::element::Scalar;
-use crate::error::{ufunc_binary_resolution, ufunc_no_loop, Error, Result};
+use crate::error::{
+    ufunc_binary_resolution, ufunc_input_casting, ufunc_no_loop, Error, Result,
+};
 use crate::iter::{broadcast_shapes, broadcast_to, offsets};
 use crate::ops::BinOp;
 
@@ -37,85 +39,25 @@ fn reso_error(op: BinOp, a: &NdArray, b: &NdArray) -> Error {
     ufunc_binary_resolution(op.name(), &a.descr.str_code(), &b.descr.str_code())
 }
 
-/// numpy's answer when a datetime meets an *incommensurate* timedelta, e.g.
-/// `M8[D] + m8[Y]`.
-///
-/// `PyUFunc_AdditionTypeResolver` does not look for a common divisor in this
-/// combination: it resolves the loop to the datetime operand's own unit and
-/// then fails casting the timedelta input into it. So the user sees a casting
-/// error naming the input position, not a metadata error:
-///
-///   Cannot cast ufunc 'add' input 1 from dtype('<m8[Y]') to dtype('<m8[D]')
-///   with casting rule 'same_kind'
-///
-/// Probed from numpy 2.5.2 in both operand orders (the index follows the
-/// timedelta, so `m8[Y] + M8[D]` reports input 0). Note this applies ONLY to
-/// datetime-with-timedelta: two incommensurate *timedeltas* keep the plain
-/// metadata `TypeError`, which is why this is not folded into `promote_meta`.
-fn td_cast_error(op: BinOp, dt_meta_src: DType, td: &NdArray, td_index: usize) -> Error {
-    let m = dtm::meta_of(dt_meta_src).expect("datetime-like dtype");
-    let target = crate::descr::Descr::new(dtm::timedelta(m), td.descr.bo);
-    let (from, to) = (td.descr.str_code(), target.str_code());
-    Error::UFuncInputCasting {
-        message: format!(
-            "Cannot cast ufunc {:?} input {} from dtype('{}') to dtype('{}') \
-             with casting rule 'same_kind'",
-            op.name(),
-            td_index,
-            from,
-            to
-        ),
-        ufunc: op.name().to_string(),
-        index: td_index,
-        from,
-        to,
-        casting: "same_kind".into(),
-    }
-}
+/// numpy's default ufunc casting rule for the inputs.
+const UFUNC_CASTING: crate::casting::Casting = crate::casting::Casting::SameKind;
 
-/// Unit bases that are *nonlinear*: years and months have no fixed length in
-/// any smaller unit, so they are commensurate with each other and with nothing
-/// else. numpy calls these the "nonlinear base time units".
-fn nonlinear(base: u8) -> bool {
-    base == dtm::UNIT_Y || base == dtm::UNIT_M
-}
-
-/// Resolve the unit for a datetime-with-timedelta `add`/`subtract`.
-///
-/// `PyUFunc_AdditionTypeResolver` does this in **two** phases, and the port
-/// previously collapsed them into one, which produced the right exception for
-/// some unit pairs and the wrong one for others:
-///
-///  1. `PyArray_PromoteTypes` runs the metadata GCD **non-strictly** for this
-///     combination -- so a nonlinear unit does not bail out here, it just
-///     loses to the other base. What *can* fail is the units factor, which
-///     overflows for the very fine bases: `M8[as] + m8[M]` and `M8[fs] +
-///     m8[Y]` raise **OverflowError**.
-///  2. Only then are the inputs cast into the resolved unit, and an
-///     incommensurate timedelta fails that cast: `M8[D] + m8[Y]` and
-///     `M8[s] + m8[M]` raise **UFuncTypeError**.
-///
-/// Both branches are probed from numpy 2.5.2; the boundary between them is
-/// exactly whether the units factor overflows first.
-fn promote_dt_td(
-    op: BinOp,
-    dt: DType,
-    td_arr: &NdArray,
-    td_index: usize,
-    a: &NdArray,
-    b: &NdArray,
-) -> Result<DType> {
-    let ma = dtm::meta_of(a.dtype()).expect("datetime-like dtype");
-    let mb = dtm::meta_of(b.dtype()).expect("datetime-like dtype");
-    // Phase 1: non-strict. An overflow here is numpy's OverflowError and must
-    // propagate untouched.
-    let m = dtm::gcd_meta(ma, mb, false, false)?;
-    // Phase 2: the timedelta input has to survive the cast into that unit.
-    let td_meta = dtm::meta_of(td_arr.dtype()).expect("timedelta dtype");
-    if !td_meta.is_generic() && !m.is_generic() && nonlinear(td_meta.base) != nonlinear(m.base) {
-        return Err(td_cast_error(op, dt, td_arr, td_index));
+/// Reject input `i` when it cannot reach the loop dtype the resolver picked,
+/// exactly as numpy's `PyUFunc_ValidateCasting` does.
+fn check_input_casting(ufunc: &str, from: DType, to: DType, i: usize) -> Result<()> {
+    use crate::descr::Descr;
+    if from == to || crate::casting::can_cast(Descr::native(from), Descr::native(to), UFUNC_CASTING)
+    {
+        return Ok(());
     }
-    Ok(dtm::datetime(m))
+    Err(ufunc_input_casting(
+        ufunc,
+        "same_kind",
+        &Descr::native(from).str_code(),
+        &Descr::native(to).str_code(),
+        i,
+        2,
+    ))
 }
 
 /// What the two operands must be cast to, and what comes out.
@@ -180,7 +122,7 @@ fn resolve(op: BinOp, a: &NdArray, b: &NdArray) -> Result<Loop> {
                     if !is_add {
                         return Err(reso_error(op, a, b));
                     }
-                    let p = promote_dt_td(op, db, a, 0, a, b)?;
+                    let p = dtm::promote_meta(da, db)?;
                     let m = dtm::meta_of(p).unwrap();
                     return Ok(Loop {
                         ain: dtm::timedelta(m),
@@ -201,7 +143,7 @@ fn resolve(op: BinOp, a: &NdArray, b: &NdArray) -> Result<Loop> {
             }
             if da.is_datetime() {
                 if db.is_timedelta() {
-                    let p = promote_dt_td(op, da, b, 1, a, b)?;
+                    let p = dtm::promote_meta(da, db)?;
                     let m = dtm::meta_of(p).unwrap();
                     return Ok(Loop {
                         ain: p,
@@ -450,6 +392,14 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<Nd
         }
     };
 
+    // The resolver only names the loop; numpy's ufunc machinery then insists
+    // that every input reach that loop's dtype under the call's casting rule
+    // (`same_kind` by default). `M8[D] + m8[Y]` promotes to `M8[D]`, so input 1
+    // would have to become `m8[D]` -- which m8's nonlinear units forbid -- and
+    // numpy reports `_UFuncInputCastingError` rather than a resolution failure.
+    check_input_casting(op.name(), a.dtype(), lp.ain, 0)?;
+    check_input_casting(op.name(), b.dtype(), lp.bin, 1)?;
+
     let av = a.try_astype(lp.ain)?;
     let bv = b.try_astype(lp.bin)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
@@ -668,6 +618,8 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<Nd
 /// `np.divmod` on two timedelta64 operands: numpy's `TIMEDELTA_mm_qm_divmod`.
 pub fn divmod(a: &NdArray, b: &NdArray) -> Result<(NdArray, NdArray)> {
     let lp = resolve(BinOp::Mod, a, b)?;
+    check_input_casting("divmod", a.dtype(), lp.ain, 0)?;
+    check_input_casting("divmod", b.dtype(), lp.bin, 1)?;
     let av = a.try_astype(lp.ain)?;
     let bv = b.try_astype(lp.bin)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;

@@ -103,37 +103,51 @@ pub fn element_to_py<'py>(
     if arr.dtype().is_flexible() {
         return flexible_to_py(py, arr, off);
     }
+    if arr.dtype().is_datetime_like() {
+        let v = match arr.read_at(off) {
+            Scalar::Int(i) => i,
+            s => s.as_f64() as i64,
+        };
+        return datetime_object(py, arr.dtype(), v);
+    }
     scalar_to_py(py, arr.read_at(off))
 }
 
-/// The Python object `tolist()` (and `item()`) hand back for one element.
-///
-/// This differs from [`element_to_py`] for the datetime-like dtypes *only*.
-/// numpy's `tolist`/`item` convert to the `datetime` module's types, while
-/// iteration and `a[i]` hand back `np.datetime64`/`np.timedelta64` scalars --
-/// so the two conversions genuinely are different functions, and the object
-/// ufunc loops want the scalar one.
-///
-/// Probed from numpy 2.5.2 across all 13 units:
-///   * NaT -> `None`, for every unit and both kinds;
-///   * `M8[Y|M|W|D]` -> `datetime.date`;
-///   * `M8[h|m|s|ms|us]` -> `datetime.datetime`;
-///   * `m8[W|D|h|m|s|ms|us]` -> `datetime.timedelta`;
-///   * `m8[Y]`/`m8[M]` -> plain `int` (they are not commensurate with days);
-///   * everything `ns` and finer -> plain `int`;
-///   * any value the Python type cannot represent -> plain `int`.
-/// The scalar classes already implement exactly that table in `.item()`, so
-/// this defers to them rather than duplicating it.
-pub fn element_to_py_item<'py>(
+/// numpy's `DATETIME_getitem` / `TIMEDELTA_getitem`: the Python object one
+/// datetime-like element hands back — a `datetime.date` / `datetime.datetime` /
+/// `datetime.timedelta` where that is exact, `None` for NaT, and the raw
+/// integer for every unit or magnitude `datetime` cannot express.
+pub fn datetime_object<'py>(
     py: Python<'py>,
-    arr: &NdArray,
-    off: isize,
+    dt: DType,
+    v: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if arr.dtype().is_datetime_like() {
-        let sc = npscalar_to_py(py, arr.dtype(), arr.read_at(off))?;
-        return sc.call_method0("item");
+    use rnp_core::datetime::PyDtObj;
+    let Some(what) = rnp_core::datetime::value_to_pyobj(dt, v) else {
+        return scalar_to_py(py, Scalar::Int(v));
+    };
+    let dtmod = || py.import(pyo3::intern!(py, "datetime"));
+    match what {
+        PyDtObj::Nothing => Ok(py.None().into_bound(py)),
+        PyDtObj::Int(i) => Ok(i.into_pyobject(py)?.into_any()),
+        PyDtObj::Date { year, month, day } => dtmod()?
+            .getattr(pyo3::intern!(py, "date"))?
+            .call1((year, month, day)),
+        PyDtObj::DateTime {
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec,
+            us,
+        } => dtmod()?
+            .getattr(pyo3::intern!(py, "datetime"))?
+            .call1((year, month, day, hour, min, sec, us)),
+        PyDtObj::Delta { days, secs, us } => dtmod()?
+            .getattr(pyo3::intern!(py, "timedelta"))?
+            .call1((days, secs, us)),
     }
-    element_to_py(py, arr, off)
 }
 
 /// Build the numpy scalar object for one element, falling back to the plain

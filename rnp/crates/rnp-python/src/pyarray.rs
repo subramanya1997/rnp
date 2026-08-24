@@ -72,7 +72,7 @@ fn nested_list<'py>(
     index: &mut Vec<isize>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if index.len() == arr.ndim() {
-        return crate::convert::element_to_py_item(py, arr, arr.byte_index(index));
+        return crate::convert::element_to_py(py, arr, arr.byte_index(index));
     }
     let n = arr.shape[index.len()];
     let mut items = Vec::with_capacity(n.max(0) as usize);
@@ -1398,6 +1398,13 @@ impl PyNdArray {
             let idx = shape_from_args(args)?;
             self.arr.get(&idx).map_err(crate::err)?
         };
+        if self.arr.dtype().is_datetime_like() {
+            let raw = match v {
+                rnp_core::Scalar::Int(i) => i,
+                other => other.as_f64() as i64,
+            };
+            return crate::convert::datetime_object(py, self.arr.dtype(), raw);
+        }
         scalar_to_py(py, v)
     }
 
