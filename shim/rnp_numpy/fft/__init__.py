@@ -1,6 +1,7 @@
 """Discrete Fourier transforms backed by the Rust FFT kernels."""
 
 import math as _math
+import warnings as _warnings
 
 from _rnp import _fft_c2c, _fft_c2r, _fft_r2c
 from rnp_numpy import asarray, conjugate
@@ -90,12 +91,92 @@ def ihfft(a, n=None, axis=-1, norm=None, out=None):
     return conjugate(result, out=result)
 
 
+def _cook_nd_args(a, s=None, axes=None, invreal=False):
+    if s is None:
+        shapeless = True
+        if axes is None:
+            s = list(a.shape)
+        else:
+            s = [a.shape[axis] for axis in axes]
+    else:
+        shapeless = False
+    s = list(s)
+    if axes is None:
+        if not shapeless:
+            _warnings.warn(
+                "`axes` should not be `None` if `s` is not `None` "
+                "(Deprecated in NumPy 2.0).",
+                DeprecationWarning, stacklevel=3,
+            )
+        axes = list(range(-len(s), 0))
+    else:
+        axes = list(axes)
+    if len(s) != len(axes):
+        raise ValueError("Shape and axes have different lengths.")
+    if invreal and shapeless:
+        s[-1] = (a.shape[axes[-1]] - 1) * 2
+    if None in s:
+        _warnings.warn(
+            "Passing an array containing `None` values to `s` is deprecated in NumPy 2.0.",
+            DeprecationWarning, stacklevel=3,
+        )
+    s = [a.shape[axis] if size == -1 else size for size, axis in zip(s, axes)]
+    return s, axes
+
+
+def _raw_fftnd(a, s=None, axes=None, function=fft, norm=None, out=None):
+    a = asarray(a)
+    s, axes = _cook_nd_args(a, s, axes)
+    for ii in range(len(axes) - 1, -1, -1):
+        a = function(a, n=s[ii], axis=axes[ii], norm=norm, out=out)
+    return a
+
+
+def fftn(a, s=None, axes=None, norm=None, out=None):
+    return _raw_fftnd(a, s, axes, fft, norm, out=out)
+
+
+def ifftn(a, s=None, axes=None, norm=None, out=None):
+    return _raw_fftnd(a, s, axes, ifft, norm, out=out)
+
+
+def fft2(a, s=None, axes=(-2, -1), norm=None, out=None):
+    return _raw_fftnd(a, s, axes, fft, norm, out=out)
+
+
+def ifft2(a, s=None, axes=(-2, -1), norm=None, out=None):
+    return _raw_fftnd(a, s, axes, ifft, norm, out=out)
+
+
+def rfftn(a, s=None, axes=None, norm=None, out=None):
+    a = asarray(a)
+    s, axes = _cook_nd_args(a, s, axes)
+    a = rfft(a, s[-1], axes[-1], norm, out=out)
+    for ii in range(len(axes) - 2, -1, -1):
+        a = fft(a, s[ii], axes[ii], norm, out=out)
+    return a
+
+
+def rfft2(a, s=None, axes=(-2, -1), norm=None, out=None):
+    return rfftn(a, s, axes, norm, out=out)
+
+
+def irfftn(a, s=None, axes=None, norm=None, out=None):
+    a = asarray(a)
+    s, axes = _cook_nd_args(a, s, axes, invreal=True)
+    for ii in range(len(axes) - 1):
+        a = ifft(a, s[ii], axes[ii], norm)
+    return irfft(a, s[-1], axes[-1], norm, out=out)
+
+
+def irfft2(a, s=None, axes=(-2, -1), norm=None, out=None):
+    return irfftn(a, s, axes, norm, out=out)
+
+
 def _pending(*args, **kwargs):
     raise NotImplementedError("FFT transform cluster not implemented yet")
 
 
-fftn = ifftn = fft2 = ifft2 = _pending
-rfftn = irfftn = rfft2 = irfft2 = _pending
 fftfreq = rfftfreq = fftshift = ifftshift = _pending
 
 for _name in __all__:
