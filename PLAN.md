@@ -71,6 +71,60 @@ ratio port/numpy. Criterion micro-benches live in `rnp/` for inner loops.
   MT19937/PCG64 streams), datetime64, strings, structured dtypes. Each gets its
   own milestone written when reached.
 
+## M5 FINAL (2026-08-24)
+
+M5 closed with the zero-divergence gate fully restored on merged main
+(commit 3d014ee): dev_check 36504/0, dev_check_struct 16922/0,
+dev_check_matmul 3862/0, dev_check_nep50 12094/0, dev_check_object 2641/0,
+dev_check_straggler 1697/0 — 73,720 bit-exact comparisons total; cargo
+test --release 154 green. Landed via three fix lanes: datetime
+(tolist/item object conversion, negative-year %04d repr, UFuncInputCasting
+errors), message-parity (OverflowError/getfield messages, tobytes order
+bug, complex std summation order, and bit-exact complex vecdot/vecmat by
+calling Accelerate ILP64 dotc/gemm under numpy's exact blas_stride
+predicate — new rnp-core/src/blas.rs), and structured dtypes
+(multi-field setitem, subarray fields, VOID sort, field-by-position
+astype, structured can_cast/promote_types/result_type +
+DTypePromotionError). The last two lanes were implemented by Codex
+(gpt-5.6-sol) during a sustained Anthropic API 529 outage, spec'd and
+verified by Fable. Full-suite scoreboard rerun in progress.
+
+## Revised ladder after M5 (2026-08-23)
+
+The original M6 (sort/matmul) landed early — sort/argsort/searchsorted in M4,
+the matmul family in M5. The scoreboard so far covers only `_core/tests`
+(66 files); the full upstream tree also has lib (25 files / ~1375 test fns),
+random (10/673), ma (8/526), polynomial (10/345), linalg (3/126), matrixlib
+(7/89), fft (2/52), and ~12 top-level/testing files. f2py, typing and
+_pyinstaller tests are out of scope (they test the Fortran toolchain and type
+stubs, not the array engine).
+
+- **M6 — finish the core**: nditer object (test_nditer 13.5%),
+  `__array_function__` overrides (test_overrides 21.9%), test_numeric
+  (17.9%), `__dlpack__` (0/95), scalar buffer protocol (0/79),
+  casting-FP-error warnings (0/210), collection for test_ufunc/test_einsum/
+  test_casting_unittests/test_deprecations, StringDType storage model
+  (662 failures in test_strings). Harness extended to run the whole
+  upstream suite (per-suite scoreboards) — measurement lane running.
+- **M7 — lib + ma**: mostly pure-Python breadth over the engine.
+- **M8 — linalg + fft + random**: LAPACK/FFT (faer or Accelerate, consistent
+  with the BLAS-parity precedent), bit-exact generator streams, polynomial,
+  matrixlib.
+
+- 2026-08-23: whole-suite baseline measured (harness/run.py grew --suite/
+  --full, commit c6d3f20; per-suite scoreboards in harness/scoreboard_*.json).
+  Against the current build: lib 2259/4575 (49%), ma 3666/4352 (84%),
+  polynomial 383/610 (63%), matrixlib 2/89, random 21/363 (6 of 10 files
+  blocked: PCG64DXSM/SeedSequence missing), top 3/6, linalg 0 (no
+  rnp_numpy.linalg._linalg), fft 0 (no rnp_numpy.fft at all). Combined with
+  core: ~32,114 passing of ~41,304 currently collecting. Top collection
+  blockers by files blocked: testing._private.utils.run_subprocess (4),
+  random.PCG64DXSM (3), linalg._linalg (3), random.SeedSequence (2), fft (2),
+  structured "unsupported field value" (2 — the in-flight struct lane's
+  territory). REAL BUG found: upstream lib/test_regression.py collects then
+  dies in a native abort inside _arraycompat.setitem — needs a crash triage
+  lane before M7.
+
 Every milestone ends with: full-suite scoreboard run, crosscheck run,
 benchmark run, Fable review, git commit.
 
