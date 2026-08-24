@@ -14,7 +14,7 @@ use rnp_core::indexing::{Indexed, TakeMode};
 use rnp_core::{binary, BinOp, DType, NdArray, Scalar};
 
 use crate::convert::{array_from_any, flexible_to_py, npflexible_to_py, npscalar_to_py,
-                     operand_for, scalar_from_py, scalar_to_py};
+                     operand_for, scalar_to_py};
 use rnp_core::printing;
 use crate::pydtype::{descr_from_any, dtype_from_any, PyDType};
 
@@ -386,7 +386,12 @@ impl PyFlatIter {
         Ok(PyNdArray::into_py_any(out, py)?.into_bound(py).into_any())
     }
 
-    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn __setitem__(
+        &mut self,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         if !self.arr.flags.writeable {
             return Err(PyValueError::new_err("assignment destination is read-only"));
         }
@@ -411,14 +416,26 @@ impl PyFlatIter {
             resolved.push(v as usize);
         }
         if !self.arr.dtype().is_flexible() {
-            if let Some(s) = scalar_from_py(value) {
+            if let Some(s) = crate::convert::any_scalar(value)? {
                 for &v in &resolved {
                     self.arr.write_at(self.offset(v), s);
                 }
+                crate::ufuncs::report_fpe(py, "cast")?;
                 return Ok(());
             }
         }
-        let src = array_from_any(value, Some(self.arr.dtype()), false)?;
+        let converted = if let Ok(array) = value.cast::<PyNdArray>() {
+            let source_kind = array.borrow().arr.dtype().kind();
+            if matches!(source_kind, 'O' | 'S' | 'U') && self.arr.dtype().is_numeric() {
+                Some(value.call_method1("astype", (PyDType::new(self.arr.dtype()),))?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source = converted.as_ref().unwrap_or(value);
+        let src = array_from_any(source, Some(self.arr.dtype()), false)?;
         let want = [resolved.len() as isize];
         let src = match rnp_core::iter::broadcast_to(&src, &want) {
             Ok(s) => s,
@@ -441,6 +458,7 @@ impl PyFlatIter {
                 self.arr.write_at(d, src.read_at(src_offs[k]));
             }
         }
+        crate::ufuncs::report_fpe(py, "cast")?;
         Ok(())
     }
 
@@ -945,6 +963,7 @@ impl PyNdArray {
         } else {
             self.arr.astype_descr(d)
         };
+        crate::ufuncs::report_fpe(py, "cast")?;
         PyNdArray::into_py_any(out, py)
     }
 
@@ -1370,10 +1389,28 @@ impl PyNdArray {
         Ok(())
     }
 
-    fn fill(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let s = scalar_from_py(value)
-            .ok_or_else(|| PyTypeError::new_err("fill() requires a scalar value"))?;
+    fn fill(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let s = match crate::convert::any_scalar(value)? {
+            Some(s) => s,
+            None => {
+                let scalar = if let Ok(text) = value.extract::<String>() {
+                    Scalar::Float(text.parse::<f64>().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "could not convert string to float: '{text}'"
+                        ))
+                    })?)
+                } else {
+                    let a = array_from_any(value, Some(self.arr.dtype()), false)?;
+                    if a.size() != 1 {
+                        return Err(PyTypeError::new_err("fill() requires a scalar value"));
+                    }
+                    a.get_flat(0)
+                };
+                scalar
+            }
+        };
         self.arr.fill(s);
+        crate::ufuncs::report_fpe(py, "cast")?;
         Ok(())
     }
 
@@ -2083,8 +2120,10 @@ impl PyNdArray {
                     return Ok(());
                 }
                 if !view.dtype().is_flexible() {
-                    if let Some(s) = scalar_from_py(value) {
-                        view.fill(s.cast(view.dtype()));
+                    if let Some(s) = crate::convert::any_scalar(value)? {
+                        // Keep the original scalar until the storage cast so
+                        // overflow/invalid is attributed to this assignment.
+                        view.fill(s);
                         return Ok(());
                     }
                 }

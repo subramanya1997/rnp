@@ -33,9 +33,6 @@ _ORDERS = ("C", "F", "A", "K")
 
 _NAN = float("nan")
 _CNAN = complex(_NAN, _NAN)
-_FLOAT_MAX = {2: 65504.0, 4: 3.4028234663852886e+38}
-
-
 def _pkg():
     import sys
     return sys.modules[__name__.rsplit(".", 1)[0]]
@@ -402,10 +399,6 @@ def copyto(dst, src, casting="same_kind", where=True):
 
     if _weak_kind(src) is not None:
         _check_scalar_cast(src, dt, casting)
-        if type(src) is _b.float and dt.kind == "f" and \
-                _b.abs(src) > _FLOAT_MAX.get(dt.itemsize, _b.float("inf")):
-            _warnings.warn("overflow encountered in cast", RuntimeWarning,
-                           stacklevel=2)
         if isinstance(src, complex) and dt.kind in "iufmM":
             _warnings.warn(_COMPLEX_MSG, ComplexWarning, stacklevel=2)
         value = _raw_array(src, dt if dt.kind != "O" else None)
@@ -449,7 +442,9 @@ def copyto(dst, src, casting="same_kind", where=True):
 
     # Materialise a temporary so overlapping source/destination is safe.
     if value.dtype != dt:
-        value = _orig_astype(value, dt, copy=True)
+        # Use the public compatibility path: object and text sources need its
+        # element-wise conversion before the Rust numeric cast loop.
+        value = value.astype(dt, copy=True)
     else:
         value = _ordered_copy(value, dt, "C")
 
@@ -574,13 +569,21 @@ def setitem(self, key, value):
     if isinstance(value, ndarray) and value.size and self.size:
         if may_share_memory(self, value):
             value = _ordered_copy(value, value.dtype, "C")
+    if isinstance(value, str) and self.dtype.kind in "fciub":
+        value = _b.float(value) if self.dtype.kind in "fc" else _b.int(value)
+    if isinstance(value, ndarray) and value.dtype.kind in "OSU" \
+            and self.dtype.kind in "fciub":
+        value = value.astype(self.dtype, copy=True)
     try:
-        return _orig_setitem(self, key, value)
+        result = _orig_setitem(self, key, value)
     except TypeError as exc:
         if not _has_none_error(exc) or self.dtype.kind not in "fc":
             raise
-    fill = _NAN if self.dtype.kind == "f" else _CNAN
-    return _orig_setitem(self, key, _replace_none(value, fill))
+        fill = _NAN if self.dtype.kind == "f" else _CNAN
+        result = _orig_setitem(self, key, _replace_none(value, fill))
+    from . import _errstate
+    _errstate.drain("cast", stacklevel=3)
+    return result
 
 
 # ---------------------------------------------------------------------------

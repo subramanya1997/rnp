@@ -1,6 +1,7 @@
 //! Element types and the C-cast semantics numpy uses for `astype`.
 
 use crate::dtype::DType;
+use crate::fpe;
 use num_complex::Complex;
 
 pub type C32 = Complex<f32>;
@@ -122,6 +123,57 @@ impl Scalar {
             // represent them, and every path that could reach here is
             // guarded by `DType::is_numeric`.
             _ => self,
+        }
+    }
+
+    /// Cast as part of a NumPy cast loop, recording its IEEE status.
+    ///
+    /// Plain [`Self::cast`] is also used to normalise operands before an
+    /// arithmetic kernel.  Those bookkeeping conversions are not observable
+    /// cast loops and must not leak flags into the operation's accumulator.
+    #[inline]
+    pub fn cast_with_fpe(self, dtype: DType) -> Scalar {
+        self.record_cast_fpe(dtype);
+        self.cast(dtype)
+    }
+
+    /// Record the IEEE condition NumPy attributes to a cast loop.
+    #[inline]
+    fn record_cast_fpe(self, dtype: DType) {
+        if matches!(dtype.kind(), 'i' | 'u') {
+            let real = match self {
+                Scalar::Float(v) => Some(v),
+                Scalar::Complex(v) => Some(v.re),
+                _ => None,
+            };
+            if real.is_some_and(|v| !v.is_finite()) {
+                fpe::raise(fpe::INVALID);
+            }
+            return;
+        }
+
+        let overflow = match self {
+            Scalar::Float(v) => match dtype {
+                DType::F16 => v.is_finite() && F16::from_f64(v).to_f64().is_infinite(),
+                DType::F32 | DType::C64 => v.is_finite() && (v as f32).is_infinite(),
+                _ => false,
+            },
+            Scalar::Complex(v) => {
+                matches!(dtype, DType::F32 | DType::C64)
+                    && ((v.re.is_finite() && (v.re as f32).is_infinite())
+                        || (v.im.is_finite() && (v.im as f32).is_infinite()))
+            }
+            // Every core integer fits all modeled float formats except f16.
+            Scalar::Int(v) => {
+                dtype == DType::F16 && F16::from_f64(v as f64).to_f64().is_infinite()
+            }
+            Scalar::Uint(v) => {
+                dtype == DType::F16 && F16::from_f64(v as f64).to_f64().is_infinite()
+            }
+            Scalar::Bool(_) => false,
+        };
+        if overflow {
+            fpe::raise(fpe::OVER);
         }
     }
 }
@@ -294,7 +346,7 @@ macro_rules! impl_int_element {
         impl Element for $t {
             const DTYPE: DType = $dt;
             fn from_scalar(s: Scalar) -> Self {
-                match s.cast($dt) {
+                match s.cast_with_fpe($dt) {
                     Scalar::Int(i) => i as $t,
                     Scalar::Uint(u) => u as $t,
                     other => other.as_i64() as $t,
@@ -333,7 +385,7 @@ impl NpBool {
 impl Element for NpBool {
     const DTYPE: DType = DType::Bool;
     fn from_scalar(s: Scalar) -> Self {
-        match s.cast(DType::Bool) {
+        match s.cast_with_fpe(DType::Bool) {
             Scalar::Bool(b) => NpBool::new(b),
             _ => unreachable!(),
         }
@@ -346,7 +398,7 @@ impl Element for NpBool {
 impl Element for F16 {
     const DTYPE: DType = DType::F16;
     fn from_scalar(s: Scalar) -> Self {
-        match s.cast(DType::F16) {
+        match s.cast_with_fpe(DType::F16) {
             Scalar::Float(f) => F16::from_f64(f),
             _ => unreachable!(),
         }
@@ -359,7 +411,7 @@ impl Element for F16 {
 impl Element for f32 {
     const DTYPE: DType = DType::F32;
     fn from_scalar(s: Scalar) -> Self {
-        match s.cast(DType::F32) {
+        match s.cast_with_fpe(DType::F32) {
             Scalar::Float(f) => f as f32,
             _ => unreachable!(),
         }
@@ -372,7 +424,7 @@ impl Element for f32 {
 impl Element for f64 {
     const DTYPE: DType = DType::F64;
     fn from_scalar(s: Scalar) -> Self {
-        match s.cast(DType::F64) {
+        match s.cast_with_fpe(DType::F64) {
             Scalar::Float(f) => f,
             _ => unreachable!(),
         }
@@ -385,7 +437,7 @@ impl Element for f64 {
 impl Element for C32 {
     const DTYPE: DType = DType::C64;
     fn from_scalar(s: Scalar) -> Self {
-        match s.cast(DType::C64) {
+        match s.cast_with_fpe(DType::C64) {
             Scalar::Complex(c) => Complex::new(c.re as f32, c.im as f32),
             _ => unreachable!(),
         }
@@ -398,7 +450,7 @@ impl Element for C32 {
 impl Element for C64v {
     const DTYPE: DType = DType::C128;
     fn from_scalar(s: Scalar) -> Self {
-        match s.cast(DType::C128) {
+        match s.cast_with_fpe(DType::C128) {
             Scalar::Complex(c) => c,
             _ => unreachable!(),
         }
