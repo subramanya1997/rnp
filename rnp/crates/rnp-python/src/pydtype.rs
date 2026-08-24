@@ -426,6 +426,31 @@ fn shape_arg(obj: &Bound<'_, PyAny>) -> PyResult<Vec<isize>> {
     Err(PyTypeError::new_err("invalid shape in a dtype spec"))
 }
 
+fn sized_flexible(base: Descr, size: &Bound<'_, PyAny>) -> PyResult<Option<Descr>> {
+    if !matches!(base.dt, DType::Bytes(0) | DType::Str(0) | DType::Void(0)) {
+        return Ok(None);
+    }
+    let count = size.extract::<i64>().map_err(|_| {
+        PyValueError::new_err("invalid itemsize in generic type tuple")
+    })?;
+    let byte_width = match base.dt {
+        DType::Str(0) => count.checked_mul(4),
+        _ => Some(count),
+    };
+    if count < 0 || byte_width.is_none_or(|n| n > i32::MAX as i64) {
+        return Err(PyValueError::new_err(
+            "invalid itemsize in generic type tuple",
+        ));
+    }
+    let sized = match base.dt {
+        DType::Bytes(0) => DType::Bytes(count as u32),
+        DType::Str(0) => DType::Str(count as u32),
+        DType::Void(0) => DType::Void(count as u32),
+        _ => unreachable!(),
+    };
+    Ok(Some(Descr::native(sized)))
+}
+
 /// `('f4', (2, 2))` -> subarray; `('f4', 3)` -> subarray of 3.
 fn descr_from_tuple(t: &Bound<'_, PyTuple>, align: bool) -> PyResult<Descr> {
     if t.len() != 2 {
@@ -453,26 +478,8 @@ fn descr_from_tuple(t: &Bound<'_, PyTuple>, align: bool) -> PyResult<Descr> {
         }
     }
     let base = descr_from_any_aligned(&first, align)?;
-    if matches!(base.dt, DType::Bytes(0) | DType::Str(0) | DType::Void(0)) {
-        let count = second.extract::<i64>().map_err(|_| {
-            PyValueError::new_err("invalid itemsize in generic type tuple")
-        })?;
-        let byte_width = match base.dt {
-            DType::Str(0) => count.checked_mul(4),
-            _ => Some(count),
-        };
-        if count < 0 || byte_width.is_none_or(|n| n > i32::MAX as i64) {
-            return Err(PyValueError::new_err(
-                "invalid itemsize in generic type tuple",
-            ));
-        }
-        let sized = match base.dt {
-            DType::Bytes(0) => DType::Bytes(count as u32),
-            DType::Str(0) => DType::Str(count as u32),
-            DType::Void(0) => DType::Void(count as u32),
-            _ => unreachable!(),
-        };
-        return Ok(Descr::native(sized));
+    if let Some(sized) = sized_flexible(base, &second)? {
+        return Ok(sized);
     }
     let shape = shape_arg(&second)?;
     if shape.is_empty() {
@@ -506,7 +513,17 @@ fn field_from_entry(entry: &Bound<'_, PyAny>, index: usize, align: bool) -> PyRe
     };
     let mut descr = descr_from_any_aligned(&t.get_item(1)?, align)?;
     if t.len() == 3 {
-        let shape = shape_arg(&t.get_item(2)?)?;
+        let shape_obj = t.get_item(2)?;
+        if let Some(sized) = sized_flexible(descr, &shape_obj)? {
+            descr = sized;
+            return Ok(FieldSpec {
+                name,
+                descr,
+                title,
+                offset: None,
+            });
+        }
+        let shape = shape_arg(&shape_obj)?;
         if !shape.is_empty() && !(shape.len() == 1 && shape[0] == 1) {
             descr = make_subarray(descr, shape);
         } else if shape.len() == 1 && shape[0] == 1 {
