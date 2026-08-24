@@ -308,6 +308,14 @@ def asarray(obj, dtype=None):
     _text = _text_scalar(obj, dtype)
     if _text is not None:
         return _text
+    # The core numeric caster cannot interpret object-slab handles.  Route an
+    # object ndarray through the Python-aware astype wrapper, which converts
+    # the actual stored objects element by element.  `vectorize` relies on
+    # this when it casts a frompyfunc result to its inferred output dtype.
+    if isinstance(obj, ndarray) and dtype is not None:
+        target = globals()["dtype"](dtype)
+        if target.kind == "O" or obj.dtype.kind == "O":
+            return obj.astype(target)
     try:
         return _rnp_asarray(obj, dtype)
     except TypeError as exc:
@@ -1096,7 +1104,7 @@ from ._errstate import (  # noqa: E402,F401
 # --------------------------------------------------------------------------
 
 from ._ufunc import ALL as _UFUNCS  # noqa: E402
-from ._ufunc import ufunc  # noqa: E402
+from ._ufunc import frompyfunc, ufunc  # noqa: E402
 
 globals().update(_UFUNCS)
 

@@ -683,6 +683,12 @@ def broadcast_arrays(*args, subok=False):
 def as_strided(x, shape=None, strides=None, subok=False, writeable=True,
                *, check_bounds=None):
     from _rnp import _as_strided
+    if shape is not None and strides is None:
+        arr = np.asarray(x)
+        # A scalar dummy expanded to a broadcast shape is a zero-stride view;
+        # vectorize's core-signature planner uses exactly this construction.
+        if arr.ndim == 0:
+            strides = (0,) * len(tuple(shape))
     return _as_strided(x, shape, strides, writeable)
 
 

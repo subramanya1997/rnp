@@ -7,6 +7,7 @@ implemented raises NotImplementedError rather than returning a wrong answer.
 """
 
 import builtins as _builtins
+import operator as _operator
 
 import _rnp
 
@@ -275,7 +276,8 @@ class ufunc:
 
     __module__ = "numpy"
     __slots__ = ("__name__", "_qualname", "nin", "nout", "nargs", "types",
-                 "ntypes", "identity", "signature", "_ok")
+                 "ntypes", "identity", "signature", "_ok", "_pyfunc",
+                 "_doc", "_identity_set")
 
     def __init__(self, name):
         meta = TABLE.get(name)
@@ -292,6 +294,32 @@ class ufunc:
         self.identity = identity
         self.signature = GUFUNC_SIGNATURES.get(name)
         self._ok = name in _IMPLEMENTED
+        self._pyfunc = None
+        self._doc = None
+        self._identity_set = True
+
+    @classmethod
+    def _from_pyfunc(cls, func, nin, nout, identity, identity_set):
+        name = f"{getattr(func, '__name__', '?')} (vectorized)"
+        obj = cls(name)
+        obj.nin = nin
+        obj.nout = nout
+        obj.nargs = nin + nout
+        obj.types = ["O" * nin + "->" + "O" * nout]
+        obj.ntypes = 1
+        obj.identity = identity
+        obj.signature = None
+        obj._ok = True
+        obj._pyfunc = func
+        args = "x" if nin == 1 else ", ".join(
+            f"x{i}" for i in range(1, nin + 1))
+        obj._doc = (
+            f"{name}({args}, /, out=None, *, where=True, "
+            "casting='same_kind', order='K', dtype=None, subok=True"
+            "[, signature])\n\ndynamic ufunc based on a python function"
+        )
+        obj._identity_set = identity_set
+        return obj
 
     # -- introspection -----------------------------------------------------
 
@@ -300,6 +328,8 @@ class ufunc:
 
     @property
     def __doc__(self):
+        if self._doc is not None:
+            return self._doc
         return f"{self.__name__}(x1, x2, /, out=None, *, where=True, ...)"
 
     def _no_signature_method(self, what):
@@ -361,6 +391,12 @@ class ufunc:
             # from the output array when upstream code passes that class.
             if dtype is _rnp.dtype:
                 dtype = out.dtype
+        override = self._dispatch_pyfunc_override(args, out)
+        if override is not _UNSET:
+            return override
+        if self._pyfunc is not None:
+            return self._call_pyfunc(
+                args, out, where, casting, dtype, allocate_out, scalar_out)
         try:
             res = _rnp._ufunc_call(self.__name__, args, out=out, where_=where,
                                    casting=casting, dtype=dtype)
@@ -377,6 +413,134 @@ class ufunc:
         if isinstance(res, tuple):
             return tuple(_maybe_scalar(r, scalar_out) for r in res)
         return _maybe_scalar(res, scalar_out)
+
+    def _dispatch_pyfunc_override(self, args, out):
+        """NEP 13 override ordering for dynamically-created ufuncs."""
+        candidates = []
+        types = []
+        operands = list(args)
+        if isinstance(out, tuple):
+            operands.extend(x for x in out if x is not None)
+        elif out is not None:
+            operands.append(out)
+        for operand in operands:
+            typ = type(operand)
+            method = getattr(typ, "__array_ufunc__", None)
+            if method is None or typ in types or typ is ndarray:
+                continue
+            insert = len(types)
+            for i, old in enumerate(types):
+                if issubclass(typ, old):
+                    insert = i
+                    break
+            types.insert(insert, typ)
+            candidates.insert(insert, (operand, method))
+        if not candidates:
+            return _UNSET
+        kwargs = {} if out is None else {
+            "out": out if isinstance(out, tuple) else (out,)}
+        for operand, method in candidates:
+            result = method(operand, self, "__call__", *args, **kwargs)
+            if result is not NotImplemented:
+                return result
+        names = ", ".join(t.__name__ for t in types)
+        raise TypeError(
+            f"operand type(s) all returned NotImplemented from "
+            f"__array_ufunc__({self!r}, '__call__', ...): {names}")
+
+    def _call_pyfunc(self, args, out, where, casting, dtype,
+                     allocate_out, scalar_out):
+        """Run a `frompyfunc` loop over broadcast object operands."""
+        if dtype is not None and _rnp.dtype(dtype).kind != "O":
+            from ._core._exceptions import _UFuncNoLoopError
+            raise _UFuncNoLoopError(
+                self, tuple([_rnp.dtype(object)] * self.nargs))
+
+        from . import asarray as _asarray
+        arrays = [_asarray(a, dtype=object) for a in args]
+        if self.nout == 1:
+            destinations = [out]
+        elif out is None:
+            destinations = [None] * self.nout
+        elif isinstance(out, tuple) and len(out) == self.nout:
+            destinations = list(out)
+        else:
+            raise ValueError(
+                "The 'out' tuple must have exactly one entry per ufunc output")
+
+        concrete = [o for o in destinations if o is not None]
+        if _builtins.any(not isinstance(o, ndarray) for o in concrete):
+            raise TypeError("return arrays must be of ArrayType")
+        shapes = [a.shape for a in arrays]
+        shapes.extend(o.shape for o in concrete)
+        shape = tuple(_rnp.broadcast_shapes(*shapes)) if shapes else ()
+        if _builtins.any(o.shape != shape for o in concrete):
+            raise ValueError("operands could not be broadcast together")
+        arrays = [_rnp.broadcast_to(a, shape) if a.shape != shape else a
+                  for a in arrays]
+
+        mask = _asarray(where, dtype=bool)
+        if mask.shape != shape:
+            mask = _rnp.broadcast_to(mask, shape)
+
+        object_dtype = _rnp.dtype(object)
+        for i, dest in enumerate(destinations):
+            if dest is not None and not _rnp.can_cast(
+                    object_dtype, dest.dtype, casting=casting):
+                from ._core._exceptions import _UFuncOutputCastingError
+                raise _UFuncOutputCastingError(
+                    self, casting, object_dtype, dest.dtype, i)
+
+        size = 1
+        for dim in shape:
+            size *= dim
+        values = [[None] * size for _ in range(self.nout)]
+
+        def c_index(flat):
+            if not shape:
+                return ()
+            index = [0] * len(shape)
+            for axis in range(len(shape) - 1, -1, -1):
+                index[axis] = flat % shape[axis]
+                flat //= shape[axis]
+            return tuple(index)
+
+        for flat in range(size):
+            index = c_index(flat)
+            if not bool(mask[index]):
+                continue
+            result = self._pyfunc(*(a[index] for a in arrays))
+            if self.nout == 1:
+                values[0][flat] = result
+            elif isinstance(result, tuple) and len(result) == self.nout:
+                for k, value in enumerate(result):
+                    values[k][flat] = value
+            # NumPy fills every output with None when a multi-output callback
+            # returns anything other than the exact expected tuple.
+
+        results = []
+        for k, dest in enumerate(destinations):
+            if dest is None:
+                # Building from the nested Python values would interpret a
+                # tuple/list returned by the callback as another array axis.
+                # Allocate the object container first, then store each result
+                # as one opaque Python object.
+                res = _rnp.empty(shape, dtype=object)
+                for flat, value in enumerate(values[k]):
+                    res[c_index(flat)] = value
+            else:
+                for flat, value in enumerate(values[k]):
+                    index = c_index(flat)
+                    if bool(mask[index]):
+                        dest[index] = value
+                res = dest
+            results.append(res)
+
+        if self.nout == 1:
+            return _maybe_scalar(results[0], scalar_out and not allocate_out)
+        if scalar_out and not allocate_out:
+            return tuple(_maybe_scalar(r, True) for r in results)
+        return tuple(results)
 
     # -- the generalized (core-signature) call ------------------------------
 
@@ -476,6 +640,9 @@ class ufunc:
 
     def reduce(self, array, axis=0, dtype=None, out=None, keepdims=False,
                initial=None, where=True):
+        if self._pyfunc is not None:
+            return self._reduce_pyfunc(
+                array, axis, dtype, out, keepdims, initial, where)
         self._no_signature_method("reduce")
         if not self._ok or self.nin != 2:
             self._nope("reduce")
@@ -486,6 +653,116 @@ class ufunc:
                                  where_=where)
         _errstate.drain(self.__name__)
         return _maybe_scalar(res, out is None)
+
+    def _reduce_pyfunc(self, array, axis, dtype, out, keepdims,
+                       initial, where):
+        """Object reduction used by binary frompyfunc ufuncs."""
+        if self.nin != 2 or self.nout != 1:
+            self._nope("reduce")
+        if dtype is not None and _rnp.dtype(dtype).kind != "O":
+            from ._core._exceptions import _UFuncNoLoopError
+            raise _UFuncNoLoopError(
+                self, tuple([_rnp.dtype(object)] * self.nargs))
+        if isinstance(out, tuple):
+            out = out[0]
+
+        from . import asarray as _asarray
+        arr = _asarray(array, dtype=object)
+        ndim = arr.ndim
+        if axis is None:
+            axes = tuple(range(ndim))
+        elif isinstance(axis, tuple):
+            axes = tuple(axis)
+        else:
+            axes = (axis,)
+        normalized = []
+        for original in axes:
+            value = _operator.index(original)
+            value = value + ndim if value < 0 else value
+            if ndim == 0 and value in (0, -1):
+                value = 0
+            if value < 0 or value >= max(ndim, 1):
+                from .exceptions import AxisError
+                raise AxisError(
+                    f"axis {original} is out of bounds for array of dimension {ndim}")
+            if value in normalized:
+                raise ValueError("duplicate value in 'axis'")
+            normalized.append(value)
+        axes = tuple(normalized)
+        if len(axes) > 1 and not self._identity_set:
+            raise ValueError(
+                "reduction operation is not reorderable, so at most one axis may be specified")
+
+        if not axes:
+            res = arr.copy()
+            if out is not None:
+                out[...] = res
+                return out
+            return res
+
+        out_shape = tuple(
+            1 if keepdims and i in axes else dim
+            for i, dim in enumerate(arr.shape) if keepdims or i not in axes)
+        mask = _asarray(where, dtype=bool)
+        if mask.shape != arr.shape:
+            mask = _rnp.broadcast_to(mask, arr.shape)
+
+        def indices(shape):
+            size = 1
+            for dim in shape:
+                size *= dim
+            for flat in range(size):
+                index = [0] * len(shape)
+                rem = flat
+                for i in range(len(shape) - 1, -1, -1):
+                    index[i] = rem % shape[i]
+                    rem //= shape[i]
+                yield tuple(index)
+
+        groups = {index: [] for index in indices(out_shape)}
+        for index in indices(arr.shape):
+            if not bool(mask[index]):
+                continue
+            if keepdims:
+                key = tuple(0 if i in axes else value
+                            for i, value in enumerate(index))
+            else:
+                key = tuple(value for i, value in enumerate(index)
+                            if i not in axes)
+            groups[key].append(arr[index])
+
+        res = _rnp.empty(out_shape, dtype=object)
+        for index, values in groups.items():
+            if initial is not None:
+                acc = initial
+                rest = values
+            elif self._identity_set and self.identity is not None:
+                acc = self.identity
+                rest = values
+            elif values:
+                acc = values[0]
+                rest = values[1:]
+            else:
+                raise ValueError(
+                    f"zero-size array to reduction operation {self.__name__} "
+                    "which has no identity")
+            for value in rest:
+                acc = self._pyfunc(acc, value)
+            res[index] = acc
+
+        if out is not None:
+            if not isinstance(out, ndarray):
+                raise TypeError("return arrays must be of ArrayType")
+            if out.shape != out_shape:
+                raise ValueError("operands could not be broadcast together")
+            object_dtype = _rnp.dtype(object)
+            if not _rnp.can_cast(object_dtype, out.dtype, casting="same_kind"):
+                from ._core._exceptions import _UFuncOutputCastingError
+                raise _UFuncOutputCastingError(
+                    self, "same_kind", object_dtype, out.dtype, 0)
+            out[...] = res
+            return out
+        return _maybe_scalar(res, not keepdims and not out_shape)
 
     def accumulate(self, array, axis=0, dtype=None, out=None):
         self._no_signature_method("accumulate")
@@ -623,6 +900,28 @@ def _maybe_scalar(res, want_scalar):
     if want_scalar and isinstance(res, ndarray) and res.ndim == 0:
         return res[()]
     return res
+
+
+def frompyfunc(func, nin, nout, **kwargs):
+    """Create an object-loop ufunc from an arbitrary Python callable."""
+    identity = kwargs.pop("identity", _UNSET)
+    if kwargs:
+        name = next(iter(kwargs))
+        raise TypeError(f"'{name}' is an invalid keyword to frompyfunc")
+    if not callable(func):
+        raise TypeError("function must be callable")
+    nin = _operator.index(nin)
+    nout = _operator.index(nout)
+    if nin + nout > 64:
+        raise ValueError(
+            "Cannot construct a ufunc with more than 64 operands "
+            f"(requested number were: inputs = {nin} and outputs = {nout})")
+    identity_set = identity is not _UNSET
+    value = None if identity is _UNSET else identity
+    return ufunc._from_pyfunc(func, nin, nout, value, identity_set)
+
+
+frompyfunc.__text_signature__ = "(func, nin, nout, **kwargs)"
 
 
 #: numpy binds several names to the *same* ufunc object, so `np.acos is
