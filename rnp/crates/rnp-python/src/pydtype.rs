@@ -453,6 +453,27 @@ fn descr_from_tuple(t: &Bound<'_, PyTuple>, align: bool) -> PyResult<Descr> {
         }
     }
     let base = descr_from_any_aligned(&first, align)?;
+    if matches!(base.dt, DType::Bytes(0) | DType::Str(0) | DType::Void(0)) {
+        let count = second.extract::<i64>().map_err(|_| {
+            PyValueError::new_err("invalid itemsize in generic type tuple")
+        })?;
+        let byte_width = match base.dt {
+            DType::Str(0) => count.checked_mul(4),
+            _ => Some(count),
+        };
+        if count < 0 || byte_width.is_none_or(|n| n > i32::MAX as i64) {
+            return Err(PyValueError::new_err(
+                "invalid itemsize in generic type tuple",
+            ));
+        }
+        let sized = match base.dt {
+            DType::Bytes(0) => DType::Bytes(count as u32),
+            DType::Str(0) => DType::Str(count as u32),
+            DType::Void(0) => DType::Void(count as u32),
+            _ => unreachable!(),
+        };
+        return Ok(Descr::native(sized));
+    }
     let shape = shape_arg(&second)?;
     if shape.is_empty() {
         return Ok(base);

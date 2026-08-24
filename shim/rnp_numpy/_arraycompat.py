@@ -416,6 +416,9 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
         _size = dt.itemsize // (4 if dt.kind == "U" else 1) or None
         return _strcast.to_string_array(self, dt, dt.kind, _size)
     if dt.kind in "SU" and src.kind in "SU":
+        if (src.kind == "S" and dt.kind == "U" and dt.itemsize == 0
+                and src.itemsize > (2**31 - 1) // 4):
+            raise TypeError("string cast exceeds maximum fixed-width itemsize")
         from ._core import _strcast
         return _strcast.restring(self, dt)
     if dt.kind in "SU" and dt.itemsize == 0:

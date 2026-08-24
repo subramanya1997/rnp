@@ -888,6 +888,10 @@ fn parse_scalar_spec(s: &str) -> Option<Descr> {
         } else {
             tail.parse().ok()?
         };
+        let byte_width = if head == 'U' { n.checked_mul(4)? } else { n };
+        if byte_width > i32::MAX as u32 {
+            return None;
+        }
         let dt = match head {
             'S' => DType::Bytes(n),
             'U' => DType::Str(n),

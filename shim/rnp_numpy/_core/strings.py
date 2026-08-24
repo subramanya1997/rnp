@@ -980,7 +980,7 @@ def slice(a, start=None, stop=_NO_VALUE, step=None, /):
         step = 1
     for _i, _v in enumerate(_supplied, start=2):
         _dt = getattr(asarray(_v), "dtype", None)
-        if _dt is not None and _dt.kind in "SU":
+        if _dt is not None and _dt.kind in "SUT":
             from ._exceptions import _UFuncInputCastingError
             raise _UFuncInputCastingError(
                 _slice_ufunc, "same_kind", _dt, np.dtype(np.intp), _i)
