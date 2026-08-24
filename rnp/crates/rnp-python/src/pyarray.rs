@@ -1819,6 +1819,26 @@ impl PyNdArray {
         self.reduce(py, ReduceOp::Sum, axis, dtype, out, keepdims)
     }
 
+    #[pyo3(signature = (axis = None, dtype = None, out = None))]
+    fn cumsum<'py>(
+        slf: &Bound<'py, Self>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::accumulate(slf, "add", axis, dtype, out)
+    }
+
+    #[pyo3(signature = (axis = None, dtype = None, out = None))]
+    fn cumprod<'py>(
+        slf: &Bound<'py, Self>,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::accumulate(slf, "multiply", axis, dtype, out)
+    }
+
     #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false))]
     fn prod<'py>(
         &self,
@@ -2653,6 +2673,32 @@ fn as_i64(s: Scalar) -> i64 {
 }
 
 impl PyNdArray {
+    /// Shared native implementation of `cumsum` and `cumprod`.
+    ///
+    /// The ufunc accumulation entry point owns numpy's dtype promotion and
+    /// destination-casting rules. `axis=None` is the ndarray-method special
+    /// case: flatten in C order and accumulate along the resulting axis 0.
+    fn accumulate<'py>(
+        slf: &Bound<'py, Self>,
+        name: &str,
+        axis: Option<&Bound<'py, PyAny>>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        out: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        if axis.is_none_or(|a| a.is_none()) {
+            let arr = slf.borrow().arr.clone();
+            let flat = arr.reshape(&[arr.size() as isize]).map_err(crate::err)?;
+            let flat = PyNdArray::into_py_any(flat, py)?.into_bound(py).into_any();
+            return crate::ufuncs::_ufunc_accumulate(py, name, &flat, 0, dtype, out);
+        }
+        let axis = axis
+            .expect("checked above")
+            .extract::<isize>()
+            .map_err(|_| PyTypeError::new_err("an integer is required for the axis"))?;
+        crate::ufuncs::_ufunc_accumulate(py, name, slf.as_any(), axis, dtype, out)
+    }
+
     /// `all()`/`any()` over the whole array or one axis.
     fn bool_reduce<'py>(
         &self,
