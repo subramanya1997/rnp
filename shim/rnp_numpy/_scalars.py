@@ -666,30 +666,17 @@ def _install_operators(cls):
             def rev(self, other):
                 return _binary(name, other, self)
         else:
-            where = "scalar " + name
-
             # The defaults are keyword-only on purpose: `pow(a, b, m)` calls
             # `__pow__` with *three* positional arguments, and a plain default
             # would silently bind the modulus to the opcode. Keyword-only
             # keeps numpy's TypeError while still compiling to a LOAD_FAST.
-            def fwd(self, other, *, _c=code, _w=where):
+            def fwd(self, other, *, _c=code):
                 r = _sb2(_c, self, other)
-                if r is None:
-                    return NotImplemented
-                d, v, flags = r
-                if flags:
-                    # Frames: report, this method, the caller.
-                    _report_fpe(flags, _w, stacklevel=3)
-                return _WRAPS[d](v)
+                return NotImplemented if r is None else r
 
-            def rev(self, other, *, _c=code, _w=where):
+            def rev(self, other, *, _c=code):
                 r = _sb2(_c, other, self)
-                if r is None:
-                    return NotImplemented
-                d, v, flags = r
-                if flags:
-                    _report_fpe(flags, _w, stacklevel=3)
-                return _WRAPS[d](v)
+                return NotImplemented if r is None else r
 
         fwd.__name__ = f"__{op}__"
         rev.__name__ = f"__r{op}__"
@@ -732,10 +719,17 @@ def _install_operators(cls):
 def _make_numeric(name, spec, base, builtin=None, clsname=None):
     d = dtype(spec)
     ns = {
-        "__slots__": ("_v",),
+        "__slots__": ("_v",) if builtin is None else (),
         "dtype": d,
         "__module__": "numpy",
     }
+    if builtin is _builtins.float:
+        ns["_v"] = property(lambda self: _builtins.float.real.__get__(self))
+    elif builtin is _builtins.complex:
+        ns["_v"] = property(
+            lambda self: _builtins.complex(
+                _builtins.complex.real.__get__(self),
+                _builtins.complex.imag.__get__(self)))
     bases = (base,) if builtin is None else (base, builtin)
     # The type whose *exact* instances need no conversion at all: `float` for
     # the 8-byte floats, `complex` for the 16-byte complexes, `int` for the
@@ -765,16 +759,12 @@ def _make_numeric(name, spec, base, builtin=None, clsname=None):
             # trailing arguments the corresponding builtin accepts.
             if _raw is None:
                 if type(value) is _fast_type and not extra and not kw:
-                    self = builtin.__new__(cls, value)
-                    self._v = value
-                    return self
+                    return builtin.__new__(cls, value)
                 arr = _as_array_arg(cls, value, extra, kw)
                 if arr is not None:
                     return arr
             v = _raw if _raw is not None else _cast(cls, value, *extra, **kw)
-            self = builtin.__new__(cls, v)
-            self._v = v
-            return self
+            return builtin.__new__(cls, v)
     else:
         def __new__(cls, value=0, *extra, _raw=None, **kw):
             if _raw is None:
@@ -806,12 +796,32 @@ def _make_numeric(name, spec, base, builtin=None, clsname=None):
             return self
     else:
         def _wrap(value, _cls=cls, _new=builtin.__new__):
-            self = _new(_cls, value)
-            self._v = value
-            return self
+            return _new(_cls, value)
 
     cls._wrap = staticmethod(_wrap)
     _install_operators(cls)
+    # Storage aliases (`longlong`/`ulonglong`) must still return the canonical
+    # dtype class, so only install this on the first class registered for a
+    # given integer dtype.
+    if k in "iu" and d.name not in _SCALAR_BY_NAME:
+        _generic_add = cls.__add__
+        _lo, _hi = _INT_RANGE[d.name]
+        _modulus = 1 << (8 * d.itemsize)
+
+        def _same_type_add(self, other, *, _cls=cls, _fallback=_generic_add,
+                           _lo=_lo, _hi=_hi, _modulus=_modulus,
+                           _wrap=cls._wrap):
+            if type(self) is not _cls or type(other) is not _cls:
+                return _fallback(self, other)
+            value = self._v + other._v
+            if _lo <= value <= _hi:
+                return _wrap(value)
+            value = (value - _lo) % _modulus + _lo
+            _report_fpe(2, "scalar add", stacklevel=3)
+            return _wrap(value)
+
+        _same_type_add.__name__ = "__add__"
+        cls.__add__ = _same_type_add
     _install_numeric_extras(cls, d)
     _SCALAR_BY_NAME.setdefault(d.name, cls)
     # Lets the Rust fast path recognise an operand by its type pointer instead

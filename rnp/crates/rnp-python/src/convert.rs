@@ -179,6 +179,9 @@ pub fn npscalar_to_py<'py>(
             return r;
         }
     }
+    if let Some(result) = crate::ufuncs::native_builtin_scalar(py, dt, s) {
+        return result;
+    }
     if let Some(w) = crate::pydtype::scalar_wrap(py, dt) {
         return w.call1((scalar_to_py(py, s)?,));
     }

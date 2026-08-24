@@ -1170,9 +1170,9 @@ fn int_overflowed(op: BinOp, x: Scalar, y: Scalar, r: Scalar, dt: DType) -> bool
 // constructed `dtype` object inside a tuple. This path does none of that.
 // `rnp_core::ops::binary_scalar` runs the same element kernels over `Scalar`
 // values, operands are classified by *type pointer* against a registry the
-// shim fills in at class-creation time, and the result is `(code, value,
-// flags)` where `code` indexes a tuple of wrapper callables on the Python
-// side -- no `dtype` object is created at all.
+// shim fills in at class-creation time, and the result is constructed as its
+// final scalar object on the Rust side -- no temporary tuple or `dtype`
+// object is created at all.
 
 /// The dtypes a numpy scalar can have, in the order the shim's wrapper table
 /// uses. `_scalar_dtype_names()` hands the same order to Python.
@@ -1246,6 +1246,8 @@ const SCALAR_BINOP_NAMES: [&str; 18] = [
 /// is one pointer hash, which replaces two `getattr`s plus a downcast.
 static TYPE_REG: OnceLock<std::sync::RwLock<std::collections::HashMap<usize, DType>>> =
     OnceLock::new();
+static F64_CLASS: OnceLock<Py<PyAny>> = OnceLock::new();
+static C128_CLASS: OnceLock<Py<PyAny>> = OnceLock::new();
 /// The shim's `generic` base class, used only on the miss path.
 static GENERIC_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 
@@ -1258,7 +1260,58 @@ pub fn _register_scalar_class(cls: &Bound<'_, PyAny>, dtype: &Bound<'_, PyAny>) 
     let dt = dtype_from_any(dtype)?;
     let ptr = cls.as_ptr() as usize;
     type_reg().write().unwrap().insert(ptr, dt);
+    if dt == DType::F64 {
+        let _ = F64_CLASS.set(cls.clone().unbind());
+    } else if dt == DType::C128 {
+        let _ = C128_CLASS.set(cls.clone().unbind());
+    }
     Ok(())
+}
+
+/// Construct the two scalar types whose Python classes inherit their payload
+/// layout directly from CPython's `float`/`complex` objects.
+pub fn native_builtin_scalar<'py>(
+    py: Python<'py>,
+    dt: DType,
+    value: Scalar,
+) -> Option<PyResult<Bound<'py, PyAny>>> {
+    let cls = match dt {
+        DType::F64 => F64_CLASS.get(),
+        DType::C128 => C128_CLASS.get(),
+        _ => return None,
+    }?;
+    let ty = cls.bind(py).as_ptr().cast::<pyo3::ffi::PyTypeObject>();
+    // SAFETY: the registered F64/C128 classes are Python subclasses of
+    // `float`/`complex` with no additional instance slots. `tp_alloc`
+    // allocates their full `tp_basicsize` and initializes the object header;
+    // the remaining payload has exactly CPython's PyFloatObject or
+    // PyComplexObject layout. The returned new reference is transferred to
+    // `Bound`, and a null allocation is converted from the active exception.
+    Some(unsafe {
+        let Some(alloc) = (*ty).tp_alloc else {
+            return Some(Err(PyTypeError::new_err("scalar type has no allocator")));
+        };
+        let obj = alloc(ty, 0);
+        if obj.is_null() {
+            return Some(Err(PyErr::fetch(py)));
+        }
+        match (dt, value) {
+            (DType::F64, Scalar::Float(v)) => {
+                (*(obj as *mut pyo3::ffi::PyFloatObject)).ob_fval = v;
+            }
+            (DType::C128, Scalar::Complex(v)) => {
+                (*(obj as *mut pyo3::ffi::PyComplexObject)).cval = pyo3::ffi::Py_complex {
+                    real: v.re,
+                    imag: v.im,
+                };
+            }
+            _ => {
+                pyo3::ffi::Py_DECREF(obj);
+                return Some(Err(PyTypeError::new_err("invalid builtin scalar payload")));
+            }
+        }
+        Ok(Bound::from_owned_ptr(py, obj))
+    })
 }
 
 #[pyfunction]
@@ -1319,6 +1372,19 @@ fn classify(obj: &Bound<'_, PyAny>) -> PyResult<SOperand> {
         reg.get(&(obj.get_type().as_ptr() as usize)).copied()
     };
     if let Some(dt) = dt {
+        if dt == DType::F64 && obj.is_instance_of::<pyo3::types::PyFloat>() {
+            return Ok(SOperand::Strong(
+                dt,
+                Scalar::Float(obj.extract::<f64>()?),
+            ));
+        }
+        if dt == DType::C128 && obj.is_instance_of::<pyo3::types::PyComplex>() {
+            let c = obj.cast::<pyo3::types::PyComplex>()?;
+            return Ok(SOperand::Strong(
+                dt,
+                Scalar::Complex(num_complex::Complex::new(c.real(), c.imag())),
+            ));
+        }
         let v = obj.getattr(pyo3::intern!(obj.py(), "_v"))?;
         if let Some(s) = scalar_from_py(&v) {
             return Ok(SOperand::Strong(dt, s.cast(dt)));
@@ -1378,8 +1444,9 @@ fn unusable<'py>(
 
 /// `scalar OP scalar` with no allocation: the whole point of this module.
 ///
-/// Returns `(dtype_code, value, fp_flags)`, or `None` when Python should see
-/// `NotImplemented`.
+/// Returns the wrapped numpy scalar directly, or `None` when Python should
+/// see `NotImplemented`. Keeping result construction on this side avoids a
+/// temporary tuple and a second Python call through the dtype wrapper.
 #[pyfunction]
 pub fn _scalar_binop2<'py>(
     py: Python<'py>,
@@ -1432,23 +1499,28 @@ pub fn _scalar_binop2<'py>(
         // invariant is visible.
         value = value.cast(DType::F64);
     }
-    let dc = dtype_code(out_dt).ok_or_else(|| {
+    dtype_code(out_dt).ok_or_else(|| {
         PyValueError::new_err(format!(
             "scalar '{}' produced a {} result, which has no scalar class",
             op.name(),
             out_dt.name()
         ))
     })?;
+    if flags != 0 {
+        if let Some(reporter) = FPE_REPORTER.get() {
+            reporter
+                .bind(py)
+                .call1((flags, format!("scalar {}", op.name())))?;
+        }
+    }
+    if let Some(result) = native_builtin_scalar(py, out_dt, value) {
+        return Ok(Some(result?));
+    }
+    let wrap = crate::pydtype::scalar_wrap(py, out_dt).ok_or_else(|| {
+        PyValueError::new_err(format!("no scalar wrapper registered for {}", out_dt.name()))
+    })?;
     Ok(Some(
-        PyTuple::new(
-            py,
-            [
-                dc.into_pyobject(py)?.into_any(),
-                crate::convert::scalar_to_py(py, value)?,
-                flags.into_pyobject(py)?.into_any(),
-            ],
-        )?
-        .into_any(),
+        wrap.call1((crate::convert::scalar_to_py(py, value)?,))?,
     ))
 }
 
