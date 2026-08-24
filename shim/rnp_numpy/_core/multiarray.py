@@ -14,6 +14,7 @@ from .. import (  # noqa: F401
     empty,
     flatiter,
     flatnonzero,
+    frombuffer,
     full,
     ndarray,
     nonzero,
@@ -38,7 +39,7 @@ def _get_ndarray_c_version():
 
 
 def _reconstruct(subtype, shape, dtype_):
-    return ndarray.__new__(subtype) if False else empty(shape, dtype_)
+    return ndarray.__new__(subtype, shape, dtype_)
 
 
 dot = not_implemented("numpy._core.multiarray.dot")
@@ -67,7 +68,6 @@ datetime_data = not_implemented("numpy._core.multiarray.datetime_data")
 busday_count = not_implemented("numpy._core.multiarray.busday_count")
 busday_offset = not_implemented("numpy._core.multiarray.busday_offset")
 is_busday = not_implemented("numpy._core.multiarray.is_busday")
-frombuffer = not_implemented("numpy._core.multiarray.frombuffer")
 fromfile = not_implemented("numpy._core.multiarray.fromfile")
 fromiter = not_implemented("numpy._core.multiarray.fromiter")
 fromstring = not_implemented("numpy._core.multiarray.fromstring")

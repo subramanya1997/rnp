@@ -30,6 +30,7 @@ from _rnp import (
     equal,
     flatiter,
     flatnonzero,
+    frombuffer,
     full,
     greater,
     greater_equal,
@@ -218,7 +219,9 @@ def _string_fill_fallback(exc, dtype, obj):
 
 def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
           like=None):
-    _copy = False if copy is None else copy
+    # `copy` is numpy 2.x's tri-state and the engine understands all three:
+    # True always copies, False refuses to, None copies only when it must.
+    _copy = copy
     if isinstance(dtype, str) and dtype in _CHAR_TYPECODES:
         obj, dtype = _char_typecode_elements(obj), "S1"
     try:
@@ -745,7 +748,18 @@ def indices(dimensions, dtype=int_):
 
 
 def isscalar(x):
-    return isinstance(x, (int, float, complex, str, bytes, _builtins.bool))
+    """numpy's rule: a numpy scalar, one of `ScalarType`, or a `numbers.Number`.
+
+    An `ndarray` is never a scalar -- not even a 0-d one.
+    """
+    import numbers
+    if isinstance(x, ndarray):
+        return False
+    if isinstance(x, generic):
+        return True
+    return (type(x) in (int, float, complex, _builtins.bool, bytes, str,
+                        memoryview, _builtins.bytearray)
+            or isinstance(x, numbers.Number))
 
 
 class iinfo:

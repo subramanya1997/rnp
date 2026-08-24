@@ -13,10 +13,29 @@ use std::ptr::NonNull;
 /// and leaves room for future SIMD inner loops.
 pub const ALLOC_ALIGN: usize = 64;
 
+/// Keep-alive token for memory this process did not allocate.
+///
+/// `rnp-core` has no idea what a Python object is, so a `Buffer` that wraps
+/// foreign memory carries an opaque owner instead. Dropping the owner is what
+/// releases the exporter's claim (for the PyO3 binding that is a `Py<PyAny>`
+/// being decref'd, plus whatever `Py_buffer` bookkeeping goes with it).
+///
+/// Implementors must guarantee that the address range handed to
+/// [`Buffer::from_foreign`] stays valid, and stays at that address, for as
+/// long as the owner value is alive.
+pub trait ForeignOwner: Send + Sync {}
+
+enum Backing {
+    /// Allocated by us with this layout; freed on drop.
+    Owned(Layout),
+    /// Someone else's memory; `_owner` keeps it alive and drops last.
+    Foreign(Box<dyn ForeignOwner>),
+}
+
 pub struct Buffer {
     ptr: NonNull<u8>,
     len: usize,
-    layout: Layout,
+    backing: Backing,
 }
 
 // SAFETY: `Buffer` owns a unique heap allocation and exposes no interior
@@ -38,7 +57,7 @@ impl Buffer {
         // SAFETY: `layout` has non-zero size (>= ALLOC_ALIGN) and valid align.
         let raw = unsafe { alloc_zeroed(layout) };
         let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-        Buffer { ptr, len, layout }
+        Buffer { ptr, len, backing: Backing::Owned(layout) }
     }
 
     /// Allocate `len` uninitialised bytes. Callers must write every byte that
@@ -48,7 +67,7 @@ impl Buffer {
         // SAFETY: `layout` has non-zero size (>= ALLOC_ALIGN) and valid align.
         let raw = unsafe { alloc(layout) };
         let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-        Buffer { ptr, len, layout }
+        Buffer { ptr, len, backing: Backing::Owned(layout) }
     }
 
     /// Allocate and copy `bytes`.
@@ -60,6 +79,31 @@ impl Buffer {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.ptr.as_ptr(), bytes.len());
         }
         buf
+    }
+
+    /// Wrap `len` bytes starting at `ptr` that some other runtime owns.
+    ///
+    /// # Safety
+    /// The caller must guarantee that, for as long as `owner` is alive:
+    /// * `ptr` is non-null and `[ptr, ptr+len)` is a single valid, readable
+    ///   allocation, and
+    /// * the allocation is never moved, freed, or shrunk.
+    ///
+    /// Dropping the returned `Buffer` drops `owner` and nothing else — the
+    /// memory is emphatically *not* freed here.
+    pub unsafe fn from_foreign(
+        ptr: *mut u8,
+        len: usize,
+        owner: Box<dyn ForeignOwner>,
+    ) -> Buffer {
+        let ptr = NonNull::new(ptr).expect("foreign buffer pointer must be non-null");
+        Buffer { ptr, len, backing: Backing::Foreign(owner) }
+    }
+
+    /// True when the bytes belong to a foreign exporter (numpy's `OWNDATA`
+    /// is the negation of this for a base array).
+    pub fn is_foreign(&self) -> bool {
+        matches!(self.backing, Backing::Foreign(_))
     }
 
     pub fn len(&self) -> usize {
@@ -92,8 +136,15 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        // SAFETY: `ptr` came from `alloc`/`alloc_zeroed` with exactly `layout`.
-        unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+        match &self.backing {
+            // SAFETY: `ptr` came from `alloc`/`alloc_zeroed` with exactly this
+            // layout, and this is the sole owner (an `Arc<Buffer>` reaching
+            // refcount zero), so nothing can observe the freed memory.
+            Backing::Owned(layout) => unsafe { dealloc(self.ptr.as_ptr(), *layout) },
+            // The exporter owns the bytes; dropping `self.backing` drops the
+            // keep-alive token, which is the only release we are allowed to do.
+            Backing::Foreign(_) => {}
+        }
     }
 }
 
@@ -126,5 +177,94 @@ mod tests {
     fn from_bytes_round_trips() {
         let b = Buffer::from_bytes(&[1, 2, 3, 4]);
         assert_eq!(b.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    // ---- foreign (adopted) buffers -------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Stands in for the Python object that guarantees adopted memory: it owns
+    /// the allocation and records that it was released exactly once.
+    struct TestOwner {
+        data: Vec<u8>,
+        released: Arc<AtomicUsize>,
+    }
+
+    impl ForeignOwner for TestOwner {}
+
+    impl Drop for TestOwner {
+        fn drop(&mut self) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn adopt(released: &Arc<AtomicUsize>, bytes: &[u8]) -> Buffer {
+        let mut owner = Box::new(TestOwner {
+            data: bytes.to_vec(),
+            released: Arc::clone(released),
+        });
+        let ptr = owner.data.as_mut_ptr();
+        let len = owner.data.len();
+        // SAFETY: `owner` owns the `Vec` the pointer came from and is moved
+        // into the `Buffer`, so the allocation outlives every use of `ptr`;
+        // a boxed `Vec`'s heap buffer does not move when the `Box` moves.
+        unsafe { Buffer::from_foreign(ptr, len, owner) }
+    }
+
+    #[test]
+    fn foreign_buffer_reads_the_owners_bytes_and_never_frees_them() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let buf = adopt(&released, &[9, 8, 7, 6]);
+        assert!(buf.is_foreign());
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf.as_slice(), &[9, 8, 7, 6]);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(buf);
+        // Dropping the buffer released the owner exactly once — and the owner,
+        // not the buffer, is what freed the bytes.
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn every_view_keeps_the_owner_alive() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(adopt(&released, &[1, 2, 3, 4, 5, 6, 7, 8]));
+        // Two `NdArray` headers sharing the allocation, as views do.
+        let view_a = Arc::clone(&shared);
+        let view_b = Arc::clone(&shared);
+        drop(shared);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(view_a);
+        assert_eq!(released.load(Ordering::SeqCst), 0, "one view still lives");
+        assert_eq!(view_b.as_slice()[7], 8, "bytes are still readable");
+        drop(view_b);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn writes_through_a_foreign_buffer_reach_the_owner() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let buf = adopt(&released, &[0; 4]);
+        // SAFETY: sole owner, write is within `len()`.
+        unsafe { *buf.as_mut_ptr().add(2) = 0x5a };
+        assert_eq!(buf.as_slice(), &[0, 0, 0x5a, 0]);
+    }
+
+    #[test]
+    fn a_zero_length_foreign_buffer_is_legal() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let buf = adopt(&released, &[]);
+        assert!(buf.is_empty());
+        assert_eq!(buf.as_slice(), &[] as &[u8]);
+        drop(buf);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owned_buffers_are_not_foreign() {
+        assert!(!Buffer::zeroed(8).is_foreign());
+        assert!(!Buffer::uninitialized(8).is_foreign());
+        assert!(!Buffer::from_bytes(&[1]).is_foreign());
     }
 }
