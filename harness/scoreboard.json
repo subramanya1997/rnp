@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T20:24:17.402361+00:00",
-  "overall_passed": 32696,
+  "timestamp": "2026-08-24T22:36:51.407634+00:00",
+  "overall_passed": 33065,
   "overall_total": 35345,
   "files": [
     {
@@ -45,8 +45,8 @@
     },
     {
       "file": "test_array_coercion.py",
-      "passed": 104,
-      "failed": 121,
+      "passed": 107,
+      "failed": 118,
       "errors": 0,
       "skipped": 0,
       "total": 225
@@ -77,8 +77,8 @@
     },
     {
       "file": "test_arrayprint.py",
-      "passed": 112,
-      "failed": 20,
+      "passed": 113,
+      "failed": 19,
       "errors": 0,
       "skipped": 2,
       "total": 134
@@ -173,8 +173,8 @@
     },
     {
       "file": "test_dtype.py",
-      "passed": 991,
-      "failed": 173,
+      "passed": 1033,
+      "failed": 131,
       "errors": 0,
       "skipped": 4,
       "total": 1168
@@ -253,8 +253,8 @@
     },
     {
       "file": "test_indexing.py",
-      "passed": 76,
-      "failed": 30,
+      "passed": 77,
+      "failed": 29,
       "errors": 0,
       "skipped": 0,
       "total": 106
@@ -309,8 +309,8 @@
     },
     {
       "file": "test_multiarray.py",
-      "passed": 13415,
-      "failed": 852,
+      "passed": 13423,
+      "failed": 844,
       "errors": 0,
       "skipped": 5,
       "total": 14272,
@@ -326,16 +326,16 @@
     },
     {
       "file": "test_multithreading.py",
-      "passed": 27,
-      "failed": 7,
+      "passed": 28,
+      "failed": 6,
       "errors": 0,
       "skipped": 0,
       "total": 34
     },
     {
       "file": "test_nditer.py",
-      "passed": 835,
-      "failed": 95,
+      "passed": 869,
+      "failed": 61,
       "errors": 0,
       "skipped": 2,
       "total": 932
@@ -398,8 +398,8 @@
     },
     {
       "file": "test_regression.py",
-      "passed": 334,
-      "failed": 85,
+      "passed": 336,
+      "failed": 83,
       "errors": 0,
       "skipped": 3,
       "total": 422
@@ -478,24 +478,24 @@
     },
     {
       "file": "test_stringdtype.py",
-      "passed": 2903,
-      "failed": 41,
+      "passed": 2904,
+      "failed": 40,
       "errors": 0,
       "skipped": 4,
       "total": 2948
     },
     {
       "file": "test_strings.py",
-      "passed": 2007,
-      "failed": 8,
+      "passed": 2015,
+      "failed": 0,
       "errors": 0,
       "skipped": 51,
       "total": 2066
     },
     {
       "file": "test_ufunc.py",
-      "passed": 385,
-      "failed": 482,
+      "passed": 653,
+      "failed": 214,
       "errors": 0,
       "skipped": 8,
       "total": 875

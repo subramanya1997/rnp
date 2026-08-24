@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T20:34:50.030640+00:00",
-  "overall_passed": 4081,
+  "timestamp": "2026-08-24T22:47:35.957068+00:00",
+  "overall_passed": 4098,
   "overall_total": 4352,
   "files": [
     {
@@ -13,8 +13,8 @@
     },
     {
       "file": "ma/test_core.py",
-      "passed": 4005,
-      "failed": 164,
+      "passed": 4016,
+      "failed": 153,
       "errors": 0,
       "skipped": 3,
       "total": 4172
@@ -29,8 +29,8 @@
     },
     {
       "file": "ma/test_extras.py",
-      "passed": 53,
-      "failed": 50,
+      "passed": 58,
+      "failed": 45,
       "errors": 0,
       "skipped": 0,
       "total": 103
@@ -53,8 +53,8 @@
     },
     {
       "file": "ma/test_regression.py",
-      "passed": 8,
-      "failed": 5,
+      "passed": 9,
+      "failed": 4,
       "errors": 0,
       "skipped": 0,
       "total": 13
