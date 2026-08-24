@@ -217,6 +217,26 @@ def _string_fill_fallback(exc, dtype, obj):
         return None
 
 
+def _text_scalar(obj, dtype):
+    """numpy reads a `bytes`/`str` argument as a *string scalar*, not as memory.
+
+    `np.array(b"1.0", np.float64)` is `1.0` -- the text is parsed, whitespace
+    and all -- whereas `np.frombuffer(b"1.0", np.float64)` reinterprets the
+    same three bytes as raw storage.  numpy gets there by building the 0-d
+    string array first and casting it; so does this.
+
+    Returns the cast array, or None when `obj` is not text, no dtype was
+    requested, or the requested dtype is itself a string/void/object dtype --
+    in all of which cases the normal path is already right.
+    """
+    if not isinstance(obj, (bytes, str)) or dtype is None:
+        return None
+    dt = _rnp.dtype(dtype)
+    if dt.kind in "USVO":
+        return None
+    return _rnp_array(obj, None).astype(dt)
+
+
 def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
           like=None):
     # `copy` is numpy 2.x's tri-state and the engine understands all three:
@@ -224,6 +244,9 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
     _copy = copy
     if isinstance(dtype, str) and dtype in _CHAR_TYPECODES:
         obj, dtype = _char_typecode_elements(obj), "S1"
+    _text = _text_scalar(obj, dtype)
+    if _text is not None:
+        obj, dtype, _copy = _text, None, False
     try:
         res = _rnp_array(obj, dtype, copy=_copy)
     except TypeError as exc:
@@ -279,6 +302,9 @@ _rnp_asarray = asarray
 
 
 def asarray(obj, dtype=None):
+    _text = _text_scalar(obj, dtype)
+    if _text is not None:
+        return _text
     try:
         return _rnp_asarray(obj, dtype)
     except TypeError as exc:

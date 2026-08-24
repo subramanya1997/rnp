@@ -708,3 +708,201 @@ mod tests {
         assert_eq!(offset_bounds(8, &[2, 2], &[16, 8]), (0, 32));
     }
 }
+
+// ---------------------------------------------------------------------------
+// PEP 3118: adopting any buffer-exporting object with its own dtype
+// ---------------------------------------------------------------------------
+
+/// A `Py_buffer` read out in full: everything numpy's `_array_from_buffer_3118`
+/// needs, copied into owned values so the view can be released immediately.
+struct Pep3118 {
+    ptr: *mut u8,
+    len: usize,
+    writable: bool,
+    itemsize: usize,
+    format: Option<String>,
+    shape: Vec<isize>,
+    strides: Vec<isize>,
+}
+
+/// Ask `obj` for a strided, format-annotated buffer, preferring a writable one.
+///
+/// Returns `Ok(None)` when `obj` does not export a buffer at all (no exception
+/// is left set), which is how the caller decides to try the next conversion.
+fn request_pep3118(obj: &Bound<'_, PyAny>) -> PyResult<Option<Pep3118>> {
+    let mut view = std::mem::MaybeUninit::<ffi::Py_buffer>::zeroed();
+    // PyBUF_FORMAT may not be combined with PyBUF_SIMPLE, so ask for strides.
+    let want = ffi::PyBUF_STRIDES | ffi::PyBUF_FORMAT;
+    // SAFETY: `obj` is a live Python object; `view` is a correctly-sized,
+    // writable `Py_buffer` slot we own. A return of 0 means the view was
+    // filled in and must be released exactly once — the `PyBuffer_Release`
+    // below is the only release, and it runs on the single success path.
+    let (rc, writable) = unsafe {
+        let rc =
+            ffi::PyObject_GetBuffer(obj.as_ptr(), view.as_mut_ptr(), want | ffi::PyBUF_WRITABLE);
+        if rc == 0 {
+            (0, true)
+        } else {
+            ffi::PyErr_Clear();
+            (ffi::PyObject_GetBuffer(obj.as_ptr(), view.as_mut_ptr(), want), false)
+        }
+    };
+    if rc != 0 {
+        // Not a buffer exporter (or not one that can satisfy this request).
+        // SAFETY: `rc != 0` guarantees an exception is set and the view was
+        // not filled in, so there is nothing to release.
+        unsafe { ffi::PyErr_Clear() };
+        return Ok(None);
+    }
+    // SAFETY: `rc == 0`, so every field of the view is initialised. Each
+    // pointer is read into an owned value before the single release below.
+    let out = unsafe {
+        let v = view.assume_init_mut();
+        let ndim = v.ndim.max(0) as usize;
+        let shape = if v.shape.is_null() {
+            vec![v.len as isize / (v.itemsize.max(1)) as isize]
+        } else {
+            (0..ndim).map(|i| *v.shape.add(i) as isize).collect()
+        };
+        let strides = if v.strides.is_null() {
+            c_strides(&shape, v.itemsize as usize)
+        } else {
+            (0..ndim).map(|i| *v.strides.add(i) as isize).collect()
+        };
+        let format = if v.format.is_null() {
+            None
+        } else {
+            std::ffi::CStr::from_ptr(v.format)
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        };
+        let out = Pep3118 {
+            ptr: v.buf as *mut u8,
+            len: v.len as usize,
+            writable,
+            itemsize: v.itemsize as usize,
+            format,
+            shape,
+            strides,
+        };
+        ffi::PyBuffer_Release(v);
+        out
+    };
+    Ok(Some(out))
+}
+
+/// Map a PEP-3118 format string to the numpy typestr for that element.
+///
+/// `itemsize` disambiguates the codes whose width is platform-defined
+/// (`l`/`L`/`n`/`N`), exactly as numpy does when it reads a buffer.
+fn typestr_from_format(format: Option<&str>, itemsize: usize) -> Option<String> {
+    // A buffer requested without PyBUF_FORMAT reports unsigned bytes.
+    let f = format.unwrap_or("B");
+    let mut chars = f.chars().peekable();
+    let order = match chars.peek() {
+        Some('<') => {
+            chars.next();
+            "<"
+        }
+        Some('>') | Some('!') => {
+            chars.next();
+            ">"
+        }
+        Some('=') | Some('@') => {
+            chars.next();
+            "="
+        }
+        _ => "=",
+    };
+    let rest: String = chars.collect();
+    let by_size = |i: usize| i.to_string();
+    let code = match rest.as_str() {
+        "?" => "b1".to_string(),
+        "b" => "i1".to_string(),
+        "B" => "u1".to_string(),
+        "h" => "i2".to_string(),
+        "H" => "u2".to_string(),
+        "i" => "i4".to_string(),
+        "I" => "u4".to_string(),
+        // Platform-width codes. The letter carries numpy's C-type alias as
+        // well as the width (`array.array('q')` is `longlong`, which reprs
+        // differently from the same-sized `long`), so it is passed through
+        // verbatim whenever the exporter's itemsize agrees with the platform
+        // width; otherwise only the width can be honoured.
+        "l" | "q" | "n" | "L" | "Q" | "N" => {
+            if itemsize == std::mem::size_of::<i64>() {
+                rest.clone()
+            } else if rest.chars().next().is_some_and(|c| c.is_lowercase()) {
+                format!("i{}", by_size(itemsize))
+            } else {
+                format!("u{}", by_size(itemsize))
+            }
+        }
+        "e" => "f2".to_string(),
+        "f" => "f4".to_string(),
+        "d" => "f8".to_string(),
+        "Ze" => "c4".to_string(),
+        "Zf" => "c8".to_string(),
+        "Zd" => "c16".to_string(),
+        "c" => "S1".to_string(),
+        // Anything else (long double, structs, object pointers, repeat
+        // counts) is not something this port can adopt; the caller falls
+        // back to its normal conversion rather than guessing.
+        _ => return None,
+    };
+    Some(format!("{order}{code}"))
+}
+
+/// numpy's last conversion step before "treat it as a sequence": wrap any
+/// buffer-exporting object, taking the dtype from the buffer's own format.
+///
+/// `bytes` and `str` are deliberately excluded. numpy treats them as *string
+/// scalars* -- `np.array(b"1.0", np.float64)` parses the text and yields
+/// `1.0`, it does not reinterpret the three characters as three numbers --
+/// and only `np.frombuffer` reads a `bytes` object as raw memory.
+pub fn from_buffer_protocol(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Option<PyNdArray>> {
+    if obj.is_instance_of::<pyo3::types::PyBytes>()
+        || obj.is_instance_of::<pyo3::types::PyString>()
+    {
+        return Ok(None);
+    }
+    let Some(info) = request_pep3118(obj)? else {
+        return Ok(None);
+    };
+    let Some(typestr) = typestr_from_format(info.format.as_deref(), info.itemsize) else {
+        return Ok(None);
+    };
+    let descr = descr_from_any(pyo3::types::PyString::new(py, &typestr).as_any())?;
+
+    // Same lifetime rule as `frombuffer`: an exporter with a release slot has
+    // its export held by a `memoryview`, everything else is held directly.
+    let keep = if has_release_buffer(obj) {
+        pyo3::types::PyMemoryView::from(obj)?.into_any()
+    } else {
+        obj.clone()
+    };
+    let raw = RawBuf {
+        ptr: info.ptr,
+        len: info.len,
+        writable: info.writable,
+    };
+    let mut arr = NdArray {
+        buffer: adopt(&raw, &keep),
+        byte_offset: 0,
+        shape: info.shape,
+        strides: info.strides,
+        descr,
+        flags: Flags::default(),
+    };
+    set_layout_flags(&mut arr);
+    arr.flags.writeable = info.writable;
+    arr.flags.owndata = false;
+    Ok(Some(PyNdArray {
+        arr,
+        base: Some(keep.unbind()),
+    }))
+}
