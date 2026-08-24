@@ -50,7 +50,10 @@ def asarray(obj, dtype=None):
         if obj.dtype == want:
             return obj
         return astype(obj, want)
-    return np.array(obj, dtype=dtype, copy=False)
+    # numpy 2.x changed `copy=False` from "avoid a copy if you can" to "raise
+    # if a copy would be needed"; `asarray` is the spelling that still means
+    # the former, and is what numpy's own migration guide points at.
+    return np.asarray(obj, dtype=dtype)
 
 
 def _shape(a):
