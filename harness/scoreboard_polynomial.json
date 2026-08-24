@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T19:39:28.268634+00:00",
-  "overall_passed": 486,
+  "timestamp": "2026-08-24T19:41:59.811774+00:00",
+  "overall_passed": 583,
   "overall_total": 610,
   "files": [
     {
@@ -13,8 +13,8 @@
     },
     {
       "file": "polynomial/test_classes.py",
-      "passed": 141,
-      "failed": 102,
+      "passed": 231,
+      "failed": 12,
       "errors": 0,
       "skipped": 0,
       "total": 243
@@ -69,16 +69,16 @@
     },
     {
       "file": "polynomial/test_printing.py",
-      "passed": 75,
-      "failed": 3,
+      "passed": 78,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 78
     },
     {
       "file": "polynomial/test_symbol.py",
-      "passed": 48,
-      "failed": 4,
+      "passed": 52,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 52

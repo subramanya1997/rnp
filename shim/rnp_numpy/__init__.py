@@ -307,6 +307,14 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
             res = _ac.array_none_fallback(obj, dtype)
         elif hasattr(type(obj), "__array__"):
             res = _ac.array_from_protocol(obj, dtype, copy, exc)
+        elif (dtype is None
+              and ("unsupported element type in array()" in str(exc)
+                   or not isinstance(obj, (list, tuple)))):
+            # NumPy boxes arbitrary Python values (Decimal, Fraction,
+            # polynomial instances, user objects) into object arrays when no
+            # dtype was requested.  The numeric engine deliberately rejects
+            # them, so build the object slab at this Python boundary.
+            res = _ac._object_array(obj)
         else:
             from . import _textparse as _tp
             parsed = (_tp.parse_text(obj, dtype if dtype is None
@@ -398,6 +406,10 @@ def asarray(obj, dtype=None, order=None, *, device=None, copy=None, like=None):
             return _arraycompat_mod().array_from_protocol(
                 obj, dtype, False, exc
             )
+        if (dtype is None
+                and ("unsupported element type in array()" in str(exc)
+                     or not isinstance(obj, (list, tuple)))):
+            return _ac._object_array(obj)
         if _NESTED_NDARRAY_MSG not in str(exc) or not isinstance(
             obj, (list, tuple)
         ):
@@ -508,7 +520,15 @@ class _CopyMode(_enum.Enum):
 def issubdtype(arg1, arg2):
     """numpy's `issubdtype`, over the abstract scalar hierarchy above."""
     if not isinstance(arg1, type) or not issubclass(arg1, generic):
-        arg1 = dtype(arg1).type
+        try:
+            arg1 = dtype(arg1).type
+        except TypeError:
+            # Arbitrary Python *classes* are valid questions and simply are
+            # not NumPy scalar subtypes.  Instances retain NumPy's dtype
+            # interpretation error.
+            if isinstance(arg1, type):
+                return False
+            raise
     if not isinstance(arg2, type) or not issubclass(arg2, generic):
         try:
             arg2 = dtype(arg2).type
