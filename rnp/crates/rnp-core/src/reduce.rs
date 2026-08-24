@@ -14,7 +14,7 @@
 
 use crate::array::NdArray;
 use crate::dtype::{DType, Kind};
-use crate::element::{Element, Scalar, C32, C64v, F16};
+use crate::element::{C64v, Element, Scalar, C32, F16};
 use crate::error::{Error, Result};
 use crate::ops::Arith;
 
@@ -105,8 +105,9 @@ macro_rules! pairwise_float {
         unsafe fn $name(a: *const u8, n: usize, stride: isize) -> $acc {
             let load = |i: usize| -> $acc {
                 // SAFETY: caller guarantees element `i` is in bounds.
-                let v: $store =
-                    unsafe { std::ptr::read_unaligned(a.offset(i as isize * stride) as *const $store) };
+                let v: $store = unsafe {
+                    std::ptr::read_unaligned(a.offset(i as isize * stride) as *const $store)
+                };
                 #[allow(clippy::redundant_closure_call)]
                 $load(v)
             };
@@ -190,9 +191,7 @@ macro_rules! pairwise_complex {
         unsafe fn $name(a: *const u8, n: usize, stride: isize) -> ($ftype, $ftype) {
             let re = |i: usize| -> $ftype {
                 // SAFETY: caller guarantees the component is in bounds.
-                unsafe {
-                    std::ptr::read_unaligned(a.offset(i as isize * stride) as *const $ftype)
-                }
+                unsafe { std::ptr::read_unaligned(a.offset(i as isize * stride) as *const $ftype) }
             };
             let im = |i: usize| -> $ftype {
                 // SAFETY: as above; the imaginary part follows the real one.
@@ -214,16 +213,7 @@ macro_rules! pairwise_complex {
                 return (rr, ri);
             }
             if n <= PW_BLOCKSIZE {
-                let mut r: [$ftype; 8] = [
-                    re(0),
-                    im(0),
-                    re(2),
-                    im(2),
-                    re(4),
-                    im(4),
-                    re(6),
-                    im(6),
-                ];
+                let mut r: [$ftype; 8] = [re(0), im(0), re(2), im(2), re(4), im(4), re(6), im(6)];
                 let mut i = 8usize;
                 while i < n - (n % 8) {
                     r[0] += re(i);
@@ -402,9 +392,7 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
         }
         d if d.is_unsigned() => {
             let mut acc = 0u64;
-            if stride == d.itemsize() as isize
-                && (p as usize) % d.alignment().max(1) == 0
-            {
+            if stride == d.itemsize() as isize && (p as usize) % d.alignment().max(1) == 0 {
                 crate::dispatch_dtype!(d, T, {
                     // SAFETY: `n` contiguous, aligned, in-bounds elements.
                     let s: &[T] = unsafe { std::slice::from_raw_parts(p as *const T, n) };
@@ -425,8 +413,9 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
             crate::dispatch_dtype!(d, T, {
                 for i in 0..n {
                     // SAFETY: in-bounds by the caller's contract.
-                    let v: T =
-                        unsafe { std::ptr::read_unaligned(p.offset(i as isize * stride) as *const T) };
+                    let v: T = unsafe {
+                        std::ptr::read_unaligned(p.offset(i as isize * stride) as *const T)
+                    };
                     acc = acc.wrapping_add(match v.to_scalar() {
                         Scalar::Uint(u) => u,
                         Scalar::Int(x) => x as u64,
@@ -439,9 +428,7 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
         }
         d => {
             let mut acc = 0i64;
-            if stride == d.itemsize() as isize
-                && (p as usize) % d.alignment().max(1) == 0
-            {
+            if stride == d.itemsize() as isize && (p as usize) % d.alignment().max(1) == 0 {
                 crate::dispatch_dtype!(d, T, {
                     // SAFETY: `n` contiguous, aligned, in-bounds elements.
                     let s: &[T] = unsafe { std::slice::from_raw_parts(p as *const T, n) };
@@ -462,8 +449,9 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
             crate::dispatch_dtype!(d, T, {
                 for i in 0..n {
                     // SAFETY: in-bounds by the caller's contract.
-                    let v: T =
-                        unsafe { std::ptr::read_unaligned(p.offset(i as isize * stride) as *const T) };
+                    let v: T = unsafe {
+                        std::ptr::read_unaligned(p.offset(i as isize * stride) as *const T)
+                    };
                     acc = acc.wrapping_add(match v.to_scalar() {
                         Scalar::Int(x) => x,
                         Scalar::Uint(u) => u as i64,
@@ -563,7 +551,20 @@ macro_rules! extreme_by_cmp {
         }
     )*};
 }
-extreme_by_cmp!(i8, i16, i32, i64, u8, u16, u32, u64, crate::element::NpBool, F16, C32, C64v);
+extreme_by_cmp!(
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64,
+    crate::element::NpBool,
+    F16,
+    C32,
+    C64v
+);
 
 macro_rules! extreme_by_intrinsic {
     ($($t:ty),*) => {$(
@@ -628,7 +629,11 @@ where
     let mut acc = r[0];
     let mut saw_nan = nan[0];
     for k in 1..LANES {
-        acc = if want_max { acc.omax(r[k]) } else { acc.omin(r[k]) };
+        acc = if want_max {
+            acc.omax(r[k])
+        } else {
+            acc.omin(r[k])
+        };
         saw_nan |= nan[k];
     }
     for &v in tail {
@@ -745,9 +750,7 @@ unsafe fn sum_run_masked(
             i += 1;
         }
         // SAFETY: a sub-range of the caller's run, so still in bounds.
-        acc = acc.add(unsafe {
-            sum_run(arr, off + start as isize * stride, i - start, stride)
-        });
+        acc = acc.add(unsafe { sum_run(arr, off + start as isize * stride, i - start, stride) });
     }
     acc
 }
@@ -959,7 +962,10 @@ fn sum_all_nditer(arr: &NdArray, mut acc: Acc) -> Acc {
     };
     let mut filled = 0usize;
     for off in crate::iter::offsets(&shape, &strides, arr.byte_offset) {
-        tmp.write_raw_at(tmp.byte_offset + (filled * isz) as isize, arr.raw_bytes_at(off));
+        tmp.write_raw_at(
+            tmp.byte_offset + (filled * isz) as isize,
+            arr.raw_bytes_at(off),
+        );
         filled += 1;
         if filled == chunk {
             // SAFETY: `tmp` holds `chunk` contiguous elements of this dtype.
@@ -1066,6 +1072,13 @@ fn reduce_all_native(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Resul
         }
         ReduceOp::Prod => {
             let out_dt = reduce_dtype(op, arr.dtype());
+            if out_dt == DType::F16 {
+                let mut acc = seed.map_or(1.0f32, |s| s.as_f64() as f32);
+                for off in crate::iter::offsets(&arr.shape, &arr.strides, arr.byte_offset) {
+                    acc *= arr.read_at(off).as_f64() as f32;
+                }
+                return Ok(Scalar::Float(F16::from_f32(acc).to_f64()));
+            }
             let mut acc = seed.unwrap_or(Scalar::Int(1)).cast(out_dt);
             crate::dispatch_dtype!(out_dt, A, {
                 let mut a = A::from_scalar(acc);
@@ -1160,6 +1173,291 @@ pub fn reduce_axis(arr: &NdArray, axis: usize, op: ReduceOp, keepdims: bool) -> 
     reduce_axis_with(arr, axis, op, keepdims, ReduceOpts::default())
 }
 
+/// Reduce several axes with the same single-axis kernels numpy uses.
+///
+/// Axes are collapsed from highest to lowest so their original numbers stay
+/// valid. Reducing every axis is one whole-array collapse: for floating sums
+/// this matters because numpy coalesces a contiguous operand into one
+/// pairwise tree rather than chaining per-axis trees.
+pub fn reduce_axes(arr: &NdArray, axes: &[usize], op: ReduceOp, keepdims: bool) -> Result<NdArray> {
+    let mut removed = axes.to_vec();
+    removed.sort_unstable();
+    if removed.windows(2).any(|w| w[0] == w[1]) {
+        return Err(Error::ValueError("duplicate value in 'axis'".into()));
+    }
+    if removed.iter().any(|&axis| axis >= arr.ndim()) {
+        let axis = removed
+            .iter()
+            .copied()
+            .find(|&axis| axis >= arr.ndim())
+            .unwrap();
+        return Err(Error::AxisError(format!(
+            "axis {axis} is out of bounds for array of dimension {}",
+            arr.ndim()
+        )));
+    }
+
+    if removed.is_empty() {
+        let dt = reduce_dtype(op, arr.dtype());
+        return Ok(if dt == arr.dtype() {
+            arr.copy()
+        } else {
+            arr.astype(dt)
+        });
+    }
+
+    if removed.len() == arr.ndim() {
+        let value = reduce_all(arr, op)?;
+        let shape = if keepdims {
+            vec![1; arr.ndim()]
+        } else {
+            vec![]
+        };
+        let out = NdArray::zeros(shape, reduce_dtype(op, arr.dtype()))?;
+        out.write_at(out.byte_offset, value);
+        return Ok(out);
+    }
+
+    if removed.len() == 1 {
+        return reduce_axis(arr, removed[0], op, keepdims);
+    }
+
+    if op == ReduceOp::Sum {
+        // `add.reduce` has pairwise inner loops. NpyIter coalesces only
+        // neighbouring selected axes whose input strides form one dimension;
+        // each remaining group is a distinct buffered collapse (and thus a
+        // distinct rounding point for float16).
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut start = removed[0];
+        let mut end = start;
+        for &axis in removed.iter().skip(1) {
+            let coalesces =
+                axis == end + 1 && arr.strides[end] == arr.strides[axis] * arr.shape[axis];
+            if coalesces {
+                end = axis;
+            } else {
+                groups.push((start, end));
+                start = axis;
+                end = axis;
+            }
+        }
+        groups.push((start, end));
+
+        if arr.dtype() == DType::F16 && groups.len() > 1 {
+            // HALF keeps the float accumulator alive across the separately
+            // iterated outer reduction groups and rounds only when storing
+            // the final output cell. Each innermost group still uses numpy's
+            // pairwise HALF loop.
+            let (inner_start, inner_end) = *groups.last().expect("non-empty groups");
+            let inner_n = arr.shape[inner_start..=inner_end]
+                .iter()
+                .map(|&n| n.max(0) as usize)
+                .product::<usize>();
+            let inner_stride = arr.strides[inner_end];
+            let outer_axes: Vec<usize> = removed
+                .iter()
+                .copied()
+                .filter(|&axis| axis < inner_start)
+                .collect();
+            let outer_shape: Vec<isize> = outer_axes.iter().map(|&axis| arr.shape[axis]).collect();
+            let outer_strides: Vec<isize> =
+                outer_axes.iter().map(|&axis| arr.strides[axis]).collect();
+            let mut out_shape = Vec::with_capacity(arr.ndim() - removed.len());
+            let mut rest_strides = Vec::with_capacity(arr.ndim() - removed.len());
+            for axis in 0..arr.ndim() {
+                if !removed.contains(&axis) {
+                    out_shape.push(arr.shape[axis]);
+                    rest_strides.push(arr.strides[axis]);
+                }
+            }
+            let out = NdArray::zeros(out_shape, DType::F16)?;
+            let bases = crate::iter::offsets(&out.shape, &rest_strides, arr.byte_offset);
+            let dsts = crate::iter::offsets(&out.shape, &out.strides, out.byte_offset);
+            for (base, dst) in bases.zip(dsts) {
+                let mut acc = Acc::F16(0.0);
+                for outer in crate::iter::offsets(&outer_shape, &outer_strides, base) {
+                    // SAFETY: the coalesced innermost group is an in-bounds
+                    // strided run beginning at this outer-group offset.
+                    acc = acc
+                        .add(unsafe { sum_run(arr, outer, inner_n, inner_stride) })
+                        .round_to_storage(DType::F16);
+                }
+                out.write_at(dst, acc.to_scalar());
+            }
+            let mut cur = out;
+            if keepdims {
+                let mut shape = cur.shape.clone();
+                for &axis in &removed {
+                    shape.insert(axis, 1);
+                }
+                cur = cur.reshape(&shape)?;
+            }
+            return Ok(cur);
+        }
+
+        // HALF uses its float accumulator across separately buffered groups;
+        // packing all selected axes reproduces that one final rounding.
+        if arr.dtype() != DType::F16 || groups.len() == 1 {
+            let mut cur = arr.clone();
+            for &(start, end) in groups.iter().rev() {
+                if start == end {
+                    cur = reduce_axis(&cur, start, op, false)?;
+                    continue;
+                }
+                let mut merged = cur.clone();
+                merged.shape[start] = cur.shape[start..=end]
+                    .iter()
+                    .map(|&n| n.max(0) as usize)
+                    .product::<usize>() as isize;
+                merged.strides[start] = cur.strides[end];
+                merged.shape.drain(start + 1..=end);
+                merged.strides.drain(start + 1..=end);
+                merged.update_flags();
+                cur = reduce_axis(&merged, start, op, false)?;
+            }
+            if keepdims {
+                let mut shape = cur.shape.clone();
+                for &axis in &removed {
+                    shape.insert(axis, 1);
+                }
+                cur = cur.reshape(&shape)?;
+            }
+            return Ok(cur);
+        }
+    }
+
+    if op == ReduceOp::Prod && arr.dtype() == DType::F16 {
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut start = removed[0];
+        let mut end = start;
+        for &axis in removed.iter().skip(1) {
+            let coalesces =
+                axis == end + 1 && arr.strides[end] == arr.strides[axis] * arr.shape[axis];
+            if coalesces {
+                end = axis;
+            } else {
+                groups.push((start, end));
+                start = axis;
+                end = axis;
+            }
+        }
+        groups.push((start, end));
+
+        if groups.len() > 1 {
+            // The HALF multiply loop holds a float accumulator within each
+            // contiguous iterator buffer, then stores (and therefore rounds)
+            // it through the half output before folding the next outer run.
+            let (inner_start, inner_end) = *groups.last().expect("non-empty groups");
+            let inner_n = arr.shape[inner_start..=inner_end]
+                .iter()
+                .map(|&n| n.max(0) as usize)
+                .product::<usize>();
+            let inner_stride = arr.strides[inner_end];
+            let outer_axes: Vec<usize> = removed
+                .iter()
+                .copied()
+                .filter(|&axis| axis < inner_start)
+                .collect();
+            let outer_shape: Vec<isize> = outer_axes.iter().map(|&axis| arr.shape[axis]).collect();
+            let outer_strides: Vec<isize> =
+                outer_axes.iter().map(|&axis| arr.strides[axis]).collect();
+            let mut out_shape = Vec::with_capacity(arr.ndim() - removed.len());
+            let mut rest_strides = Vec::with_capacity(arr.ndim() - removed.len());
+            for axis in 0..arr.ndim() {
+                if !removed.contains(&axis) {
+                    out_shape.push(arr.shape[axis]);
+                    rest_strides.push(arr.strides[axis]);
+                }
+            }
+            let out = NdArray::zeros(out_shape, DType::F16)?;
+            let bases = crate::iter::offsets(&out.shape, &rest_strides, arr.byte_offset);
+            let dsts = crate::iter::offsets(&out.shape, &out.strides, out.byte_offset);
+            for (base, dst) in bases.zip(dsts) {
+                let mut acc = 1.0f32;
+                for outer in crate::iter::offsets(&outer_shape, &outer_strides, base) {
+                    for i in 0..inner_n {
+                        acc *= arr
+                            .read_at(outer + i as isize * inner_stride)
+                            .as_f64() as f32;
+                    }
+                    acc = F16::from_f32(acc).to_f32();
+                }
+                out.write_at(dst, Scalar::Float(F16::from_f32(acc).to_f64()));
+            }
+            let mut cur = out;
+            if keepdims {
+                let mut shape = cur.shape.clone();
+                for &axis in &removed {
+                    shape.insert(axis, 1);
+                }
+                cur = cur.reshape(&shape)?;
+            }
+            return Ok(cur);
+        }
+
+        if groups.len() == 1 {
+            let (start, end) = groups[0];
+            let mut merged = arr.clone();
+            merged.shape[start] = arr.shape[start..=end]
+                .iter()
+                .map(|&n| n.max(0) as usize)
+                .product::<usize>() as isize;
+            merged.strides[start] = arr.strides[end];
+            merged.shape.drain(start + 1..=end);
+            merged.strides.drain(start + 1..=end);
+            merged.update_flags();
+            let mut cur = reduce_axis(&merged, start, op, false)?;
+            if keepdims {
+                let mut shape = cur.shape.clone();
+                for &axis in &removed {
+                    shape.insert(axis, 1);
+                }
+                cur = cur.reshape(&shape)?;
+            }
+            return Ok(cur);
+        }
+    }
+
+    // NpyIter packs the selected reduction axes into its inner buffer in
+    // C-order before invoking the ufunc loop. Pack that exact logical run for
+    // each output cell, then use the already bit-exact whole-array kernel.
+    let reduced_shape: Vec<isize> = removed.iter().map(|&axis| arr.shape[axis]).collect();
+    let reduced_strides: Vec<isize> = removed.iter().map(|&axis| arr.strides[axis]).collect();
+    let reduced_size: usize = reduced_shape.iter().map(|&n| n.max(0) as usize).product();
+    let tmp = NdArray::empty(vec![reduced_size as isize], arr.dtype())?;
+
+    let mut out_shape = Vec::with_capacity(arr.ndim() - removed.len());
+    let mut rest_strides = Vec::with_capacity(arr.ndim() - removed.len());
+    for axis in 0..arr.ndim() {
+        if !removed.contains(&axis) {
+            out_shape.push(arr.shape[axis]);
+            rest_strides.push(arr.strides[axis]);
+        }
+    }
+    let out = NdArray::zeros(out_shape, reduce_dtype(op, arr.dtype()))?;
+    let src_bases = crate::iter::offsets(&out.shape, &rest_strides, arr.byte_offset);
+    let dst_offsets = crate::iter::offsets(&out.shape, &out.strides, out.byte_offset);
+    for (base, dst) in src_bases.zip(dst_offsets) {
+        for (i, src) in crate::iter::offsets(&reduced_shape, &reduced_strides, base).enumerate() {
+            tmp.write_raw_at(
+                tmp.byte_offset + (i * arr.itemsize()) as isize,
+                arr.raw_bytes_at(src),
+            );
+        }
+        out.write_at(dst, reduce_all(&tmp, op)?);
+    }
+
+    let mut cur = out;
+    if keepdims {
+        let mut shape = cur.shape.clone();
+        for &axis in &removed {
+            shape.insert(axis, 1);
+        }
+        cur = cur.reshape(&shape)?;
+    }
+    Ok(cur)
+}
+
 /// Reduce along a single axis, honouring `where=` and `initial=`.
 pub fn reduce_axis_with(
     arr: &NdArray,
@@ -1231,10 +1529,16 @@ fn reduce_axis_native(
     let axis_stride = arr.strides[axis];
 
     // numpy runs its pairwise inner loop whenever the reduction axis ends up
-    // innermost in the iterator: either it already is, or every other axis is
-    // degenerate so the iterator collapses onto it.
+    // innermost after the iterator's stride-based axis ordering. Numerical
+    // axis position is insufficient for transposed/F-order views.
     let rest: usize = rest_shape.iter().map(|&d| d.max(0) as usize).product();
-    let innermost = axis + 1 == arr.ndim() || rest == 1;
+    let axis_stride_abs = axis_stride.unsigned_abs();
+    let innermost = rest == 1
+        || rest_shape
+            .iter()
+            .zip(rest_strides.iter())
+            .filter(|&(&n, _)| n > 1)
+            .all(|(_, &stride)| axis_stride_abs <= stride.unsigned_abs());
     let out_offsets: Vec<isize> =
         crate::iter::offsets(&out.shape, &out.strides, out.byte_offset).collect();
     let src_offsets: Vec<isize> =
@@ -1249,8 +1553,7 @@ fn reduce_axis_native(
         let mut m_rest: Vec<isize> = m.strides.clone();
         let m_axis = m.strides[axis];
         m_rest.remove(axis);
-        let offs: Vec<isize> =
-            crate::iter::offsets(&rest_shape, &m_rest, m.byte_offset).collect();
+        let offs: Vec<isize> = crate::iter::offsets(&rest_shape, &m_rest, m.byte_offset).collect();
         (m, offs, m_axis)
     });
 
@@ -1270,8 +1573,12 @@ fn reduce_axis_native(
                     // SAFETY: the run lies inside `arr`.
                     unsafe {
                         sum_run_masked(
-                            arr, src_off, n, axis_stride,
-                            Acc::seeded(out_dt, seed), &bits,
+                            arr,
+                            src_off,
+                            n,
+                            axis_stride,
+                            Acc::seeded(out_dt, seed),
+                            &bits,
                         )
                     }
                     .to_scalar()
@@ -1289,21 +1596,32 @@ fn reduce_axis_native(
                 for i in 0..n {
                     let off = src_off + i as isize * axis_stride;
                     // SAFETY: single in-bounds element.
-                    acc = acc.add(unsafe { sum_run(arr, off, 1, axis_stride) });
+                    acc = acc
+                        .add(unsafe { sum_run(arr, off, 1, axis_stride) })
+                        .round_to_storage(out_dt);
                 }
                 acc.to_scalar()
             }
             ReduceOp::Prod => {
-                let mut acc = seed.unwrap_or(Scalar::Int(1)).cast(out_dt);
-                crate::dispatch_dtype!(out_dt, A, {
-                    let mut a = A::from_scalar(acc);
+            if out_dt == DType::F16 && innermost {
+                    let mut acc = seed.map_or(1.0f32, |s| s.as_f64() as f32);
                     for i in 0..n {
                         let off = src_off + i as isize * axis_stride;
-                        a = a.a_mul(A::from_scalar(arr.read_at(off)));
+                        acc *= arr.read_at(off).as_f64() as f32;
                     }
-                    acc = a.to_scalar();
-                });
-                acc
+                    Scalar::Float(F16::from_f32(acc).to_f64())
+                } else {
+                    let mut acc = seed.unwrap_or(Scalar::Int(1)).cast(out_dt);
+                    crate::dispatch_dtype!(out_dt, A, {
+                        let mut a = A::from_scalar(acc);
+                        for i in 0..n {
+                            let off = src_off + i as isize * axis_stride;
+                            a = a.a_mul(A::from_scalar(arr.read_at(off)));
+                        }
+                        acc = a.to_scalar();
+                    });
+                    acc
+                }
             }
             _ => {
                 // `initial=` seeds the accumulator, as it does for sum/prod.
@@ -1356,11 +1674,7 @@ mod tests {
 
     #[test]
     fn integer_sums_widen_like_numpy() {
-        let a = NdArray::from_scalars(
-            &[Scalar::Int(100), Scalar::Int(100)],
-            DType::I8,
-        )
-        .unwrap();
+        let a = NdArray::from_scalars(&[Scalar::Int(100), Scalar::Int(100)], DType::I8).unwrap();
         // np.sum(np.array([100, 100], np.int8)) == 200 (int64), no overflow.
         assert_eq!(reduce_dtype(ReduceOp::Sum, DType::I8), DType::I64);
         assert_eq!(reduce_all(&a, ReduceOp::Sum).unwrap(), Scalar::Int(200));

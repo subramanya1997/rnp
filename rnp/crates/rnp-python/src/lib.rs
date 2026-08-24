@@ -943,27 +943,48 @@ fn reduce_free<'py>(
     out: Option<&Bound<'py, PyAny>>,
     keepdims: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let arr = PyNdArray::into_py_any(array_from_any(a, None, false)?, py)?;
-    let kwargs = PyDict::new(py);
-    if let Some(x) = axis {
-        kwargs.set_item("axis", x)?;
+    // Keep argmin/argmax on their single-axis ndarray implementation.  The
+    // value reductions below need a direct engine path: calling a method by
+    // name from a freshly-created extension object bypasses the Python-level
+    // ndarray wrapper on CPython, and therefore used to miss mixed `out=`
+    // loop resolution in the native method.
+    if matches!(op, ReduceOp::ArgMin | ReduceOp::ArgMax) {
+        let arr = PyNdArray::into_py_any(array_from_any(a, None, false)?, py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(x) = axis {
+            kwargs.set_item("axis", x)?;
+        }
+        if let Some(x) = out {
+            kwargs.set_item("out", x)?;
+        }
+        kwargs.set_item("keepdims", keepdims)?;
+        let name = if op == ReduceOp::ArgMin {
+            "argmin"
+        } else {
+            "argmax"
+        };
+        return arr.bind(py).call_method(name, (), Some(&kwargs));
     }
-    if let Some(x) = dtype {
-        kwargs.set_item("dtype", x)?;
+
+    let mut arr = array_from_any(a, None, false)?;
+    if let Some(d) = dtype {
+        if !d.is_none() {
+            arr = arr.astype(dtype_from_any(d)?);
+        }
+    } else if let Some(o) = out.filter(|o| !o.is_none()) {
+        let cell = o
+            .cast::<PyNdArray>()
+            .map_err(|_| PyTypeError::new_err("output must be an array"))?;
+        let acc = rnp_core::promote(arr.dtype(), cell.borrow().arr.dtype());
+        arr = arr.astype(acc);
     }
-    if let Some(x) = out {
-        kwargs.set_item("out", x)?;
+    let none = py.None();
+    let axes = ufuncs::resolve_axes(&arr, axis.unwrap_or_else(|| none.bind(py)))?;
+    let res = rnp_core::reduce::reduce_axes(&arr, &axes, op, keepdims).map_err(err)?;
+    if res.ndim() == 0 && out.is_none_or(|o| o.is_none()) {
+        return convert::npscalar_to_py(py, res.dtype(), res.read_at(res.byte_offset));
     }
-    kwargs.set_item("keepdims", keepdims)?;
-    let name = match op {
-        ReduceOp::Sum => "sum",
-        ReduceOp::Prod => "prod",
-        ReduceOp::Min => "min",
-        ReduceOp::Max => "max",
-        ReduceOp::ArgMin => "argmin",
-        ReduceOp::ArgMax => "argmax",
-    };
-    arr.bind(py).call_method(name, (), Some(&kwargs))
+    pyarray::store_or_wrap(py, res, out)
 }
 
 #[pyfunction]

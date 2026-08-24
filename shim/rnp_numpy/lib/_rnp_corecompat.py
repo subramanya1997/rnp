@@ -1122,20 +1122,19 @@ def _make_reduction(name, ufunc, bool_result=False):
 
     def reduction(a, axis=None, dtype=None, out=None, keepdims=_NoValue,
                   initial=_NoValue, where=_NoValue, **kwargs):
-        tuple_axis = isinstance(axis, tuple) and len(axis) != 1
         has_where = where is not _NoValue and where is not True
-        if not tuple_axis and not has_where:
+        has_initial = initial is not _NoValue
+        # Tuple axes and `out=` are native now.  Keep the ufunc fallback only
+        # for the two options the ndarray reduction signature still does not
+        # expose (`where` and `initial`).
+        if not has_where and not has_initial:
             kw = dict(kwargs)
             if keepdims is not _NoValue:
                 kw["keepdims"] = keepdims
-            if initial is not _NoValue:
-                kw["initial"] = initial
             if dtype is not None:
                 kw["dtype"] = dtype
             if out is not None:
                 kw["out"] = out
-            if isinstance(axis, tuple):
-                axis = axis[0]
             return engine(a, axis=axis, **kw)
 
         arr = np.asanyarray(a)
