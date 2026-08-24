@@ -14,6 +14,20 @@ import random as _random
 import warnings as _warnings
 
 from .. import arange, array, asarray, empty, float64, int_, zeros
+from .bit_generator import (
+    ISeedSequence,
+    ISpawnableSeedSequence,
+    SeedlessSeedSequence,
+    SeedSequence,
+)
+from ._bit_generators import (
+    BitGenerator,
+    MT19937,
+    PCG64,
+    PCG64DXSM,
+    Philox,
+    SFC64,
+)
 
 _rng = _random.Random()
 
@@ -430,16 +444,6 @@ class Generator:
 
 def default_rng(seed=None):
     return Generator(seed)
-
-
-class PCG64:
-    def __init__(self, seed=None):
-        self.seed = seed
-
-
-class MT19937:
-    def __init__(self, seed=None):
-        self.seed = seed
 
 
 __all__ = [n for n in dir() if not n.startswith("_")]
