@@ -1829,7 +1829,32 @@ impl PyNdArray {
         })
     }
 
+    /// `operator.index()`: numpy accepts only a 0-d array of an integer
+    /// dtype — not bool, not a one-element 1-d array — and raises this exact
+    /// TypeError for everything else.
+    fn __index__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.arr.ndim() != 0 || !self.arr.dtype().is_integer() {
+            return Err(PyTypeError::new_err(
+                "only integer scalar arrays can be converted to a scalar index",
+            ));
+        }
+        match self.arr.get_flat(0) {
+            Scalar::Int(i) => Ok(i.into_pyobject(py)?.into_any().unbind()),
+            Scalar::Uint(u) => Ok(u.into_pyobject(py)?.into_any().unbind()),
+            _ => Err(PyTypeError::new_err(
+                "only integer scalar arrays can be converted to a scalar index",
+            )),
+        }
+    }
+
     // ---- operators -----------------------------------------------------
+
+    fn __matmul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        crate::linalgops::matmul_operator(py, &self.arr, other, false)
+    }
+    fn __rmatmul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        crate::linalgops::matmul_operator(py, &self.arr, other, true)
+    }
 
     fn __add__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         self.binop(py, other, BinOp::Add, false)
@@ -1948,6 +1973,10 @@ impl PyNdArray {
     }
 
     // ---- in-place operators ---------------------------------------------
+
+    fn __imatmul__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        crate::linalgops::imatmul(slf, other)
+    }
 
     fn __iadd__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
         Self::inplace(slf, other, BinOp::Add)

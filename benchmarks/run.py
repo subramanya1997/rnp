@@ -105,6 +105,44 @@ def cases(np_mod, size):
     yield "scalar_extract", lambda: a[7]
 
 
+def matmul_cases(np_mod):
+    """The matmul family, sized in matrix dimensions rather than elements.
+
+    numpy hands contiguous float32/float64/complex matrix-matrix products to
+    BLAS (`cblas_?gemm`), which is blocked, hand-tuned and vectorised; the
+    port's kernel is a plain packed triple loop. The float rows below are
+    therefore expected to lose, and are kept in the table at full size so the
+    gap is visible rather than hidden. The integer and batched-small rows are
+    the ones where numpy also runs a scalar C loop, so they are the fair
+    like-for-like comparison.
+    """
+    def sq(n, dt):
+        a = np_mod.arange(n * n, dtype=dt).reshape(n, n)
+        b = np_mod.arange(n * n, dtype=dt).reshape(n, n)
+        return a, b
+
+    for n in (32, 128, 256):
+        for dt_name in ("float64", "float32", "int32"):
+            a, b = sq(n, getattr(np_mod, dt_name))
+            yield f"matmul_{dt_name}_{n}", (lambda a=a, b=b: np_mod.matmul(a, b))
+    a, b = sq(512, np_mod.float64)
+    yield "matmul_float64_512", lambda: np_mod.matmul(a, b)
+
+    # Batched small matrices: 4096 independent 8x8 products, where numpy's
+    # per-call BLAS overhead is at its worst and the port's loop at its best.
+    ba = np_mod.arange(4096 * 8 * 8, dtype=np_mod.float64).reshape(4096, 8, 8)
+    bb = np_mod.arange(4096 * 8 * 8, dtype=np_mod.float64).reshape(4096, 8, 8)
+    yield "matmul_batched_4096x8x8", lambda: np_mod.matmul(ba, bb)
+
+    # Vector shapes.
+    v = np_mod.arange(1_000_000, dtype=np_mod.float64)
+    w = np_mod.arange(1_000_000, dtype=np_mod.float64)
+    yield "vecdot_float64_1e6", lambda: np_mod.vecdot(v, w)
+    mv, vv = sq(512, np_mod.float64)[0], np_mod.arange(512, dtype=np_mod.float64)
+    yield "matvec_float64_512", lambda: np_mod.matvec(mv, vv)
+    yield "dot_float64_256", lambda: np_mod.dot(*sq(256, np_mod.float64))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes", default="1000,1000000")
@@ -129,6 +167,25 @@ def main():
             rows.append({"case": name, "size": size, "numpy_us": t_real,
                          "port_us": t_port, "ratio": ratio})
             print(f"{name:16s} {size:>10d} {t_real:12.2f} {t_port:12.2f} {ratio:7.2f}x")
+
+    # ---- the matmul family, sized in matrix dimensions -------------------
+    print()
+    print(f"{'case':24s} {'numpy (us)':>12s} {'port (us)':>12s} {'ratio':>7s}")
+    real = dict(matmul_cases(real_np))
+    port = dict(matmul_cases(port_np))
+    for name in real:
+        try:
+            t_real, t_port = bench_pair(real[name], port[name], reps=5, inner=1)
+        except Exception as e:  # noqa: BLE001
+            print(f"{name:24s}  port FAILED: {e}")
+            continue
+        t_real *= 1e6
+        t_port *= 1e6
+        ratio = t_port / t_real
+        rows.append({"case": name, "size": None, "numpy_us": t_real,
+                     "port_us": t_port, "ratio": ratio})
+        print(f"{name:24s} {t_real:12.2f} {t_port:12.2f} {ratio:7.2f}x")
+
     RESULTS.write_text(json.dumps(rows, indent=2))
     print(f"\n-> {RESULTS}")
 

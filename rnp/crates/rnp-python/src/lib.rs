@@ -11,6 +11,7 @@ use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 mod convert;
 mod index;
 mod itemsel;
+mod linalgops;
 mod pyarray;
 mod objects;
 mod pydtype;
@@ -598,6 +599,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_register_scalar_types, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_wraps, m)?)?;
     ufuncs::register(m)?;
+    linalgops::register(m)?;
 
     m.add("__version__", "0.1.0")?;
     Ok(())
