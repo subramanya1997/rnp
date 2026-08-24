@@ -318,12 +318,50 @@ impl Descr {
     /// including the `>` prefix a byte-swapped descriptor carries.
     pub fn buffer_format(&self) -> String {
         let prefix = if self.bo == ByteOrder::Big { ">" } else { "" };
+        if let Some(def) = self.struct_def() {
+            let mut out = String::from("T{");
+            let mut cursor = 0usize;
+            for field in &def.fields {
+                if field.offset > cursor {
+                    out.push_str(&format!("{}x", field.offset - cursor));
+                }
+                out.push_str(&field.descr.buffer_format());
+                out.push(':');
+                out.push_str(&field.name);
+                out.push(':');
+                cursor = field.offset + field.descr.itemsize();
+            }
+            if def.itemsize > cursor {
+                out.push_str(&format!("{}x", def.itemsize - cursor));
+            }
+            out.push('}');
+            return out;
+        }
+        if let Some(sub) = self.subarray_def() {
+            let dims = sub
+                .shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            return format!("({dims}){}", sub.base.buffer_format());
+        }
         match self.dt {
             // numpy spells the flexible kinds with a repeat count: `'3s'`,
             // `'3w'` (UCS4) and `'4x'` (opaque padding).
             DType::Bytes(n) => format!("{prefix}{n}s"),
             DType::Str(n) => format!("{prefix}{n}w"),
             DType::Void(n) => format!("{prefix}{n}x"),
+            DType::I64 => format!(
+                "{prefix}{}",
+                if self.alias == Alias::LongLong { "q" } else { "l" }
+            ),
+            DType::U64 => format!(
+                "{prefix}{}",
+                if self.alias == Alias::ULongLong { "Q" } else { "L" }
+            ),
+            DType::F64 if self.alias == Alias::LongDouble => format!("{prefix}g"),
+            DType::C128 if self.alias == Alias::CLongDouble => format!("{prefix}Zg"),
             other => format!("{prefix}{}", other.buffer_format()),
         }
     }
@@ -1081,6 +1119,17 @@ mod tests {
         assert_eq!(p("c").char_code(), 'c');
         assert_eq!(p("c"), p("S1"));
         assert_eq!(p("c").repr_string(), "dtype('S1')");
+    }
+
+    #[test]
+    fn buffer_formats_preserve_c_aliases_and_compounds() {
+        assert_eq!(p("l").buffer_format(), "l");
+        assert_eq!(p("q").buffer_format(), "q");
+        assert_eq!(p("L").buffer_format(), "L");
+        assert_eq!(p("Q").buffer_format(), "Q");
+        assert_eq!(p("g").buffer_format(), "g");
+        assert_eq!(p("G").buffer_format(), "Zg");
+        assert_eq!(p("U16,2f8").buffer_format(), "T{16w:f0:(2)d:f1:}");
     }
 
     #[test]
