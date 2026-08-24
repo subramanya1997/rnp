@@ -1265,6 +1265,9 @@ del _name
 
 
 # Classes upstream test modules *instantiate* at import time.
+from ._nditer import nditer, nested_iters  # noqa: E402,F401
+
+
 for _name in ("matrix", "poly1d", "vectorize", "broadcast"):
     globals().setdefault(_name, _inert_class(_name))
 del _name
