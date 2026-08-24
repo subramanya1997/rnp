@@ -224,18 +224,24 @@ pub fn lexsort<'py>(
 
 /// `a.tobytes(order)` / `a.tostring(order)`.
 ///
-/// `'A'` and `'K'` mean "F if the array is F-contiguous (and not C), else C",
-/// which is what numpy's `NPY_ANYORDER`/`NPY_KEEPORDER` collapse to for a
-/// flat byte dump.
+/// `'A'` means "F if the array is F-contiguous (and not C), else C", numpy's
+/// `NPY_ANYORDER` resolved through `PyArray_ISFORTRAN`.
+///
+/// `'K'` is *not* memory order here: `PyArray_ToString` only special-cases
+/// `NPY_FORTRANORDER`, so `NPY_KEEPORDER` falls through to the C-order walk
+/// like everything else. Probed on an F-contiguous `(2, 3, 4)` float32 array
+/// and on transposed/strided/reversed views: `tobytes('K')` equals
+/// `tobytes('C')` in every case, while `tobytes('A')` equals `tobytes('F')`
+/// only for the F-contiguous ones.
 pub fn tobytes_impl<'py>(
     py: Python<'py>,
     arr: &NdArray,
     order: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let want_f = match order.unwrap_or("C") {
-        "C" | "c" => false,
+        "C" | "c" | "K" | "k" => false,
         "F" | "f" => true,
-        "A" | "a" | "K" | "k" => arr.flags.f_contiguous && !arr.flags.c_contiguous,
+        "A" | "a" => arr.flags.f_contiguous && !arr.flags.c_contiguous,
         other => {
             return Err(PyValueError::new_err(format!(
                 "order must be one of 'C', 'F', 'A', or 'K' (got '{other}')"
@@ -764,6 +770,35 @@ const RESIZE_BASE_REFCNT: isize = 2;
 // var / std
 // ---------------------------------------------------------------------------
 
+/// Allocate a fresh `shape`-shaped array of `dt` whose axes are laid out the
+/// way a `NPY_KEEPORDER` ufunc output over `like` would be: the axis `like`
+/// strides through fastest is the one that ends up contiguous.
+///
+/// `like` may have fewer axes than `shape` (an operand broadcast against a
+/// keepdims mean), in which case only the trailing axes it covers are ordered
+/// and the rest keep C order.
+fn keeporder_like(like: &NdArray, shape: &[isize], dt: DType) -> PyResult<NdArray> {
+    let nd = shape.len();
+    if nd < 2 || like.ndim() != nd {
+        return NdArray::zeros(shape.to_vec(), dt).map_err(crate::err);
+    }
+    // Axes sorted by descending |stride|: the smallest stride goes last, which
+    // is where a C-order allocation puts its contiguous axis.
+    let mut order: Vec<usize> = (0..nd).collect();
+    order.sort_by_key(|&ax| std::cmp::Reverse(like.strides[ax].unsigned_abs()));
+    if order.iter().copied().eq(0..nd) {
+        return NdArray::zeros(shape.to_vec(), dt).map_err(crate::err);
+    }
+    let permuted: Vec<isize> = order.iter().map(|&ax| shape[ax]).collect();
+    let base = NdArray::zeros(permuted, dt).map_err(crate::err)?;
+    // Undo the permutation so the view carries `shape` again.
+    let mut inverse = vec![0usize; nd];
+    for (i, &ax) in order.iter().enumerate() {
+        inverse[ax] = i;
+    }
+    base.permute(&inverse).map_err(crate::err)
+}
+
 /// Transcribed from `numpy/_core/_methods.py::_var`: the mean is taken in the
 /// accumulator dtype, the deviations are squared through `x * conj(x)` for
 /// complex operands (so the result is real), and the final division is by
@@ -885,7 +920,15 @@ pub fn var_impl<'py>(
 
     // x = arr - mean, broadcast back over the reduced axis.
     let diff = rnp_core::binary(&promoted, &mean, BinOp::Sub).map_err(crate::err)?;
-    let sq = NdArray::zeros(diff.shape.clone(), sq_dt).map_err(crate::err)?;
+    // `_var` then squares in place and sums, and the sum's *order* is decided
+    // by the layout `arr - arrmean` came out with. numpy's ufuncs allocate
+    // their output in `NPY_KEEPORDER`, so a Fortran-ordered (or transposed)
+    // operand yields a Fortran-ordered difference and the reduction walks it
+    // down columns, not across rows. The engine's `binary` always hands back
+    // a C-contiguous result, so the squared deviations are allocated with
+    // `arr`'s own axis ordering instead -- otherwise `a.T.var()` sums the same
+    // twelve numbers in the wrong order and lands a ULP away from numpy.
+    let sq = keeporder_like(arr, &diff.shape, sq_dt)?;
     let d_off: Vec<isize> =
         rnp_core::iter::offsets(&diff.shape, &diff.strides, diff.byte_offset).collect();
     let s_off: Vec<isize> =
@@ -901,7 +944,15 @@ pub fn var_impl<'py>(
         sq.write_at(d, v.cast(sq_dt));
     }
 
-    let total = masked_sum(&sq.astype(res_dt), ax, mask.as_ref(), keepdims)?;
+    // `astype` to the dtype an array already has still copies, and the copy is
+    // C-contiguous -- which would throw away the layout `keeporder_like` just
+    // arranged. `_var` has no cast here at all when the two agree.
+    let summand = if sq.dtype() == res_dt {
+        sq
+    } else {
+        sq.astype(res_dt)
+    };
+    let total = masked_sum(&summand, ax, mask.as_ref(), keepdims)?;
     let denom = counts(arr, ax, mask.as_ref());
     let denom = if keepdims || ax.is_none() {
         denom
