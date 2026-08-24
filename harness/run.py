@@ -5,11 +5,14 @@ Usage:
     .venv/bin/python harness/run.py                    # default target set
     .venv/bin/python harness/run.py test_indexing.py   # specific file(s)
     .venv/bin/python harness/run.py --all              # every _core test file
+    .venv/bin/python harness/run.py --suite lib        # every file in a suite
     .venv/bin/python harness/run.py --full             # every suite
 
 Tests under upstream/ are NEVER modified. We run pytest in a subprocess whose
 PYTHONPATH injects (a) the rnp_numpy shim and (b) a sitecustomize that
-redirects `import numpy` to the shim. Results land in harness/scoreboard.json.
+redirects `import numpy` to the shim. Results land in harness/scoreboard.json
+(the "core" suite / --all / default-target-set runs); other suites land in
+harness/scoreboard_<suite>.json.
 
 Very large files (test_multiarray.py collects ~14k tests) do not finish inside
 a sane per-file timeout, which used to make them score 0. They are now *sharded*
@@ -30,6 +33,25 @@ ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM_TESTS = ROOT / "upstream" / "numpy" / "_core" / "tests"
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 SCOREBOARD = ROOT / "harness" / "scoreboard.json"
+UPSTREAM_NUMPY = ROOT / "upstream" / "numpy"
+
+# Suite name -> list of upstream test directories that make it up. "core" is
+# kept identical to the historical UPSTREAM_TESTS default (single dir); "top"
+# covers the two small top-level test dirs that don't have their own suite.
+SUITE_DIRS = {
+    "core": [UPSTREAM_NUMPY / "_core" / "tests"],
+    "lib": [UPSTREAM_NUMPY / "lib" / "tests"],
+    "ma": [UPSTREAM_NUMPY / "ma" / "tests"],
+    "linalg": [UPSTREAM_NUMPY / "linalg" / "tests"],
+    "fft": [UPSTREAM_NUMPY / "fft" / "tests"],
+    "random": [UPSTREAM_NUMPY / "random" / "tests"],
+    "polynomial": [UPSTREAM_NUMPY / "polynomial" / "tests"],
+    "matrixlib": [UPSTREAM_NUMPY / "matrixlib" / "tests"],
+    "top": [UPSTREAM_NUMPY / "tests", UPSTREAM_NUMPY / "testing" / "tests"],
+}
+# Order used for --full and for the "run everything" report.
+SUITE_ORDER = ["core", "lib", "ma", "linalg", "fft", "random", "polynomial",
+               "matrixlib", "top"]
 
 # Files targeted by current/adopted milestones (see PLAN.md).
 DEFAULT_TARGETS = [
@@ -144,44 +166,36 @@ def plan_units(files, shard_override=None):
     return units
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("files", nargs="*", help="upstream test file names")
-    ap.add_argument("--all", action="store_true",
-                    help="run every file in upstream/numpy/_core/tests")
-    ap.add_argument("--full", action="store_true",
-                    help="run every test file in all upstream numpy suites "
-                         "(_core, lib, linalg, fft, random, ma, polynomial)")
-    ap.add_argument("--jobs", "-j", type=int, default=4,
-                    help="parallel pytest subprocesses (default 4)")
-    ap.add_argument("--shards", type=int, default=None,
-                    help="override the per-file shard count for every file")
-    ap.add_argument("--timeout", type=int, default=TIMEOUT,
-                    help="per-subprocess timeout in seconds (default 900)")
-    ap.add_argument("--out", default=None, help="scoreboard path override")
-    args = ap.parse_args()
+def suite_files(suite: str) -> list:
+    """Every test_*.py file across a suite's upstream test dir(s), sorted."""
+    files = []
+    for d in SUITE_DIRS[suite]:
+        if d.is_dir():
+            files.extend(sorted(d.glob("test_*.py")))
+    return files
 
-    if args.full:
-        files = []
-        for sub in ["_core", "lib", "linalg", "fft", "random", "ma",
-                    "polynomial"]:
-            d = ROOT / "upstream" / "numpy" / sub / "tests"
-            if d.is_dir():
-                files.extend(sorted(d.glob("test_*.py")))
-    elif args.all:
-        files = sorted(UPSTREAM_TESTS.glob("test_*.py"))
-    elif args.files:
-        files = [UPSTREAM_TESTS / f for f in args.files]
-    else:
-        files = [UPSTREAM_TESTS / f for f in DEFAULT_TARGETS]
 
+def scoreboard_path_for(suite: str) -> Path:
+    # "core" (== the historical --all target set) keeps the original,
+    # un-suffixed scoreboard.json so existing workflows/tooling don't break.
+    if suite == "core":
+        return SCOREBOARD
+    return ROOT / "harness" / f"scoreboard_{suite}.json"
+
+
+def run_files(files: list, jobs: int, shards: int, timeout: int,
+              out: Path, quiet: bool = False) -> dict:
+    """Run `files` through the shard/timeout machinery and write a scoreboard.
+
+    Returns the board dict (also written to `out`).
+    """
     files = [f for f in files if f.exists() or print(f"!! missing: {f}",
                                                      file=sys.stderr)]
-    units = plan_units(files, args.shards)
+    units = plan_units(files, shards)
 
     parts = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
-        futs = {ex.submit(run_shard, f, i, n, args.timeout): (f, i, n)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        futs = {ex.submit(run_shard, f, i, n, timeout): (f, i, n)
                 for (f, i, n) in units}
         done = 0
         for fut in concurrent.futures.as_completed(futs):
@@ -197,10 +211,11 @@ def main() -> int:
         results.append(r)
         tot_pass += r["passed"]
         tot_all += max(r["total"] - r["skipped"], 0)
-        denom = max(r["total"] - r["skipped"], 0)
-        pct = 100 * r["passed"] / max(denom, 1)
-        print(f"{r['file']:38s} {r['passed']:5d}/{denom:5d}  ({pct:5.1f}%)"
-              + ("  [CRASH]" if "error" in r else ""))
+        if not quiet:
+            denom = max(r["total"] - r["skipped"], 0)
+            pct = 100 * r["passed"] / max(denom, 1)
+            print(f"{r['file']:38s} {r['passed']:5d}/{denom:5d}  ({pct:5.1f}%)"
+                  + ("  [CRASH]" if "error" in r else ""))
 
     board = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -208,10 +223,68 @@ def main() -> int:
         "overall_total": tot_all,
         "files": results,
     }
-    out = Path(args.out) if args.out else SCOREBOARD
     out.write_text(json.dumps(board, indent=2))
-    print(f"\nOVERALL: {tot_pass}/{tot_all} "
-          f"({100 * tot_pass / max(tot_all, 1):.1f}%)  -> {out}")
+    if not quiet:
+        print(f"\nOVERALL: {tot_pass}/{tot_all} "
+              f"({100 * tot_pass / max(tot_all, 1):.1f}%)  -> {out}")
+    return board
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("files", nargs="*", help="upstream test file names")
+    ap.add_argument("--all", action="store_true",
+                    help="run every file in upstream/numpy/_core/tests")
+    ap.add_argument("--suite", choices=sorted(SUITE_DIRS),
+                    help="run every file in an upstream suite's tests dir "
+                         "(core, lib, ma, linalg, fft, random, polynomial, "
+                         "matrixlib, top); writes harness/scoreboard_<suite>"
+                         ".json (core writes harness/scoreboard.json)")
+    ap.add_argument("--full", action="store_true",
+                    help="run every suite (core, lib, ma, linalg, fft, "
+                         "random, polynomial, matrixlib, top), each writing "
+                         "its own harness/scoreboard[_<suite>].json")
+    ap.add_argument("--jobs", "-j", type=int, default=4,
+                    help="parallel pytest subprocesses (default 4)")
+    ap.add_argument("--shards", type=int, default=None,
+                    help="override the per-file shard count for every file")
+    ap.add_argument("--timeout", type=int, default=TIMEOUT,
+                    help="per-subprocess timeout in seconds (default 900)")
+    ap.add_argument("--out", default=None, help="scoreboard path override")
+    args = ap.parse_args()
+
+    if args.full:
+        grand_pass, grand_all = 0, 0
+        for suite in SUITE_ORDER:
+            files = suite_files(suite)
+            out = Path(args.out) if args.out else scoreboard_path_for(suite)
+            print(f"\n=== suite: {suite} ({len(files)} files) ===",
+                  file=sys.stderr)
+            board = run_files(files, args.jobs, args.shards, args.timeout, out)
+            grand_pass += board["overall_passed"]
+            grand_all += board["overall_total"]
+        print(f"\nGRAND TOTAL: {grand_pass}/{grand_all} "
+              f"({100 * grand_pass / max(grand_all, 1):.1f}%)")
+        return 0
+
+    if args.suite:
+        files = suite_files(args.suite)
+        out = Path(args.out) if args.out else scoreboard_path_for(args.suite)
+        run_files(files, args.jobs, args.shards, args.timeout, out)
+        return 0
+
+    # --all / explicit files / default target set: identical to historical
+    # behavior, always against upstream/numpy/_core/tests, always writing
+    # harness/scoreboard.json unless --out overrides it.
+    if args.all:
+        files = sorted(UPSTREAM_TESTS.glob("test_*.py"))
+    elif args.files:
+        files = [UPSTREAM_TESTS / f for f in args.files]
+    else:
+        files = [UPSTREAM_TESTS / f for f in DEFAULT_TARGETS]
+
+    out = Path(args.out) if args.out else SCOREBOARD
+    run_files(files, args.jobs, args.shards, args.timeout, out)
     return 0
 
 
