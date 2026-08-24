@@ -1779,7 +1779,8 @@ impl PyNdArray {
     /// converted back at the end, and the division happens *in the
     /// accumulator's own type* (so a complex mean goes through numpy's
     /// complex divide, not a component-wise one).
-    #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false))]
+    #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false, *,
+                        where_ = None))]
     fn mean<'py>(
         &self,
         py: Python<'py>,
@@ -1787,12 +1788,16 @@ impl PyNdArray {
         dtype: Option<&Bound<'py, PyAny>>,
         out: Option<&Bound<'py, PyAny>>,
         keepdims: bool,
+        where_: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if out.is_some_and(|o| !o.is_none()) {
-            return Err(PyNotImplementedError::new_err(
-                "mean(out=) is not implemented yet",
-            ));
+        // `out=` and `where=` route through the generic accumulator in
+        // `straggler.rs`; the path below keeps numpy's exact complex64
+        // division for the plain case.
+        if out.is_some_and(|o| !o.is_none()) || where_.is_some_and(|w| !w.is_none()) {
+            return crate::straggler::mean_impl(py, &self.arr, axis, dtype, out, keepdims, where_);
         }
+        // numpy raises `AxisError`, not a bare `ValueError`, for a bad axis.
+        crate::straggler::check_axis(&self.arr, axis)?;
         let is_half = self.arr.dtype() == DType::F16;
         let acc_dt = match dtype {
             Some(d) if !d.is_none() => dtype_from_any(d)?,

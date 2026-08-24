@@ -21,12 +21,28 @@ use crate::pydtype::{descr_from_any, PyDType};
 // shared helpers
 // ---------------------------------------------------------------------------
 
-/// numpy raises `np.exceptions.AxisError`; the shim re-raises the engine's
-/// `AxisError` as that class, so route through the engine error type.
+/// numpy raises `np.exceptions.AxisError` (a `ValueError`/`IndexError`
+/// subclass) for an out-of-range axis, and the tests assert that exact class.
+/// The engine only carries a message, so build the shim's class directly and
+/// fall back to `ValueError` if the shim is not importable.
 fn axis_err(axis: isize, ndim: usize) -> PyErr {
-    crate::err(rnp_core::Error::AxisError(format!(
-        "axis {axis} is out of bounds for array of dimension {ndim}"
-    )))
+    let msg = format!("axis {axis} is out of bounds for array of dimension {ndim}");
+    Python::attach(|py| {
+        match py
+            .import("rnp_numpy.exceptions")
+            .and_then(|m| m.getattr("AxisError"))
+            .and_then(|c| c.call1((axis, ndim)))
+        {
+            Ok(exc) => PyErr::from_value(exc),
+            Err(_) => PyValueError::new_err(msg),
+        }
+    })
+}
+
+/// Validate `axis` against `arr` without computing anything, so callers that
+/// have their own reduction path still raise numpy's `AxisError`.
+pub fn check_axis(arr: &NdArray, axis: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    resolve_axis_pub(arr, axis).map(|_| ())
 }
 
 /// Normalise an axis against `ndim`, with numpy's 0-d special case: a 0-d
@@ -669,13 +685,26 @@ pub fn var_impl<'py>(
             _ => DType::F64,
         },
     };
-    // `var`/`std` of a complex operand are real-valued.
-    let res_dt = match acc {
+    // `var`/`std` of a complex *operand* are real-valued, but an explicit
+    // complex `dtype=` still wins: numpy sums the (real) squared deviations
+    // with that dtype, so `np.var(float_mat, dtype='F')` is complex64.
+    let explicit = dtype.is_some_and(|d| !d.is_none());
+    let res_dt = if explicit {
+        acc
+    } else {
+        match acc {
+            DType::C64 => DType::F32,
+            DType::C128 => DType::F64,
+            d => d,
+        }
+    };
+    // The squared deviations themselves are always real.
+    let sq_dt = match res_dt {
         DType::C64 => DType::F32,
         DType::C128 => DType::F64,
         d => d,
     };
-    let out_dt = if dt == DType::F16 && dtype.is_none_or(|d| d.is_none()) {
+    let out_dt = if dt == DType::F16 && !explicit {
         DType::F16
     } else {
         res_dt
@@ -697,7 +726,7 @@ pub fn var_impl<'py>(
 
     // x = arr - mean, broadcast back over the reduced axis.
     let diff = rnp_core::binary(&promoted, &mean, BinOp::Sub).map_err(crate::err)?;
-    let sq = NdArray::zeros(diff.shape.clone(), res_dt).map_err(crate::err)?;
+    let sq = NdArray::zeros(diff.shape.clone(), sq_dt).map_err(crate::err)?;
     let d_off: Vec<isize> =
         rnp_core::iter::offsets(&diff.shape, &diff.strides, diff.byte_offset).collect();
     let s_off: Vec<isize> =
@@ -710,10 +739,10 @@ pub fn var_impl<'py>(
                 Scalar::Float(f * f)
             }
         };
-        sq.write_at(d, v.cast(res_dt));
+        sq.write_at(d, v.cast(sq_dt));
     }
 
-    let total = masked_sum(&sq, ax, mask.as_ref(), keepdims)?;
+    let total = masked_sum(&sq.astype(res_dt), ax, mask.as_ref(), keepdims)?;
     let denom = counts(arr, ax, mask.as_ref());
     let denom = if keepdims || ax.is_none() {
         denom
@@ -721,6 +750,16 @@ pub fn var_impl<'py>(
         drop_axis(&denom, ax.unwrap())
     };
     let denom = sub_clamped(&denom, ddof);
+    if any_nonpositive(&denom) {
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+            std::ffi::CString::new("Degrees of freedom <= 0 for slice")
+                .unwrap()
+                .as_c_str(),
+            1,
+        )?;
+    }
     let mut res = divide_by(&total, &denom, res_dt);
     if sqrt {
         let r2 = NdArray::zeros(res.shape.clone(), res_dt).map_err(crate::err)?;
@@ -734,6 +773,63 @@ pub fn var_impl<'py>(
         res = r2;
     }
     if out_dt != res_dt {
+        res = res.astype(out_dt);
+    }
+    if ax.is_none() && !keepdims && out.is_none_or(|o| o.is_none()) {
+        let v = res.get_flat(0);
+        return crate::convert::npscalar_to_py(py, out_dt, v);
+    }
+    store_or_wrap(py, res, out)
+}
+
+/// `a.mean(...)` for the two argument shapes `pyarray.rs`'s own `mean` does
+/// not cover: an `out=` destination and a `where=` mask. The accumulator
+/// rules are the same ones `_methods._mean` uses.
+pub fn mean_impl<'py>(
+    py: Python<'py>,
+    arr: &NdArray,
+    axis: Option<&Bound<'py, PyAny>>,
+    dtype: Option<&Bound<'py, PyAny>>,
+    out: Option<&Bound<'py, PyAny>>,
+    keepdims: bool,
+    where_: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dt = arr.dtype();
+    let is_half = dt == DType::F16;
+    let acc = match dtype {
+        Some(d) if !d.is_none() => crate::pydtype::dtype_from_any(d)?,
+        _ if is_half => DType::F32,
+        _ => rnp_core::reduce::mean_dtype(dt),
+    };
+    let out_dt = if is_half && dtype.is_none_or(|d| d.is_none()) {
+        DType::F16
+    } else {
+        acc
+    };
+    let ax = resolve_axis_pub(arr, axis)?;
+    let mask = match where_ {
+        Some(w) if !w.is_none() => {
+            let m = array_from_any(w, Some(DType::Bool), false)?;
+            Some(rnp_core::iter::broadcast_to(&m, &arr.shape).map_err(crate::err)?)
+        }
+        _ => None,
+    };
+    let promoted = arr.astype(acc);
+    let total = masked_sum(&promoted, ax, mask.as_ref(), keepdims)?;
+    let mut count = counts(arr, ax, mask.as_ref());
+    if !keepdims && ax.is_some() {
+        count = drop_axis(&count, ax.unwrap());
+    }
+    if any_nonpositive(&count) {
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+            std::ffi::CString::new("Mean of empty slice.").unwrap().as_c_str(),
+            1,
+        )?;
+    }
+    let mut res = divide_by(&total, &count, acc);
+    if out_dt != acc {
         res = res.astype(out_dt);
     }
     if ax.is_none() && !keepdims && out.is_none_or(|o| o.is_none()) {
@@ -810,13 +906,45 @@ fn keepdims_view(out: &NdArray, arr: &NdArray, axis: Option<usize>) -> NdArray {
     v
 }
 
+/// True when any reduction slice would divide by zero (or fewer) elements.
+fn any_nonpositive(denom: &NdArray) -> bool {
+    rnp_core::iter::offsets(&denom.shape, &denom.strides, denom.byte_offset)
+        .any(|o| denom.read_at(o).as_f64() <= 0.0)
+}
+
 /// Sum over `axis`, skipping the elements `mask` excludes.
+///
+/// With no mask this delegates to the engine's own reduction so that the
+/// accumulation order — and therefore the last ULP — matches numpy's
+/// pairwise summation exactly; the hand-rolled loop below is only for the
+/// `where=` path, which numpy also accumulates sequentially.
 fn masked_sum(
     arr: &NdArray,
     axis: Option<usize>,
     mask: Option<&NdArray>,
     keepdims: bool,
 ) -> PyResult<NdArray> {
+    if mask.is_none() {
+        return match axis {
+            Some(a) => rnp_core::reduce_axis(arr, a, rnp_core::ReduceOp::Sum, keepdims)
+                .map_err(crate::err),
+            None => {
+                let total = if arr.size() == 0 {
+                    Scalar::Float(0.0).cast(arr.dtype())
+                } else {
+                    rnp_core::reduce_all(arr, rnp_core::ReduceOp::Sum).map_err(crate::err)?
+                };
+                let shape = if keepdims {
+                    vec![1isize; arr.ndim()]
+                } else {
+                    vec![]
+                };
+                let mut out = NdArray::zeros(shape, arr.dtype()).map_err(crate::err)?;
+                out.fill(total);
+                Ok(out)
+            }
+        };
+    }
     let acc_shape: Vec<isize> = match axis {
         None => vec![1; arr.ndim()],
         Some(a) => {
@@ -882,22 +1010,21 @@ fn sub_clamped(count: &NdArray, ddof: f64) -> NdArray {
 /// Elementwise divide of a (possibly keepdims) accumulator by a count array
 /// of the same shape, producing `dt`.
 fn divide_by(total: &NdArray, count: &NdArray, dt: DType) -> NdArray {
-    let out = NdArray::zeros(total.shape.clone(), dt).expect("divide alloc");
-    let t: Vec<isize> =
-        rnp_core::iter::offsets(&total.shape, &total.strides, total.byte_offset).collect();
+    // Materialise the counts in the accumulator's own dtype and shape and let
+    // the engine's divide do the work: numpy divides a complex accumulator
+    // through its *complex* divide, which is not a component-wise one, and
+    // reusing `binary` keeps this bit-identical with it.
+    let denom = NdArray::zeros(total.shape.clone(), dt).expect("divide alloc");
     let c: Vec<isize> =
         rnp_core::iter::offsets(&count.shape, &count.strides, count.byte_offset).collect();
-    let o: Vec<isize> =
-        rnp_core::iter::offsets(&out.shape, &out.strides, out.byte_offset).collect();
-    for i in 0..o.len() {
+    for (i, o) in
+        rnp_core::iter::offsets(&denom.shape, &denom.strides, denom.byte_offset).enumerate()
+    {
         let n = count.read_at(c[i % c.len()]).as_f64();
-        let v = match total.read_at(t[i]) {
-            Scalar::Complex(z) => Scalar::Complex(z / num_complex::Complex::new(n, 0.0)),
-            other => Scalar::Float(other.as_f64() / n),
-        };
-        out.write_at(o[i], v.cast(dt));
+        denom.write_at(o, Scalar::Float(n).cast(dt));
     }
-    out
+    let num = total.astype(dt);
+    rnp_core::binary(&num, &denom, BinOp::Div).expect("divide")
 }
 
 // ---------------------------------------------------------------------------

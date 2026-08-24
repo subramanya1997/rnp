@@ -704,6 +704,15 @@ def std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
                          where_=where, mean=mean, correction=correction)
 
 
+_rnp_mean = mean
+
+
+def mean(a, axis=None, dtype=None, out=None, keepdims=False, *, where=None):
+    if where is None:
+        return _rnp_mean(a, axis, dtype, out, keepdims)
+    return _asarr(a).mean(axis, dtype, out, keepdims, where_=where)
+
+
 def conjugate(a, out=None):
     return _asarr(a).conjugate(out)
 
