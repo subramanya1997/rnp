@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::buffer::Buffer;
 use crate::descr::{ByteOrder, Descr};
 use crate::dtype::DType;
@@ -765,6 +767,46 @@ impl NdArray {
         }
         let mut out = NdArray::new_uninit(self.shape.clone(), dtype).expect("astype alloc");
         let n = self.size();
+        if self.dtype() == DType::F64
+            && dtype == DType::F32
+            && self.flags.c_contiguous
+            && self.flags.aligned
+        {
+            // NumPy's hot benchmark cast is a plain contiguous narrowing
+            // loop.  Going through `Scalar` here hides that loop from LLVM
+            // behind enum construction and floating-point-status handling.
+            // A Rust `f64 as f32` has the same IEEE narrowing result, and the
+            // elements are independent, so chunking does not alter results.
+            // SAFETY: the aligned, C-contiguous source contains `n`
+            // initialized f64 values from `byte_offset`; `out` is a fresh,
+            // 64-byte-aligned allocation for exactly `n` f32 values.  Rayon
+            // divides the mutable destination slice into disjoint chunks.
+            unsafe {
+                let src = std::slice::from_raw_parts(
+                    self.buffer.as_ptr().offset(self.byte_offset) as *const f64,
+                    n,
+                );
+                let dst = std::slice::from_raw_parts_mut(
+                    out.buffer.as_mut_ptr() as *mut f32,
+                    n,
+                );
+                if n >= crate::loops::PAR_THRESHOLD {
+                    dst.par_chunks_mut(crate::loops::PAR_CHUNK)
+                        .zip(src.par_chunks(crate::loops::PAR_CHUNK))
+                        .for_each(|(d, s)| {
+                            for (to, &from) in d.iter_mut().zip(s) {
+                                *to = from as f32;
+                            }
+                        });
+                } else {
+                    for (to, &from) in dst.iter_mut().zip(src) {
+                        *to = from as f32;
+                    }
+                }
+            }
+            out.update_flags();
+            return out;
+        }
         if self.flags.c_contiguous {
             // Typed inner loop: both sides are flat, so the per-element cast
             // inlines instead of routing through the `Scalar` enum.
@@ -1361,6 +1403,37 @@ mod tests {
                 .map(Scalar::Float)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn astype_contiguous_f64_to_f32_matches_scalar_cast_bits() {
+        let n = crate::loops::PAR_THRESHOLD + 17;
+        let values = (0..n)
+            .map(|i| {
+                let v = match i % 7 {
+                    0 => -0.0,
+                    1 => f64::INFINITY,
+                    2 => f64::NEG_INFINITY,
+                    3 => f64::NAN,
+                    4 => f64::MIN_POSITIVE,
+                    _ => (i as f64 - 30_000.0) / 7.0,
+                };
+                Scalar::Float(v)
+            })
+            .collect::<Vec<_>>();
+        let a = NdArray::from_scalars(&values, DType::F64).unwrap();
+        let f = a.astype(DType::F32);
+        // SAFETY: `f` is a freshly allocated contiguous f32 array with `n`
+        // initialized elements written by the cast above.
+        let got = unsafe {
+            std::slice::from_raw_parts(f.buffer.as_ptr() as *const f32, n)
+        };
+        for (i, &actual) in got.iter().enumerate() {
+            let Scalar::Float(source) = values[i] else {
+                unreachable!()
+            };
+            assert_eq!(actual.to_bits(), (source as f32).to_bits(), "element {i}");
+        }
     }
 
     #[test]
