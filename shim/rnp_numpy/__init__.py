@@ -119,7 +119,7 @@ def _alloc_with_order(_fn, shape, dtype, order):
     return _fn(shape, dtype)
 
 
-def zeros(shape, dtype=None, order="C", *, like=None):
+def zeros(shape, dtype=None, order="C", *, like=None, device=None):
     return _alloc_with_order(_rnp_zeros, shape, dtype, order)
 
 
@@ -1256,6 +1256,10 @@ _wire_subsystem(
 
 def dot(a, b, out=None):
     """Dot product of two arrays (numpy's `np.dot`)."""
+    if (getattr(getattr(a, "dtype", None), "kind", None) == "O" or
+            getattr(getattr(b, "dtype", None), "kind", None) == "O"):
+        from .lib._rnp_corecompat import dot as _compat_dot
+        return _compat_dot(a, b, out=out)
     res = _rnp._dot(a, b, out=out)
     if out is None and isinstance(res, ndarray) and res.ndim == 0:
         return res[()]

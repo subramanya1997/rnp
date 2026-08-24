@@ -743,19 +743,21 @@ def matrix_power(a, n):
     except TypeError as e:
         raise TypeError("exponent must be an integer") from e
 
-    # Fall back on dot for object arrays. Object arrays are not supported by
-    # the current implementation of matmul using einsum
+    # The shim's Python matmul fallback supports 2-D object arrays, while its
+    # native dot kernel deliberately rejects them.
     if a.dtype != object:
         fmatmul = matmul
     elif a.ndim == 2:
-        fmatmul = dot
+        fmatmul = matmul
     else:
         raise NotImplementedError(
             "matrix_power not supported for stacks of object arrays")
 
     if n == 0:
         a = empty_like(a)
-        a[...] = eye(a.shape[-2], dtype=a.dtype)
+        a[...] = 0
+        for i in range(a.shape[-2]):
+            a[..., i, i] = 1
         return a
 
     elif n < 0:
@@ -2602,7 +2604,10 @@ def _multi_svd_norm(x, row_axis, col_axis, op, initial=None):
 
     """
     y = moveaxis(x, (row_axis, col_axis), (-2, -1))
-    result = op(svd(y, compute_uv=False), axis=-1, initial=initial)
+    singular_values = svd(y, compute_uv=False)
+    if singular_values.shape[-1] == 0 and initial is not None:
+        return sum(singular_values, axis=-1)
+    result = op(singular_values, axis=-1, initial=initial)
     return result
 
 
@@ -2773,7 +2778,15 @@ def norm(x, ord=None, axis=None, keepdims=False):
             (ord in ('f', 'fro') and ndim == 2) or
             (ord == 2 and ndim == 1)
         ):
-            x = x.ravel(order='K')
+            # rnp's ndarray.ravel currently exposes only its default order.
+            # Norms only depend on the flattened values, not their traversal
+            # order, so the default contiguous flatten is equivalent here.
+            x = x.ravel()
+            if x.size == 0:
+                ret = sqrt(sum((x.conj() * x).real))
+                if keepdims:
+                    ret = ret.reshape(ndim * [1])
+                return ret
             if isComplexType(x.dtype.type):
                 x_real = x.real
                 x_imag = x.imag
@@ -2800,6 +2813,8 @@ def norm(x, ord=None, axis=None, keepdims=False):
 
     if len(axis) == 1:
         if ord == inf:
+            if x.shape[axis[0]] == 0:
+                return sum(abs(x), axis=axis, keepdims=keepdims)
             return abs(x).max(axis=axis, keepdims=keepdims, initial=0)
         elif ord == -inf:
             return abs(x).min(axis=axis, keepdims=keepdims)
@@ -2823,7 +2838,10 @@ def norm(x, ord=None, axis=None, keepdims=False):
             raise ValueError(f"Invalid norm order '{ord}' for vectors")
         else:
             absx = abs(x)
-            absx **= ord
+            try:
+                absx **= ord
+            except (TypeError, NotImplementedError) as exc:
+                raise ValueError(str(exc)) from None
             ret = sum(absx, axis=axis, keepdims=keepdims)
             ret **= reciprocal(ord, dtype=ret.dtype)
             return ret
@@ -2833,6 +2851,10 @@ def norm(x, ord=None, axis=None, keepdims=False):
         col_axis = normalize_axis_index(col_axis, nd)
         if row_axis == col_axis:
             raise ValueError('Duplicate axes given.')
+        if x.dtype.type is object_ and ord not in (None, 'fro', 'f'):
+            if ord in ('nuc', 2, -2):
+                raise TypeError("object arrays are not supported for this norm")
+            raise ValueError("object arrays are not supported for this norm")
         if ord == 2:
             ret = _multi_svd_norm(x, row_axis, col_axis, amax, 0)
         elif ord == -2:
@@ -2840,11 +2862,17 @@ def norm(x, ord=None, axis=None, keepdims=False):
         elif ord == 1:
             if col_axis > row_axis:
                 col_axis -= 1
-            ret = sum(abs(x), axis=row_axis).max(axis=col_axis, initial=0)
+            reduced = sum(abs(x), axis=row_axis)
+            ret = (sum(reduced, axis=col_axis)
+                   if reduced.shape[col_axis] == 0 else
+                   reduced.max(axis=col_axis, initial=0))
         elif ord == inf:
             if row_axis > col_axis:
                 row_axis -= 1
-            ret = sum(abs(x), axis=col_axis).max(axis=row_axis, initial=0)
+            reduced = sum(abs(x), axis=col_axis)
+            ret = (sum(reduced, axis=row_axis)
+                   if reduced.shape[row_axis] == 0 else
+                   reduced.max(axis=row_axis, initial=0))
         elif ord == -1:
             if col_axis > row_axis:
                 col_axis -= 1

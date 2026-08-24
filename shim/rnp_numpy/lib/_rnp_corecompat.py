@@ -639,6 +639,10 @@ def tensordot(a, b, axes=2):
         N2a *= as_[ax]
     olda = [as_[ax] for ax in notin_a]
     oldb = [bs[ax] for ax in notin_b]
+    if N2a == 0:
+        out = np.empty(olda + oldb, dtype=np.result_type(a, b))
+        out[...] = 0
+        return out
     at = a.transpose(tuple(newaxes_a)).reshape(-1, N2a)
     bt = b.transpose(tuple(newaxes_b)).reshape(N2a, -1)
     res = dot(at, bt)

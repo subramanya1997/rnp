@@ -715,7 +715,21 @@ def _check_advanced_index_size(key):
 
 def getitem(self, key):
     _check_advanced_index_size(key)
-    return _orig_getitem(self, key)
+    result = _orig_getitem(self, key)
+    if (isinstance(result, ndarray) and type(self) is not ndarray and
+            type(result) is ndarray):
+        result = result.view(type(self))
+    return result
+
+
+def array_wrap(self, array, context=None, return_scalar=False):
+    """Wrap ufunc-style results in the receiver's ndarray subclass."""
+    result = array
+    if isinstance(result, ndarray) and type(self) is not ndarray:
+        result = result.view(type(self))
+    if return_scalar and isinstance(result, ndarray) and result.ndim == 0:
+        return result[()]
+    return result
 
 
 def setitem(self, key, value):
@@ -1077,6 +1091,7 @@ def install():
 
     ndarray.astype = astype
     ndarray.__array__ = array_protocol
+    ndarray.__array_wrap__ = array_wrap
     ndarray.copy = copy_method
     ndarray.__getitem__ = getitem
     ndarray.__setitem__ = setitem
