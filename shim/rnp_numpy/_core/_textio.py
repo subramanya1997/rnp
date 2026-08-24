@@ -645,6 +645,55 @@ def _dtype_converter(dt):
     return lambda s: s
 
 
+def _structured_leaf_dtypes(dt):
+    """Return the scalar text columns consumed by a structured dtype."""
+    if dt.subdtype is not None:
+        base, shape = dt.subdtype
+        count = 1
+        for size in shape:
+            count *= size
+        return _structured_leaf_dtypes(base) * count
+    if dt.names is not None:
+        leaves = []
+        for name in dt.names:
+            leaves.extend(_structured_leaf_dtypes(dt.fields[name][0]))
+        return leaves
+    return [dt]
+
+
+def _nest_values(values, shape):
+    """Reshape a flat Python list without requiring a homogeneous ndarray."""
+    if not shape:
+        return values[0]
+    stride = 1
+    for size in shape[1:]:
+        stride *= size
+    return [_nest_values(values[i * stride:(i + 1) * stride], shape[1:])
+            for i in range(shape[0])]
+
+
+def _pack_structured_values(dt, values, position=0):
+    """Pack converted scalar columns into nested/subarray field values."""
+    if dt.subdtype is not None:
+        base, shape = dt.subdtype
+        count = 1
+        for size in shape:
+            count *= size
+        packed = []
+        for _ in range(count):
+            value, position = _pack_structured_values(base, values, position)
+            packed.append(value)
+        return _nest_values(packed, shape), position
+    if dt.names is not None:
+        packed = []
+        for name in dt.names:
+            value, position = _pack_structured_values(
+                dt.fields[name][0], values, position)
+            packed.append(value)
+        return tuple(packed), position
+    return values[position], position + 1
+
+
 def _bool_from_text(s):
     t = s.strip().lower()
     if "_" in t:
@@ -774,9 +823,8 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
     comments = (None if comments is None else
                 comment_list[0] if len(comment_list) == 1 else comment_list)
     dt = _as_dtype(dtype)
-    if dt.names is not None:
-        raise NotImplementedError(
-            "loadtxt: structured dtypes are not supported by rnp yet")
+    structured = dt.names is not None
+    leaf_dtypes = _structured_leaf_dtypes(dt) if structured else None
 
     rows = _read_rows(fname, comments, delimiter, skiprows, usecols,
                       max_rows, encoding, quotechar=quotechar)
@@ -811,8 +859,17 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
                 argument = (field.encode("latin-1")
                             if encoding == "bytes" else field)
                 field = colconv[j](argument)
-            out.append(field if not isinstance(field, str) else
-                       conv(field.strip()))
+            if isinstance(field, str):
+                converter = (_dtype_converter(leaf_dtypes[j])
+                             if structured else conv)
+                field = converter(field.strip())
+            out.append(field)
+        if structured:
+            if len(out) != len(leaf_dtypes):
+                raise ValueError(
+                    f"the number of columns changed from {len(leaf_dtypes)} "
+                    f"to {len(out)} at some point")
+            out, _ = _pack_structured_values(dt, out)
         data.append(out)
 
     if not data:
@@ -821,10 +878,14 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
                       stacklevel=2)
         arr = _np.array([], dtype=dt)
         arr = _ensure_ndmin(arr, ndmin)
+        if unpack and structured:
+            return [arr[name] for name in dt.names]
         return arr.T if unpack else arr
 
     arr = _np.array(data, dtype=dt)
     arr = _ensure_ndmin(arr, ndmin)
+    if unpack and structured:
+        return [arr[name] for name in dt.names]
     return arr.T if unpack else arr
 
 
