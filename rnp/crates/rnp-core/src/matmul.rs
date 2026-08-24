@@ -21,6 +21,19 @@
 //! For contiguous float32/float64/complex numpy calls BLAS, whose blocked
 //! summation this cannot match bit for bit; `harness/dev_check_matmul.py`
 //! measures the resulting ULP gap rather than assuming it away.
+//!
+//! One consequence of that is worth naming, because it is the port's only
+//! known bit-level divergence here. `vecdot`/`vecmat` on complex operands run
+//! numpy's `@TYPE@_dotc`, which hands a *unit-stride* operand to
+//! `cblas_?dotc_sub`. At an inner length of exactly 1, Apple Accelerate's
+//! `dotc` produces a NaN whose **sign bit** differs from the one the same
+//! expression produces in C -- and no straight-line f64 expression reproduces
+//! it (searched: 4096 complex pairs and the 121-point special-value grid; the
+//! closest candidate still misses 3 cells, and adopting it would introduce
+//! 588 fresh divergences on the non-BLAS path, measured). This module
+//! therefore transcribes numpy's own C source, which matches numpy exactly on
+//! every path numpy does not route through BLAS (0/2401 pairs), and leaves
+//! the Accelerate n == 1 NaN sign as a documented platform artifact.
 
 use std::borrow::Cow;
 
@@ -416,14 +429,72 @@ pub fn result_dtype(kind: MatKind, a: DType, b: DType) -> Result<DType> {
 
 /// One element type the inner loop understands, together with the accumulator
 /// numpy uses for it.
+///
+/// There are two accumulations, not one, because numpy has two loops. The
+/// plain product (`matmul`, `matvec`, and `vecdot`/`vecmat` on real types)
+/// runs `@TYPE@_matmul_inner_noblas` / `@TYPE@_dot`, which accumulate in the
+/// element type. The *conjugating* product (`vecdot`/`vecmat` on complex
+/// types) runs `@TYPE@_dotc` from `umath/matmul.c.src`, which is a different
+/// expression -- `sumr += xr*yr + xi*yi`, `sumi += xr*yi - xi*yr`, not a
+/// conjugate followed by a complex multiply -- and which accumulates in
+/// `npy_double` even for `complex64`. Transcribing `dotc` rather than
+/// synthesising it from `conj()` matters for both the low bits of a
+/// `complex64` result and the sign bits of NaNs.
 trait MatElem: Element + Copy {
     type Acc: Copy;
     fn acc_zero() -> Self::Acc;
     fn acc_add(acc: Self::Acc, x: Self, y: Self) -> Self::Acc;
     fn acc_finish(acc: Self::Acc) -> Self;
-    fn conj(self) -> Self {
-        self
+
+    /// The accumulator `@TYPE@_dotc` uses. Identical to `Acc` for every type
+    /// where conjugation is a no-op.
+    type ConjAcc: Copy;
+    fn conj_zero() -> Self::ConjAcc;
+    fn conj_add(acc: Self::ConjAcc, x: Self, y: Self) -> Self::ConjAcc;
+    fn conj_finish(acc: Self::ConjAcc) -> Self;
+
+    /// True for the dtypes whose loop numpy leaves the FP status flags of.
+    ///
+    /// numpy compiles `matmul`/`vecdot`/`matvec`/`vecmat` with `USEBLAS` for
+    /// float32, float64, complex64 and complex128, and every one of those
+    /// loops ends in `if (!npy_blas_supports_fpe()) npy_clear_floatstatus_
+    /// barrier(...)` -- so on a platform whose BLAS does not preserve the FP
+    /// environment (Apple Accelerate, here) those four dtypes report *no*
+    /// warnings at all, even for the shapes that never reached BLAS. bool and
+    /// the integers have no FP status to report. That leaves float16, whose
+    /// loop is not compiled with `USEBLAS` and therefore does report.
+    const REPORT_FPE: bool = false;
+
+    /// Flags raised by one `acc_add` step, given the accumulator before and
+    /// after. Only consulted when `REPORT_FPE`.
+    fn acc_flags(_prev: Self::Acc, _x: Self, _y: Self, _next: Self::Acc) -> u8 {
+        0
     }
+
+    /// Flags raised by narrowing the accumulator back to the element type.
+    fn finish_flags(_acc: Self::Acc, _out: Self) -> u8 {
+        0
+    }
+}
+
+/// The `ConjAcc` half of the trait for every type where conjugation does
+/// nothing, so the two accumulations coincide.
+macro_rules! conj_is_plain {
+    () => {
+        type ConjAcc = Self::Acc;
+        #[inline]
+        fn conj_zero() -> Self::ConjAcc {
+            Self::acc_zero()
+        }
+        #[inline]
+        fn conj_add(acc: Self::ConjAcc, x: Self, y: Self) -> Self::ConjAcc {
+            Self::acc_add(acc, x, y)
+        }
+        #[inline]
+        fn conj_finish(acc: Self::ConjAcc) -> Self {
+            Self::acc_finish(acc)
+        }
+    };
 }
 
 macro_rules! int_elem {
@@ -442,6 +513,7 @@ macro_rules! int_elem {
             fn acc_finish(acc: $t) -> $t {
                 acc
             }
+            conj_is_plain!();
         }
     };
 }
@@ -471,6 +543,7 @@ macro_rules! float_elem {
             fn acc_finish(acc: $t) -> $t {
                 acc
             }
+            conj_is_plain!();
         }
     };
 }
@@ -492,6 +565,7 @@ impl MatElem for NpBool {
     fn acc_finish(acc: bool) -> NpBool {
         NpBool::new(acc)
     }
+    conj_is_plain!();
 }
 
 impl MatElem for F16 {
@@ -509,6 +583,45 @@ impl MatElem for F16 {
     #[inline]
     fn acc_finish(acc: f32) -> F16 {
         F16::from_f32(acc)
+    }
+    conj_is_plain!();
+
+    // float16 is the one dtype whose matmul loop numpy does *not* compile
+    // with `USEBLAS`, so it is the one dtype whose FP status survives to be
+    // reported. The conditions are the ones the C loop's own arithmetic
+    // raises: an invalid operation in the float32 multiply-accumulate, and an
+    // overflow either there or in the final `npy_float_to_half` narrowing
+    // (which on this platform is a hardware `fcvt`, and in numpy's own build
+    // is additionally guarded by `NPY_HALF_GENERATE_OVERFLOW`).
+    const REPORT_FPE: bool = true;
+
+    #[inline]
+    fn acc_flags(prev: f32, x: F16, y: F16, next: f32) -> u8 {
+        let (xf, yf) = (x.to_f32(), y.to_f32());
+        let p = xf * yf;
+        let mut f = 0u8;
+        if p.is_nan() && !(xf.is_nan() || yf.is_nan()) {
+            f |= crate::fpe::INVALID;
+        }
+        if p.is_infinite() && xf.is_finite() && yf.is_finite() {
+            f |= crate::fpe::OVER;
+        }
+        if next.is_nan() && !prev.is_nan() && !p.is_nan() {
+            f |= crate::fpe::INVALID;
+        }
+        if next.is_infinite() && prev.is_finite() && p.is_finite() {
+            f |= crate::fpe::OVER;
+        }
+        f
+    }
+
+    #[inline]
+    fn finish_flags(acc: f32, out: F16) -> u8 {
+        if acc.is_finite() && out.to_f32().is_infinite() {
+            crate::fpe::OVER
+        } else {
+            0
+        }
     }
 }
 
@@ -530,9 +643,25 @@ impl MatElem for C32 {
     fn acc_finish(acc: C32) -> C32 {
         acc
     }
+
+    // `CFLOAT_dotc`: the products stay in `npy_float`, but the running sum is
+    // `npy_double` ("at least double for stability"), and the conjugation is
+    // folded into the expression rather than applied to the operand.
+    type ConjAcc = (f64, f64);
     #[inline]
-    fn conj(self) -> C32 {
-        C32::new(self.re, -self.im)
+    fn conj_zero() -> (f64, f64) {
+        (0.0, 0.0)
+    }
+    #[inline]
+    fn conj_add(acc: (f64, f64), x: C32, y: C32) -> (f64, f64) {
+        (
+            acc.0 + (x.re * y.re + x.im * y.im) as f64,
+            acc.1 + (x.re * y.im - x.im * y.re) as f64,
+        )
+    }
+    #[inline]
+    fn conj_finish(acc: (f64, f64)) -> C32 {
+        C32::new(acc.0 as f32, acc.1 as f32)
     }
 }
 
@@ -553,9 +682,23 @@ impl MatElem for C64v {
     fn acc_finish(acc: C64v) -> C64v {
         acc
     }
+
+    // `CDOUBLE_dotc`, whose `npy_double` sum type is already the element's.
+    type ConjAcc = C64v;
     #[inline]
-    fn conj(self) -> C64v {
-        C64v::new(self.re, -self.im)
+    fn conj_zero() -> C64v {
+        C64v::new(0.0, 0.0)
+    }
+    #[inline]
+    fn conj_add(acc: C64v, x: C64v, y: C64v) -> C64v {
+        C64v::new(
+            acc.re + (x.re * y.re + x.im * y.im),
+            acc.im + (x.re * y.im - x.im * y.re),
+        )
+    }
+    #[inline]
+    fn conj_finish(acc: C64v) -> C64v {
+        acc
     }
 }
 
@@ -605,6 +748,8 @@ fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool,
     let mut ap: Vec<T> = Vec::with_capacity(r * k);
     let mut bp: Vec<T> = Vec::with_capacity(k * c);
     let mut acc: Vec<T::Acc> = Vec::with_capacity(r * c);
+    let mut cacc: Vec<T::ConjAcc> = Vec::new();
+    let mut flags = 0u8;
 
     for bi in 0..nbatch {
         let (ao, bo) = (a_batch[bi], b_batch[bi]);
@@ -613,8 +758,7 @@ fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool,
             for t in 0..k {
                 // SAFETY: `i < rows`, `t < inner` and `ao` is the in-bounds
                 // start of this batch, so the offset is in bounds.
-                let v: T = unsafe { read(a_base, ao + i as isize * sa_r + t as isize * sa_k) };
-                ap.push(if conj_a { v.conj() } else { v });
+                ap.push(unsafe { read(a_base, ao + i as isize * sa_r + t as isize * sa_k) });
             }
         }
         bp.clear();
@@ -624,6 +768,29 @@ fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool,
                 bp.push(unsafe { read(b_base, bo + t as isize * sb_k + j as isize * sb_c) });
             }
         }
+        let dst = &mut out_slice[bi * r * c..(bi + 1) * r * c];
+
+        if conj_a {
+            // `@TYPE@_dotc`: a different expression and, for complex64, a
+            // wider accumulator (see the trait's comment).
+            cacc.clear();
+            cacc.resize(r * c, T::conj_zero());
+            for i in 0..r {
+                let arow = &ap[i * k..i * k + k];
+                let orow = &mut cacc[i * c..i * c + c];
+                for (t, &x) in arow.iter().enumerate() {
+                    let brow = &bp[t * c..t * c + c];
+                    for (o, &y) in orow.iter_mut().zip(brow.iter()) {
+                        *o = T::conj_add(*o, x, y);
+                    }
+                }
+            }
+            for (d, &s) in dst.iter_mut().zip(cacc.iter()) {
+                *d = T::conj_finish(s);
+            }
+            continue;
+        }
+
         acc.clear();
         acc.resize(r * c, T::acc_zero());
         for i in 0..r {
@@ -632,14 +799,23 @@ fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool,
             for (t, &x) in arow.iter().enumerate() {
                 let brow = &bp[t * c..t * c + c];
                 for (o, &y) in orow.iter_mut().zip(brow.iter()) {
-                    *o = T::acc_add(*o, x, y);
+                    let next = T::acc_add(*o, x, y);
+                    if T::REPORT_FPE {
+                        flags |= T::acc_flags(*o, x, y, next);
+                    }
+                    *o = next;
                 }
             }
         }
-        let dst = &mut out_slice[bi * r * c..(bi + 1) * r * c];
         for (d, &s) in dst.iter_mut().zip(acc.iter()) {
             *d = T::acc_finish(s);
+            if T::REPORT_FPE {
+                flags |= T::finish_flags(s, *d);
+            }
         }
+    }
+    if T::REPORT_FPE {
+        crate::fpe::raise(flags);
     }
 }
 
@@ -977,6 +1153,67 @@ mod tests {
         let r = matmul(MatKind::VecDot, &v, &v, None, None).unwrap();
         assert_eq!(r.shape, Vec::<isize>::new());
         assert_eq!(floats(&r), vec![3.]);
+    }
+
+    #[test]
+    /// `@TYPE@_dotc` is not "conjugate, then multiply": it is a distinct
+    /// expression, and the difference is observable in the sign bit of a NaN.
+    ///
+    /// Measured against real numpy 2.5.2 over all 2401 pairs drawn from
+    /// {nan, ±inf, ±0, 1, 2}^2 with non-unit strides (which is the path numpy
+    /// runs in C rather than in BLAS): the expression below matches on every
+    /// pair, while `conj(x) * y` -- and the algebraically identical
+    /// `x.re*y.im + (-x.im)*y.re` -- do not.
+    #[test]
+    fn dotc_is_transcribed_not_synthesised() {
+        let one = C64v::new(f64::NAN, 0.0);
+        let mut a = NdArray::zeros(vec![2], DType::C128).unwrap();
+        let mut b = NdArray::zeros(vec![2], DType::C128).unwrap();
+        for i in 0..2 {
+            a.set_flat(i, Scalar::Complex(one));
+            b.set_flat(i, Scalar::Complex(one));
+        }
+        let r = matmul(MatKind::VecDot, &a, &b, None, None).unwrap();
+        let Scalar::Complex(v) = r.get_flat(0) else {
+            panic!("expected a complex result")
+        };
+        assert!(v.re.is_nan() && v.im.is_nan());
+        // `xr*yi - xi*yr` with xr = NaN, yi = +0 leaves the propagated NaN
+        // positive; the `conj`-then-multiply form would negate it.
+        assert!(!v.im.is_sign_negative(), "imaginary NaN sign flipped");
+    }
+
+    /// float16 is the only dtype whose matmul loop numpy leaves the FP status
+    /// of (every other floating loop is compiled with `USEBLAS` and ends by
+    /// clearing the status when the platform BLAS does not preserve it).
+    #[test]
+    fn float16_reports_fp_status() {
+        let mut a = NdArray::zeros(vec![1, 2], DType::F16).unwrap();
+        let mut b = NdArray::zeros(vec![2, 1], DType::F16).unwrap();
+        // inf * 0 -> invalid
+        a.set_flat(0, Scalar::Float(f64::INFINITY));
+        a.set_flat(1, Scalar::Float(0.0));
+        b.set_flat(0, Scalar::Float(0.0));
+        b.set_flat(1, Scalar::Float(0.0));
+        crate::fpe::clear();
+        let _ = matmul(MatKind::MatMul, &a, &b, None, None).unwrap();
+        assert_eq!(crate::fpe::take() & crate::fpe::INVALID, crate::fpe::INVALID);
+
+        // A finite float32 accumulator that no longer fits in float16.
+        a.set_flat(0, Scalar::Float(60000.0));
+        a.set_flat(1, Scalar::Float(60000.0));
+        b.set_flat(0, Scalar::Float(2.0));
+        b.set_flat(1, Scalar::Float(2.0));
+        crate::fpe::clear();
+        let r = matmul(MatKind::MatMul, &a, &b, None, None).unwrap();
+        assert_eq!(crate::fpe::take() & crate::fpe::OVER, crate::fpe::OVER);
+        assert!(r.get_flat(0).as_f64().is_infinite());
+
+        // The other dtypes stay silent, because numpy's do.
+        let x = NdArray::ones(vec![2, 2], DType::F64).unwrap();
+        crate::fpe::clear();
+        let _ = matmul(MatKind::MatMul, &x, &x, None, None).unwrap();
+        assert_eq!(crate::fpe::take(), 0);
     }
 
     #[test]
