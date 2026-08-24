@@ -465,6 +465,12 @@ impl Descr {
                     format!("'V{n}'")
                 }
             }
+            // `_dtype._scalar_str` special-cases the object dtype: because the
+            // pointer width is platform-dependent it never spells the itemsize,
+            // so both the short and the long form are just `'O'`. Probed:
+            // `repr(np.dtype(object))` is `dtype('O')`, and the nested form in
+            // `dtype([('a', object)])` is `'O'` as well -- never `'object'`.
+            DType::Object => "'O'".into(),
             // numpy always reprs a datetime dtype in its `<M8[unit]` form,
             // never as `datetime64[unit]`.
             DType::DateTime(u) | DType::TimeDelta(u) => {

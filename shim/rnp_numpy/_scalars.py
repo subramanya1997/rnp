@@ -893,6 +893,9 @@ def _check_range(d, value):
             f"string, a bytes-like object or a real number, not 'complex'")
     if kind not in "iu":
         return
+    # A *numpy* scalar argument is cast, not converted through CPython's
+    # `PyLong_As*`, so it never trips the C-conversion check below.
+    from_generic = isinstance(value, generic)
     if isinstance(value, _builtins.float):
         if value != value:
             raise ValueError("cannot convert float NaN to integer")
@@ -910,6 +913,18 @@ def _check_range(d, value):
         value = value.item()
     if not isinstance(value, int):
         return
+    # Before the dtype's own range check there is a C conversion, and a value
+    # too wide for *that* never reaches the range check: CPython's
+    # `PyLong_As*` raises first, with its own wording. Probed for all eight
+    # integer dtypes x {2**63-1, 2**63, 2**64-1, 2**64, -2**63, -2**63-1} and
+    # for int, float and str sources alike -- only `uint32`/`uint64` extract
+    # through an *unsigned* C type, so `np.uint8(2**63)` is "too large" while
+    # `np.uint32(2**63)` is merely "out of bounds".
+    if not from_generic:
+        hi_c = 2**64 - 1 if d.name in ("uint32", "uint64") else 2**63 - 1
+        if not -2**63 <= value <= hi_c:
+            raise OverflowError(
+                "Python int too large to convert to C long")
     lo, hi = _INT_RANGE[d.name]
     if not lo <= value <= hi:
         raise OverflowError(

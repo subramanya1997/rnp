@@ -368,7 +368,19 @@ pub fn getfield<'py>(
     if offset < 0 {
         return Err(PyValueError::new_err("offset is negative"));
     }
-    if offset as usize + d.itemsize() > arr.itemsize() {
+    // `array_getfield` reports two *different* messages, and which one it
+    // picks does not depend on the offset at all: a new type wider than the
+    // original is rejected on its own terms first, and only a new type that
+    // *would* fit at offset 0 gets the "plus offset" wording. Probed on an
+    // `int32` array: `getfield('i8', 0)`, `('i8', 4)` and `('i8', 8)` all say
+    // "new type is larger than original type", while `('i4', 4)`, `('i2', 3)`
+    // and `('i1', 4)` say "new type plus offset is larger than original type".
+    if arr.itemsize() < d.itemsize() {
+        return Err(PyValueError::new_err(
+            "new type is larger than original type",
+        ));
+    }
+    if offset as usize > arr.itemsize() - d.itemsize() {
         return Err(PyValueError::new_err(
             "new type plus offset is larger than original type",
         ));
