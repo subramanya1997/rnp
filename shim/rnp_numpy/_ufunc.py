@@ -344,10 +344,23 @@ class ufunc:
                 f"invalid number of arguments to ufunc {self.__name__!r}")
         if isinstance(out, tuple):
             out = out[0] if len(out) == 1 else out
-        scalar_out = out is None and _builtins.all(
+        # NumPy's private quantile path uses ``out=...`` to request a newly
+        # allocated ndarray.  It differs from omitted ``out`` only for scalar
+        # inputs, where the result must remain a 0-d array rather than being
+        # unboxed to a NumPy scalar.
+        allocate_out = out is Ellipsis
+        if allocate_out:
+            out = None
+        scalar_out = out is None and not allocate_out and _builtins.all(
             _is_scalarish(a) for a in args)
         if isinstance(out, ndarray):
             args = _broadcast_against_out(args, out.shape)
+            # Real NumPy has a concrete DType metaclass per dtype, so
+            # ``type(out.dtype)`` identifies the loop dtype.  The engine uses
+            # one generic ``dtype`` class; recover the intended concrete dtype
+            # from the output array when upstream code passes that class.
+            if dtype is _rnp.dtype:
+                dtype = out.dtype
         try:
             res = _rnp._ufunc_call(self.__name__, args, out=out, where_=where,
                                    casting=casting, dtype=dtype)
