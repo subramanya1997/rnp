@@ -3300,6 +3300,27 @@ class MaskedArray(ndarray):
                 output.fill_value = fill_value
         return output
 
+    def astype(self, dtype, order='K', casting='unsafe', subok=True,
+               copy=True):
+        """Cast the data while preserving masked-array metadata."""
+        data = self._data.astype(dtype, order=order, casting=casting,
+                                 subok=False, copy=copy)
+        if not subok:
+            return data
+
+        output = data.view(type(self))
+        output._update_from(self)
+        if self._mask is nomask:
+            output._mask = nomask
+        else:
+            output._mask = self._mask.astype(
+                make_mask_descr(output.dtype), order=order, copy=copy)
+        output._sharedmask = False
+        if self._fill_value is not None:
+            output._fill_value = _check_fill_value(
+                self._fill_value, output.dtype)
+        return output
+
     def __getitem__(self, indx):
         """
         x.__getitem__(y) <==> x[y]
