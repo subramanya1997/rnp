@@ -70,6 +70,14 @@ from . import _arraycompat as _arraycompat  # noqa: E402
 
 _arraycompat.install()
 
+# Object arrays reach their ufunc loops through `ndarray`'s operator slots and
+# reduction methods, neither of which goes through the ufunc objects, so those
+# are rerouted here (after `_arraycompat`, so its string wrappers stay in the
+# chain). See `._objectops`.
+from . import _objectops as _objectops  # noqa: E402
+
+_objectops.install(ndarray)
+
 
 # --------------------------------------------------------------------------
 # `order=` support for the allocating constructors.
@@ -623,6 +631,23 @@ def _flat_values(a):
 # exposes the builtins-shadowing aliases:
 max = amax
 min = amin
+
+# The free spellings of the reductions go straight to the engine, so they need
+# the same object-dtype reroute the methods got.
+sum = _objectops._wrap_free(sum, "sum")
+prod = _objectops._wrap_free(prod, "prod")
+amin = _objectops._wrap_free_simple(amin, "min")
+amax = _objectops._wrap_free_simple(amax, "max")
+max = amax
+min = amin
+cumsum = _objectops.cumsum
+cumprod = _objectops.cumprod
+
+# `object` absorbs every other dtype: `np.result_type(object, int64)` is
+# `object`. The engine's promotion table is numeric-only, so the object case is
+# short-circuited before it is consulted.
+promote_types = _objectops.wrap_promote(promote_types)
+result_type = _objectops.wrap_result_type(result_type)
 
 
 def all(a, axis=None, out=None, keepdims=False):

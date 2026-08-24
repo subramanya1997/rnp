@@ -14,6 +14,7 @@ mod itemsel;
 mod linalgops;
 mod pyarray;
 mod objects;
+mod objloops;
 mod pydtype;
 mod ufuncs;
 
