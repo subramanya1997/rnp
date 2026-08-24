@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T09:06:26.026075+00:00",
-  "overall_passed": 27203,
+  "timestamp": "2026-08-24T12:32:28.816606+00:00",
+  "overall_passed": 28882,
   "overall_total": 32336,
   "files": [
     {
@@ -45,8 +45,8 @@
     },
     {
       "file": "test_array_coercion.py",
-      "passed": 92,
-      "failed": 133,
+      "passed": 103,
+      "failed": 122,
       "errors": 0,
       "skipped": 0,
       "total": 225
@@ -85,8 +85,8 @@
     },
     {
       "file": "test_casting_floatingpoint_errors.py",
-      "passed": 0,
-      "failed": 210,
+      "passed": 210,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 210
@@ -165,16 +165,16 @@
     },
     {
       "file": "test_dlpack.py",
-      "passed": 0,
-      "failed": 82,
-      "errors": 13,
+      "passed": 95,
+      "failed": 0,
+      "errors": 0,
       "skipped": 0,
       "total": 95
     },
     {
       "file": "test_dtype.py",
-      "passed": 985,
-      "failed": 178,
+      "passed": 989,
+      "failed": 174,
       "errors": 0,
       "skipped": 4,
       "total": 1167
@@ -229,8 +229,8 @@
     },
     {
       "file": "test_half.py",
-      "passed": 33,
-      "failed": 6,
+      "passed": 36,
+      "failed": 3,
       "errors": 0,
       "skipped": 0,
       "total": 39
@@ -253,8 +253,8 @@
     },
     {
       "file": "test_indexing.py",
-      "passed": 72,
-      "failed": 34,
+      "passed": 75,
+      "failed": 31,
       "errors": 0,
       "skipped": 0,
       "total": 106
@@ -309,8 +309,8 @@
     },
     {
       "file": "test_multiarray.py",
-      "passed": 13219,
-      "failed": 1048,
+      "passed": 13223,
+      "failed": 1044,
       "errors": 0,
       "skipped": 5,
       "total": 14272,
@@ -334,8 +334,8 @@
     },
     {
       "file": "test_nditer.py",
-      "passed": 852,
-      "failed": 78,
+      "passed": 854,
+      "failed": 76,
       "errors": 0,
       "skipped": 2,
       "total": 932
@@ -350,8 +350,8 @@
     },
     {
       "file": "test_numeric.py",
-      "passed": 365,
-      "failed": 1341,
+      "passed": 1630,
+      "failed": 76,
       "errors": 0,
       "skipped": 2,
       "total": 1708
@@ -398,8 +398,8 @@
     },
     {
       "file": "test_regression.py",
-      "passed": 318,
-      "failed": 101,
+      "passed": 319,
+      "failed": 100,
       "errors": 0,
       "skipped": 3,
       "total": 422
@@ -422,8 +422,8 @@
     },
     {
       "file": "test_scalarbuffer.py",
-      "passed": 0,
-      "failed": 79,
+      "passed": 79,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 79
@@ -494,8 +494,8 @@
     },
     {
       "file": "test_ufunc.py",
-      "passed": 380,
-      "failed": 487,
+      "passed": 382,
+      "failed": 485,
       "errors": 0,
       "skipped": 8,
       "total": 875
