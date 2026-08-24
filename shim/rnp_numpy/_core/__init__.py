@@ -37,3 +37,14 @@ from .shape_base import (  # noqa: F401
     stack,
     vstack,
 )
+
+
+def __getattr__(name):
+    """Expose late-bound top-level core names without an import cycle."""
+    import rnp_numpy
+
+    try:
+        return getattr(rnp_numpy, name)
+    except AttributeError:
+        raise AttributeError(
+            f"module 'numpy._core' has no attribute {name!r}") from None
