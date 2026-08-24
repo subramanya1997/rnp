@@ -468,12 +468,17 @@ def full(shape, fill_value, dtype=None, order="C", *, like=None):
         out = _raw_full(shape, fill_value, dtype)
     except TypeError:
         fv = fill_value if isinstance(fill_value, ndarray) \
-            else _pkg().asarray(fill_value)
+            else _pkg().asarray(fill_value, dtype)
         if dtype is None:
             dtype = fv.dtype
         shape = tuple(shape) if hasattr(shape, "__len__") else (shape,)
         out = _empty(shape, dtype)
-        out[...] = fv
+        if fv.ndim == 0 and fv.dtype == object:
+            # Broadcasting a 0-d object array would store the *array* in every
+            # cell; numpy stores the object it holds.
+            out[...] = fv[()]
+        else:
+            out[...] = fv
         return out
     order = _norm_order(order, "C")
     if order in ("F",) and out.ndim > 1:
