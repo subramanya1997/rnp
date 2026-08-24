@@ -12,6 +12,7 @@ mod adopt;
 mod convert;
 mod dlpack;
 mod fields;
+mod fftops;
 mod index;
 mod itemsel;
 mod linalgops;
@@ -1353,6 +1354,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_register_scalar_wraps, m)?)?;
     m.add_function(wrap_pyfunction!(_register_datetime_factory, m)?)?;
     ufuncs::register(m)?;
+    fftops::register(m)?;
     linalgops::register(m)?;
     dlpack::register(m)?;
 

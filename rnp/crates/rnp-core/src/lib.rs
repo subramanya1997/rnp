@@ -12,6 +12,7 @@ pub mod dtype;
 pub mod element;
 pub mod error;
 pub mod fpe;
+pub mod fft;
 pub mod indexing;
 pub mod iter;
 pub mod lapack;
