@@ -358,6 +358,9 @@ impl Descr {
             // numpy prints the object dtype as `|O`, with no size.
             return "|O".to_string();
         }
+        if matches!(self.dt, DType::String(_)) {
+            return "StringDType()".to_string();
+        }
         if let DType::DateTime(u) | DType::TimeDelta(u) = self.dt {
             let suffix = crate::datetime::DtMeta::unpack(u).suffix();
             return format!("{}{}8{}", prefix, self.dt.kind(), suffix);
@@ -402,6 +405,7 @@ impl Descr {
             // `'3w'` (UCS4) and `'4x'` (opaque padding).
             DType::Bytes(n) => format!("{prefix}{n}s"),
             DType::Str(n) => format!("{prefix}{n}w"),
+            DType::String(_) => format!("{prefix}16B"),
             DType::Void(n) => format!("{prefix}{n}x"),
             DType::I64 => format!(
                 "{prefix}{}",
@@ -549,6 +553,7 @@ impl Descr {
                     format!("'{bo}U{n}'")
                 }
             }
+            DType::String(_) => "StringDType()".into(),
             DType::Void(n) => {
                 if n == 0 {
                     "'V'".into()

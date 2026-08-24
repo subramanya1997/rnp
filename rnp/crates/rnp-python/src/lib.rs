@@ -26,6 +26,16 @@ use convert::{any_scalar, array_from_any, array_from_any_descr, scalar_from_py};
 use pyarray::{descr_or_default, shape_from_any, ufunc2, PyNdArray};
 use pydtype::{descr_from_any, dtype_from_any, PyDType};
 
+#[pyfunction]
+fn _string_dtype(
+    py: Python<'_>,
+    coerce: bool,
+    has_na: bool,
+    na_object: &Bound<'_, PyAny>,
+) -> PyDType {
+    pydtype::new_string_dtype(py, coerce, has_na.then_some(na_object))
+}
+
 /// Python exception constructors the shim installs at import time, keyed by
 /// the engine error they build. The engine only knows names and dtypes; the
 /// shim owns the classes (`numpy._core._exceptions`) and the ufunc objects.
@@ -1277,6 +1287,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(datetime_data, m)?)?;
     m.add_function(wrap_pyfunction!(isnat, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_strings, m)?)?;
+    m.add_function(wrap_pyfunction!(_string_dtype, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_string_len, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_objects, m)?)?;
     m.add_function(wrap_pyfunction!(_datetime_struct, m)?)?;

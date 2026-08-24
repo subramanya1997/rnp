@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use pyo3::basic::CompareOp;
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::{OnceLock, RwLock};
 use pyo3::types::{
@@ -25,6 +25,91 @@ static SCALAR_TYPES: OnceLock<Py<PyDict>> = OnceLock::new();
 /// decoration with their descriptor.  Entries intentionally live for the
 /// process lifetime, just like the compound-dtype interners in rnp-core.
 static METADATA: OnceLock<RwLock<Vec<Py<PyDict>>>> = OnceLock::new();
+
+/// Python-owned parameters for NEP 55 StringDType descriptors. Core keeps the
+/// compact id in `DType::String`, just as it does for interned structured
+/// descriptors, while the NA sentinel retains its Python identity here.
+struct StringParams {
+    coerce: bool,
+    na_object: Option<Py<PyAny>>,
+}
+
+static STRING_PARAMS: OnceLock<RwLock<Vec<StringParams>>> = OnceLock::new();
+
+fn string_params_store() -> &'static RwLock<Vec<StringParams>> {
+    STRING_PARAMS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn string_params(py: Python<'_>, id: u32) -> Option<(bool, Option<Py<PyAny>>)> {
+    if id == 0 {
+        return Some((true, None));
+    }
+    string_params_store()
+        .read()
+        .ok()?
+        .get(id as usize - 1)
+        .map(|p| (p.coerce, p.na_object.as_ref().map(|o| o.clone_ref(py))))
+}
+
+pub fn new_string_dtype(
+    py: Python<'_>,
+    coerce: bool,
+    na_object: Option<&Bound<'_, PyAny>>,
+) -> PyDType {
+    if coerce && na_object.is_none() {
+        return PyDType::new(DType::String(0));
+    }
+    let mut store = string_params_store().write().unwrap();
+    store.push(StringParams {
+        coerce,
+        na_object: na_object.map(|o| o.clone().unbind()),
+    });
+    let _ = py;
+    PyDType::new(DType::String(store.len() as u32))
+}
+
+fn string_params_equal(py: Python<'_>, a: u32, b: u32) -> PyResult<bool> {
+    let Some((ac, an)) = string_params(py, a) else { return Ok(false) };
+    let Some((bc, bn)) = string_params(py, b) else { return Ok(false) };
+    if ac != bc {
+        return Ok(false);
+    }
+    match (an, bn) {
+        (None, None) => Ok(true),
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.bind(py), b.bind(py));
+            if a.is(b) {
+                return Ok(true);
+            }
+            // All floating NaNs are one logical NA category in NumPy's
+            // StringDType equality, even though their ordinary equality and
+            // hashes remain object-specific.
+            if a.extract::<f64>().is_ok_and(f64::is_nan)
+                && b.extract::<f64>().is_ok_and(f64::is_nan)
+            {
+                return Ok(true);
+            }
+            match a.eq(b) {
+                Ok(eq) => Ok(eq),
+                Err(_) => Ok(false),
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+fn string_repr(py: Python<'_>, id: u32) -> PyResult<String> {
+    let (coerce, na) = string_params(py, id)
+        .ok_or_else(|| PyTypeError::new_err("invalid StringDType descriptor"))?;
+    let mut args = Vec::new();
+    if let Some(na) = na {
+        args.push(format!("na_object={}", na.bind(py).repr()?.to_str()?));
+    }
+    if !coerce {
+        args.push("coerce=False".to_string());
+    }
+    Ok(format!("StringDType({})", args.join(", ")))
+}
 
 fn metadata_store() -> &'static RwLock<Vec<Py<PyDict>>> {
     METADATA.get_or_init(|| RwLock::new(Vec::new()))
@@ -468,7 +553,12 @@ impl PyDType {
 
     #[getter]
     fn str(&self) -> String {
-        self.d.str_code()
+        match self.d.dt {
+            DType::String(id) => Python::attach(|py| {
+                string_repr(py, id).unwrap_or_else(|_| "StringDType()".into())
+            }),
+            _ => self.d.str_code(),
+        }
     }
 
     #[getter]
@@ -493,7 +583,7 @@ impl PyDType {
 
     #[getter]
     fn isbuiltin(&self) -> i32 {
-        if self.d.is_struct() || self.d.subarray_def().is_some() {
+        if self.d.is_struct() || self.d.subarray_def().is_some() || self.d.dt.is_string() {
             0
         } else {
             1
@@ -507,12 +597,36 @@ impl PyDType {
 
     #[getter]
     fn hasobject(&self) -> bool {
-        false
+        self.d.dt.is_object() || self.d.dt.is_string()
+    }
+
+    #[getter]
+    fn coerce(&self, py: Python<'_>) -> PyResult<bool> {
+        match self.d.dt {
+            DType::String(id) => string_params(py, id)
+                .map(|p| p.0)
+                .ok_or_else(|| PyAttributeError::new_err("coerce")),
+            _ => Err(PyAttributeError::new_err("coerce")),
+        }
+    }
+
+    #[getter]
+    fn na_object<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self.d.dt {
+            DType::String(id) => match string_params(py, id).and_then(|p| p.1) {
+                Some(na) => Ok(na.into_bound(py)),
+                None => Err(PyAttributeError::new_err("na_object")),
+            },
+            _ => Err(PyAttributeError::new_err("na_object")),
+        }
     }
 
     /// `dtype.type`: the scalar class, looked up in the shim's registry.
     #[getter]
     fn r#type<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if self.d.dt.is_string() {
+            return Ok(Some(PyString::type_object(py).into_any()));
+        }
         // The C-type aliases keep their own scalar class: `np.dtype('q').type`
         // is `np.longlong`, not `np.int64`, even though the two dtypes compare
         // equal.
@@ -537,6 +651,7 @@ impl PyDType {
             // The datetime classes are one per *family*, not per unit.
             DType::DateTime(_) => "datetime64".into(),
             DType::TimeDelta(_) => "timedelta64".into(),
+            DType::String(_) => "str_".into(),
             d => d.name(),
         };
         match SCALAR_TYPES.get() {
@@ -548,7 +663,7 @@ impl PyDType {
     #[getter]
     fn flags(&self) -> i32 {
         // NPY_LIST_PICKLE etc.; nothing the port models yet.
-        0
+        if self.d.dt.is_string() { 107 } else { 0 }
     }
 
     #[getter]
@@ -662,15 +777,28 @@ impl PyDType {
         ))
     }
 
-    fn __repr__(&self) -> String {
-        self.d.repr_string()
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        match self.d.dt {
+            DType::String(id) => string_repr(py, id),
+            _ => Ok(self.d.repr_string()),
+        }
     }
 
-    fn __str__(&self) -> String {
-        self.d.str_string()
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        self.__repr__(py)
     }
 
-    fn __hash__(&self) -> u64 {
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        if let DType::String(id) = self.d.dt {
+            let (coerce, na) = string_params(py, id)
+                .ok_or_else(|| PyTypeError::new_err("invalid StringDType descriptor"))?;
+            let args = PyList::empty(py);
+            args.append(coerce)?;
+            if let Some(na) = na {
+                args.append(na.bind(py))?;
+            }
+            return args.to_tuple().hash();
+        }
         let mut h = DefaultHasher::new();
         if self.d.is_struct() || self.d.subarray_def().is_some() {
             // repr omits metadata but captures compound storage recursively.
@@ -678,7 +806,7 @@ impl PyDType {
         } else {
             self.d.hash(&mut h);
         }
-        h.finish()
+        Ok(h.finish() as isize)
     }
 
     fn __len__(&self) -> usize {
@@ -713,7 +841,10 @@ impl PyDType {
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
         let py = other.py();
         let eq = match descr_from_any(other) {
-            Ok(d) => storage_eq(d, self.d),
+            Ok(d) => match (self.d.dt, d.dt) {
+                (DType::String(a), DType::String(b)) => string_params_equal(py, a, b)?,
+                _ => storage_eq(d, self.d),
+            },
             // numpy returns False rather than raising for junk comparisons.
             Err(_) => false,
         };
@@ -726,6 +857,21 @@ impl PyDType {
 
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
         let py = slf.py();
+        if let DType::String(id) = slf.borrow().d.dt {
+            let (coerce, na) = string_params(py, id)
+                .ok_or_else(|| PyTypeError::new_err("invalid StringDType descriptor"))?;
+            let helper = py.import("numpy.dtypes")?.getattr("_reconstruct_string_dtype")?;
+            let has_na = na.is_some();
+            let args = PyTuple::new(
+                py,
+                [
+                    coerce.into_pyobject(py)?.to_owned().into_any(),
+                    has_na.into_pyobject(py)?.to_owned().into_any(),
+                    na.unwrap_or_else(|| py.None()).into_bound(py),
+                ],
+            )?;
+            return PyTuple::new(py, [helper, args.into_any()]);
+        }
         let cls = slf.get_type().into_any();
         let args = PyTuple::new(py, [slf.borrow().d.str_code()])?.into_any();
         let metadata = metadata_dict(py, slf.borrow().d.metadata);
