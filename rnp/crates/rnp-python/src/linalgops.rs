@@ -11,7 +11,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use rnp_core::matmul::{self, MatKind};
-use rnp_core::NdArray;
+use rnp_core::{DType, NdArray};
 
 use crate::convert::array_from_any;
 use crate::pyarray::{store_or_wrap, PyNdArray};
@@ -233,5 +233,104 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_matmul_plan, m)?)?;
     m.add_function(wrap_pyfunction!(_dot, m)?)?;
     m.add_function(wrap_pyfunction!(_inner, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_solve, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_inv, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_det, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_slogdet, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_cholesky, m)?)?;
+    m.add_function(wrap_pyfunction!(_lapack_lstsq, m)?)?;
     Ok(())
+}
+
+fn lapack_dtype(name: &str) -> PyResult<DType> {
+    match name {
+        "float32" => Ok(DType::F32),
+        "float64" => Ok(DType::F64),
+        "complex64" => Ok(DType::C64),
+        "complex128" => Ok(DType::C128),
+        _ => Err(PyTypeError::new_err(format!("unsupported LAPACK dtype {name:?}"))),
+    }
+}
+
+#[pyfunction]
+fn _lapack_solve(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    b: &Bound<'_, PyAny>,
+    vector: bool,
+    dtype: &str,
+) -> PyResult<Py<PyAny>> {
+    let aa = array_from_any(a, None, false)?;
+    let bb = array_from_any(b, None, false)?;
+    let out = rnp_core::lapack::solve(&aa, &bb, vector, lapack_dtype(dtype)?)
+        .map_err(crate::err)?;
+    PyNdArray::into_py_any(out, py).map(|value| value.into_any())
+}
+
+#[pyfunction]
+fn _lapack_inv(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    dtype: &str,
+) -> PyResult<Py<PyAny>> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::inv(&aa, lapack_dtype(dtype)?).map_err(crate::err)?;
+    PyNdArray::into_py_any(out, py).map(|value| value.into_any())
+}
+
+#[pyfunction]
+fn _lapack_det(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    dtype: &str,
+) -> PyResult<Py<PyAny>> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::det(&aa, lapack_dtype(dtype)?).map_err(crate::err)?;
+    PyNdArray::into_py_any(out, py).map(|value| value.into_any())
+}
+
+#[pyfunction]
+fn _lapack_slogdet(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    dtype: &str,
+) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+    let aa = array_from_any(a, None, false)?;
+    let (sign, logabs) =
+        rnp_core::lapack::slogdet(&aa, lapack_dtype(dtype)?).map_err(crate::err)?;
+    Ok((PyNdArray::into_py_any(sign, py)?.into_any(),
+        PyNdArray::into_py_any(logabs, py)?.into_any()))
+}
+
+#[pyfunction]
+fn _lapack_cholesky(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    upper: bool,
+    dtype: &str,
+) -> PyResult<Py<PyAny>> {
+    let aa = array_from_any(a, None, false)?;
+    let out = rnp_core::lapack::cholesky(&aa, upper, lapack_dtype(dtype)?)
+        .map_err(crate::err)?;
+    PyNdArray::into_py_any(out, py).map(|value| value.into_any())
+}
+
+#[pyfunction]
+fn _lapack_lstsq(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    b: &Bound<'_, PyAny>,
+    rcond: f64,
+    dtype: &str,
+) -> PyResult<(Py<PyAny>, Py<PyAny>, i64, Py<PyAny>)> {
+    let aa = array_from_any(a, None, false)?;
+    let bb = array_from_any(b, None, false)?;
+    let out = rnp_core::lapack::lstsq(&aa, &bb, rcond, lapack_dtype(dtype)?)
+        .map_err(crate::err)?;
+    Ok((
+        PyNdArray::into_py_any(out.x, py)?.into_any(),
+        PyNdArray::into_py_any(out.residuals, py)?.into_any(),
+        out.rank,
+        PyNdArray::into_py_any(out.singular_values, py)?.into_any(),
+    ))
 }

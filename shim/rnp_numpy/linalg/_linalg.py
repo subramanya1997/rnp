@@ -55,6 +55,7 @@ from numpy._core import (
     matrix_transpose as _core_matrix_transpose,
     moveaxis,
     multiply,
+    ndarray,
     newaxis,
     object_,
     outer as _core_outer,
@@ -162,7 +163,11 @@ def _raise_linalgerror_qr(err, flag):
 
 def _makearray(a):
     new = asarray(a)
-    wrap = getattr(a, "__array_wrap__", new.__array_wrap__)
+    wrap = getattr(a, "__array_wrap__", None)
+    if wrap is None and isinstance(a, ndarray) and type(a) is not ndarray:
+        wrap = lambda value: value.view(type(a))
+    if wrap is None:
+        wrap = lambda value: value
     return new, wrap
 
 def isComplexType(t):

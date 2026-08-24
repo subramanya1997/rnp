@@ -14,6 +14,7 @@ pub mod error;
 pub mod fpe;
 pub mod indexing;
 pub mod iter;
+pub mod lapack;
 pub mod loops;
 pub mod matmul;
 pub mod ops;
