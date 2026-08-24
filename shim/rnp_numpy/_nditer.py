@@ -869,20 +869,20 @@ class nditer:
     def __delitem__(self, key):
         raise TypeError("iterator elements cannot be deleted")
 
-    def iternext(self):
+    def iternext(self, /):
         self._flush_external()
         self._flush_buffered_writebacks()
         if not self.finished:
             self._pos += self._chunk_len if "external_loop" in self._flags else 1
         return not self.finished
 
-    def reset(self):
+    def reset(self, /):
         self._check_open()
         self._flush_external()
         self._flush_buffered_writebacks()
         self._pos = self._start
 
-    def remove_axis(self, axis):
+    def remove_axis(self, axis, /):
         if "multi_index" not in self._flags:
             raise ValueError("Iterator is not tracking a multi-index")
         axis = int(axis)
@@ -895,14 +895,14 @@ class nditer:
         self._stop = self._start + _shape_size(self._active_shape())
         self._pos = self._start
 
-    def remove_multi_index(self):
+    def remove_multi_index(self, /):
         if "multi_index" not in self._flags:
             raise ValueError("Iterator is not tracking a multi-index")
         self._flags.remove("multi_index")
         self._multi_index_removed = True
         self._pos = self._start
 
-    def enable_external_loop(self):
+    def enable_external_loop(self, /):
         if self._flags & {"multi_index", "c_index", "f_index"}:
             raise ValueError(
                 "Iterator flag EXTERNAL_LOOP cannot be used if an index or "
@@ -911,7 +911,7 @@ class nditer:
         self._flags.add("external_loop")
         self._chunk_cache = None
 
-    def copy(self):
+    def copy(self, /):
         result = _copy.copy(self)
         result._flags = set(self._flags)
         result._removed_axes = set(self._removed_axes)
@@ -919,7 +919,7 @@ class nditer:
         result._writebacks = list(self._writebacks)
         return result
 
-    def close(self, *args, **kwargs):
+    def close(self, /, *args, **kwargs):
         if args or kwargs:
             raise TypeError("close() takes no arguments")
         if self._closed:
