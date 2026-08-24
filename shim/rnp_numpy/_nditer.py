@@ -943,5 +943,153 @@ class nditer:
         return False
 
 
-def nested_iters(*args, **kwargs):
-    raise NotImplementedError("numpy.nested_iters is not implemented yet")
+class _NestedState:
+    def __init__(self, base):
+        self.base = base
+        self.coord = [0] * len(base._logical_shape)
+        self.levels = []
+
+    def close(self):
+        self.base.close()
+
+
+class _NestedIter:
+    """One linked level returned by :func:`nested_iters`."""
+
+    def __init__(self, state, axes, level):
+        self._state = state
+        self._axes = tuple(axes)
+        self._level = level
+        base = state.base
+        if base._order == "C":
+            self._axis_fast = tuple(reversed(self._axes))
+        elif base._order == "F":
+            self._axis_fast = self._axes
+        else:
+            rank = {axis: pos for pos, axis in enumerate(base._axis_fast)}
+            self._axis_fast = tuple(sorted(self._axes, key=rank.__getitem__))
+        self._size = _shape_size(base._logical_shape[axis]
+                                 for axis in self._axes)
+        self._pos = 0
+        self._closed = False
+
+    def _coord_at(self, pos):
+        coord = list(self._state.coord)
+        base = self._state.base
+        for axis in self._axis_fast:
+            dim = base._logical_shape[axis]
+            digit = pos % dim
+            pos //= dim
+            coord[axis] = dim - 1 - digit if base._axis_reverse[axis] else digit
+        return coord
+
+    def _set_current_coord(self):
+        coord = self._coord_at(min(self._pos, max(self._size - 1, 0)))
+        for axis in self._axes:
+            self._state.coord[axis] = coord[axis]
+
+    def _value_for_operand(self, operand):
+        base = self._state.base
+        self._set_current_coord()
+        arr = base._operands[operand]
+        coord = base._operand_coord(arr, tuple(self._state.coord))
+        return base._cell_view(
+            arr, coord, "readonly" not in base._op_flags[operand]
+        )
+
+    @property
+    def operands(self):
+        return self._state.base.operands
+
+    @property
+    def dtypes(self):
+        return self._state.base.dtypes
+
+    @property
+    def nop(self):
+        return self._state.base.nop
+
+    @property
+    def finished(self):
+        return self._closed or self._pos >= self._size
+
+    @property
+    def value(self):
+        if self.finished:
+            raise ValueError("Iterator is past the end")
+        values = tuple(self._value_for_operand(i) for i in range(self.nop))
+        return values[0] if self.nop == 1 else values
+
+    def __len__(self):
+        return self._size
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._state.base._flush_buffered_writebacks()
+        if self.finished:
+            raise StopIteration
+        self._set_current_coord()
+        for child in self._state.levels[self._level + 1:]:
+            child._pos = 0
+        value = self.value
+        self._pos += 1
+        return value
+
+    def __getitem__(self, key):
+        indices = list(range(self.nop))[key]
+        if isinstance(indices, int):
+            return self._value_for_operand(indices)
+        return tuple(self._value_for_operand(i) for i in indices)
+
+    def __setitem__(self, key, value):
+        target = self[key]
+        if isinstance(key, slice):
+            for cell, item in zip(target, value):
+                cell[...] = item
+        else:
+            target[...] = value
+
+    def iternext(self):
+        try:
+            next(self)
+        except StopIteration:
+            return False
+        return not self.finished
+
+    def reset(self):
+        self._pos = 0
+
+    def close(self, *args, **kwargs):
+        if args or kwargs:
+            raise TypeError("close() takes no arguments")
+        if not self._closed:
+            self._state.close()
+            self._closed = True
+
+    def __enter__(self):
+        if self._closed:
+            raise RuntimeError("Cannot enter a closed iterator")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+
+def nested_iters(op, axes, flags=None, op_flags=None, op_dtypes=None,
+                 order="K", casting="safe", buffersize=0):
+    groups = [tuple(int(axis) for axis in group) for group in axes]
+    base = nditer(op, flags=flags, op_flags=op_flags,
+                  op_dtypes=op_dtypes, order=order, casting=casting,
+                  buffersize=buffersize)
+    ndim = len(base._logical_shape)
+    flattened = [axis for group in groups for axis in group]
+    if sorted(flattened) != list(range(ndim)):
+        base.close()
+        raise ValueError("nested_iters axes must partition all iterator axes")
+    state = _NestedState(base)
+    state.levels = [_NestedIter(state, group, level)
+                    for level, group in enumerate(groups)]
+    return tuple(state.levels)
