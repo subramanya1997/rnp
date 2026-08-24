@@ -235,7 +235,7 @@ def _text_scalar(obj, dtype):
     if not isinstance(obj, (bytes, str)) or dtype is None:
         return None
     dt = _rnp.dtype(dtype)
-    if dt.kind in "USVO":
+    if dt.kind in "USVOT":
         return None
     return _rnp_array(obj, None).astype(dt)
 

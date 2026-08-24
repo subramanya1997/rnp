@@ -72,7 +72,13 @@ _UNSET = _Unset()
 #: Ufuncs numpy gives string loops that the engine has no loop for.  Each
 #: maps to the equivalent `numpy.strings` implementation, which is where the
 #: real work (and numpy's itemsize arithmetic) already lives.
-_STRING_LOOPS = {"add": "add", "multiply": "multiply"}
+_STRING_LOOPS = {
+    "add": "add", "multiply": "multiply",
+    "equal": "equal", "not_equal": "not_equal", "less": "less",
+    "less_equal": "less_equal", "greater": "greater",
+    "greater_equal": "greater_equal",
+    "maximum": "maximum", "minimum": "minimum",
+}
 
 
 def _string_kinds(args):
@@ -139,22 +145,41 @@ def _string_loop_fallback(name, args):
     if fn is None:
         return None
     kinds = _string_kinds(args)
-    if kinds is None or not any(k in "SU" for k in kinds):
+    if kinds is None or not any(k in "SUT" for k in kinds):
         return None
     if name == "add":
         # numpy has S+S and U+U loops but deliberately no mixed S/U loop.
-        if len(kinds) != 2 or set(kinds) not in ({"S"}, {"U"}):
+        if (len(kinds) != 2
+                or ("T" not in kinds and set(kinds) not in ({"S"}, {"U"}))):
             return None
     elif name == "multiply":
         # One string operand repeated an integer number of times.
         if len(kinds) != 2 or sorted(
-            "s" if k in "SU" else "i" if k in "iub" else "?" for k in kinds
+            "s" if k in "SUT" else "i" if k in "iub" else "?" for k in kinds
         ) != ["i", "s"]:
             return None
-        if kinds[0] not in "SU":  # numpy accepts either order
+        if kinds[0] not in "SUT":  # numpy accepts either order
             args = (args[1], args[0])
     from . import strings as _strings
     return getattr(_strings, fn)(*args)
+
+
+def _string_isnan(args):
+    """StringDType's ``isnan`` loop classifies only its configured NA.
+
+    A string-valued, ``None``, or pandas-style sentinel is not NaN.  NumPy
+    classifies a floating NaN sentinel once on the descriptor and then uses
+    identity when reading array elements; the storage layer likewise retains
+    that exact Python object.
+    """
+    if len(args) != 1 or _string_kinds(args) != ["T"]:
+        return None
+    arr = _rnp.asarray(args[0])
+    na = getattr(arr.dtype, "na_object", _UNSET)
+    nan_sentinel = isinstance(na, float) and na != na
+    vals = arr.reshape(-1).tolist() if arr.ndim else [arr.tolist()]
+    return _rnp.asarray([nan_sentinel and v is na for v in vals]).reshape(
+        arr.shape)
 
 
 def _broadcast_against_out(args, oshape):
@@ -348,6 +373,19 @@ class ufunc:
             _is_scalarish(a) for a in args)
         if isinstance(out, ndarray):
             args = _broadcast_against_out(args, out.shape)
+        res = None
+        if (self.__name__ == "isnan" and out is None and dtype is None
+                and where is True):
+            res = _string_isnan(args)
+        kinds = _string_kinds(args)
+        if (res is None and dtype is None and where is True
+                and kinds is not None and "T" in kinds):
+            res = _string_loop_fallback(self.__name__, args)
+            if res is not None and out is not None:
+                out[...] = res
+                res = out
+        if res is not None:
+            return _maybe_scalar(res, scalar_out)
         try:
             res = _rnp._ufunc_call(self.__name__, args, out=out, where_=where,
                                    casting=casting, dtype=dtype)

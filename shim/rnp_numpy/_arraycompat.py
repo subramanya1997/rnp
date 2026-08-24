@@ -759,8 +759,15 @@ def _make_str_comparison(name):
     elementwise.  Promoting the scalar first restores numpy's broadcasting.
     """
     _orig = getattr(ndarray, name)
+    _string_name = {
+        "__eq__": "equal", "__ne__": "not_equal", "__lt__": "less",
+        "__le__": "less_equal", "__gt__": "greater",
+        "__ge__": "greater_equal",
+    }[name]
 
     def compare(self, other):
+        if self.dtype.kind == "T":
+            return getattr(_pkg().strings, _string_name)(self, other)
         if isinstance(other, (str, bytes)) and self.dtype.kind in "SU":
             return _orig(self, _pkg().array(other))
         return _orig(self, other)
@@ -793,7 +800,7 @@ def _make_str_binop(name, fn, reflected):
     _orig = getattr(ndarray, name)
 
     def binop(self, other):
-        if self.dtype.kind in "SU":
+        if self.dtype.kind in "SUT":
             strings = _pkg().strings
             if fn == "multiply":
                 # Repetition takes (string, count) whichever side the count
@@ -830,7 +837,7 @@ def _make_str_inplace(name, fn):
     _orig = getattr(ndarray, name)
 
     def inplace(self, other):
-        if self.dtype.kind in "SU":
+        if self.dtype.kind in "SUT":
             strings = _pkg().strings
             try:
                 res = getattr(strings, fn)(self, other)
