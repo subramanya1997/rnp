@@ -100,6 +100,8 @@ def _flat(x):
 
 def _values_equal(a, b):
     """Elementwise equality with numpy's NaN-equals-NaN testing semantics."""
+    if a is b:
+        return True
     if isinstance(a, float) and isinstance(b, float):
         if a != a and b != b:
             return True

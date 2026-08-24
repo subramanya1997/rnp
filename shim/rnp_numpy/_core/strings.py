@@ -400,7 +400,15 @@ def _is_nan_na(arr, value):
     if arr.dtype.kind != "T" or not hasattr(arr.dtype, "na_object"):
         return False
     na = arr.dtype.na_object
-    return value is na and isinstance(na, float) and na != na
+    if value is not na:
+        return False
+    if isinstance(na, float) and na != na:
+        return True
+    try:
+        bool(na)
+    except TypeError:
+        return True
+    return False
 
 
 def _int_arg(x, name):
@@ -425,8 +433,25 @@ def _coerce_like(value, kind):
 # ---------------------------------------------------------------------------
 
 def _cmp(x1, x2, op):
-    a = _check_string(asarray(x1))
-    b = _check_string(asarray(x2))
+    a = asarray(x1)
+    b = asarray(x2)
+    if a.dtype.kind not in "SUTO" or b.dtype.kind not in "SUTO":
+        raise TypeError("string operation on non-string array")
+    if a.dtype.kind == b.dtype.kind == "T":
+        has_a = hasattr(a.dtype, "na_object")
+        has_b = hasattr(b.dtype, "na_object")
+        if has_a and has_b:
+            na, nb = a.dtype.na_object, b.dtype.na_object
+            same_nan_class = (isinstance(na, float) and na != na
+                              and isinstance(nb, float) and nb != nb)
+            if na is not nb and not same_nan_class:
+                try:
+                    compatible = bool(na == nb)
+                except (TypeError, ValueError):
+                    compatible = False
+                if not compatible:
+                    raise TypeError(
+                        "StringDType instances have incompatible missing values")
     shape = _bcast(a, b)
     kind = "U" if "T" in (a.dtype.kind, b.dtype.kind) or "U" in (
         a.dtype.kind, b.dtype.kind) else "S"
@@ -747,7 +772,7 @@ def multiply(a, i):
     for x in va:
         if arr.dtype.kind == "T" and not isinstance(x, str):
             if not _is_nan_na(arr, x):
-                raise ValueError(
+                raise TypeError(
                     "Cannot apply string operation to non-string NA")
     lengths = [(len(x) if isinstance(x, (str, bytes)) else 0) * n
                for x, n in zip(va, vi)]

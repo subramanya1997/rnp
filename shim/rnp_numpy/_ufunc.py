@@ -177,9 +177,117 @@ def _string_isnan(args):
     arr = _rnp.asarray(args[0])
     na = getattr(arr.dtype, "na_object", _UNSET)
     nan_sentinel = isinstance(na, float) and na != na
+    if na is not _UNSET and not nan_sentinel:
+        try:
+            bool(na)
+        except TypeError:
+            nan_sentinel = True
     vals = arr.reshape(-1).tolist() if arr.ndim else [arr.tolist()]
     return _rnp.asarray([nan_sentinel and v is na for v in vals]).reshape(
         arr.shape)
+
+
+def _index_product(shape):
+    """Yield index tuples without depending on numpy's Python iterators."""
+    if not shape:
+        yield ()
+        return
+    tail = shape[1:]
+    for i in range(shape[0]):
+        for rest in _index_product(tail):
+            yield (i,) + rest
+
+
+def _string_add_reduce(array, axis, dtype, out, keepdims, initial, where):
+    """Reference-safe StringDType add reduction used by ``reduce``."""
+    if where is not True:
+        return None
+    arr = _rnp.asarray(array)
+    target = _rnp.dtype(dtype) if dtype is not None else arr.dtype
+    if target.kind != "T" and arr.dtype.kind != "T":
+        return None
+    if arr.dtype != target:
+        arr = arr.astype(target)
+    if axis is None:
+        arr = arr.reshape((-1,))
+        axis = 0
+    axis = int(axis)
+    if axis < 0:
+        axis += arr.ndim
+    if axis < 0 or axis >= arr.ndim:
+        return None
+    outer_shape = arr.shape[:axis] + arr.shape[axis + 1:]
+    result_shape = (arr.shape[:axis] + (1,) + arr.shape[axis + 1:]
+                    if keepdims else outer_shape)
+    from . import empty
+    result = empty(result_shape, dtype=target)
+    for outer in _index_product(outer_shape):
+        values = []
+        for i in range(arr.shape[axis]):
+            idx = outer[:axis] + (i,) + outer[axis:]
+            values.append(arr[idx])
+        if initial is None:
+            if not values:
+                raise ValueError(
+                    "zero-size array to reduction operation add which has no identity")
+            acc, values = values[0], values[1:]
+        else:
+            acc = initial
+        for value in values:
+            if isinstance(acc, str) and isinstance(value, str):
+                acc += value
+            else:
+                # Descriptor nulls that are NaN-like propagate; all other
+                # non-string nulls cannot participate in concatenation.
+                from ._core.strings import _is_nan_na
+                if _is_nan_na(arr, acc):
+                    continue
+                if _is_nan_na(arr, value):
+                    acc = value
+                    continue
+                raise ValueError("Cannot compare null that is not a nan-like value")
+        dest = (outer[:axis] + (0,) + outer[axis:]
+                if keepdims else outer)
+        result[dest] = acc
+    if out is not None:
+        out[...] = result.tolist()
+        return out
+    return result
+
+
+def _string_add_accumulate(array, axis, dtype, out):
+    """Reference-safe StringDType add accumulation along one axis."""
+    arr = _rnp.asarray(array)
+    target = _rnp.dtype(dtype) if dtype is not None else arr.dtype
+    if target.kind != "T" and arr.dtype.kind != "T":
+        return None
+    if arr.dtype != target:
+        arr = arr.astype(target)
+    from . import empty
+    result = empty(arr.shape, dtype=target)
+    outer_shape = arr.shape[:axis] + arr.shape[axis + 1:]
+    for outer in _index_product(outer_shape):
+        acc = None
+        for i in range(arr.shape[axis]):
+            idx = outer[:axis] + (i,) + outer[axis:]
+            value = arr[idx]
+            if i == 0:
+                acc = value
+            elif isinstance(acc, str) and isinstance(value, str):
+                acc += value
+            else:
+                from ._core.strings import _is_nan_na
+                if not _is_nan_na(arr, acc):
+                    if _is_nan_na(arr, value):
+                        acc = value
+                    else:
+                        raise ValueError(
+                            "Cannot compare null that is not a nan-like value")
+            result[idx] = acc
+    if out is not None:
+        out[...] = result.tolist()
+        return out
+    return result
 
 
 def _broadcast_against_out(args, oshape):
@@ -382,7 +490,7 @@ class ufunc:
                 and kinds is not None and "T" in kinds):
             res = _string_loop_fallback(self.__name__, args)
             if res is not None and out is not None:
-                out[...] = res
+                out[...] = res.tolist()
                 res = out
         if res is not None:
             return _maybe_scalar(res, scalar_out)
@@ -506,6 +614,14 @@ class ufunc:
             self._nope("reduce")
         if isinstance(out, tuple):
             out = out[0]
+        if self.__name__ == "add":
+            if dtype is None and _rnp.asarray(array).dtype.kind in "SU":
+                raise TypeError(
+                    "the resolved dtypes are not compatible with add.reduce")
+            res = _string_add_reduce(
+                array, axis, dtype, out, keepdims, initial, where)
+            if res is not None:
+                return _maybe_scalar(res, out is None)
         res = _rnp._ufunc_reduce(self.__name__, array, axis=axis, dtype=dtype,
                                  out=out, keepdims=keepdims, initial=initial,
                                  where_=where)
@@ -519,6 +635,14 @@ class ufunc:
         if isinstance(out, tuple):
             out = out[0]
         axis = _single_axis(array, axis, "accumulate")
+        if self.__name__ == "add":
+            norm_axis = axis
+            arr = _rnp.asarray(array)
+            if norm_axis < 0:
+                norm_axis += arr.ndim
+            res = _string_add_accumulate(arr, norm_axis, dtype, out)
+            if res is not None:
+                return res
         res = _rnp._ufunc_accumulate(self.__name__, array, axis=axis,
                                      dtype=dtype, out=out)
         _errstate.drain(self.__name__)

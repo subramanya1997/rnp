@@ -28,6 +28,13 @@ from .exceptions import ComplexWarning
 _orig_astype = ndarray.astype
 _orig_copy = ndarray.copy
 _orig_setitem = ndarray.__setitem__
+_orig_sort = ndarray.sort
+_orig_argsort = ndarray.argsort
+_orig_nonzero = ndarray.nonzero
+_orig_min = ndarray.min
+_orig_max = ndarray.max
+_orig_argmin = ndarray.argmin
+_orig_argmax = ndarray.argmax
 
 _ORDERS = ("C", "F", "A", "K")
 
@@ -251,6 +258,11 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
     dt = _dtype(dtype)
     order = _norm_order(order, "K")
     src = self.dtype
+    if (casting == "safe" and src.kind == "T" and dt.kind == "T"
+            and hasattr(src, "na_object") and not hasattr(dt, "na_object")):
+        raise TypeError(
+            f"Cannot cast array data from {src!r} to {dt!r} "
+            f"according to the rule {casting!r}")
     if not can_cast(src, dt, casting):
         raise TypeError(
             f"Cannot cast array data from {src!r} to {dt!r} "
@@ -287,10 +299,31 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
                 values = walk(values,
                               lambda value: target_na
                               if value is source_na else value)
+            elif source_na is not _UNSET:
+                values = walk(values,
+                              lambda value: str(source_na)
+                              if value is source_na else value)
             return _pkg().array(values, dtype=dt, copy=True)
         if dt.kind == "T":
             if src.kind == "O":
                 return _pkg().array(values, dtype=dt, copy=True)
+            if src.kind in "mM":
+                rendered = (self.astype("U") if src.kind == "M" else
+                            self.astype("int64").astype("U"))
+                text = rendered.tolist()
+                target_na = getattr(dt, "na_object", _UNSET)
+                if target_na is not _UNSET and not isinstance(target_na, str):
+                    source_values = self.tolist()
+                    text = walk(text, lambda value: value)
+
+                    def replace_nat(source, value):
+                        if isinstance(source, list):
+                            return [replace_nat(s, v)
+                                    for s, v in zip(source, value)]
+                        return target_na if source is None else value
+
+                    text = replace_nat(source_values, text)
+                return _pkg().array(text, dtype=dt, copy=True)
             if src.kind in "biufc":
                 from ._core import _strcast
                 rendered = _strcast.to_string_array(
@@ -317,9 +350,27 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
             encoded = walk(values, lambda value: value.encode("ascii"))
             return _pkg().array(encoded, dtype=dt, copy=True)
         source_na = getattr(src, "na_object", _UNSET)
+        if source_na is not _UNSET and dt.kind in "mM" \
+                and not isinstance(source_na, str):
+            values = walk(values,
+                          lambda value: "NaT" if value is source_na else value)
         if source_na is not _UNSET and dt.kind in "iu":
             if _b.any(value is source_na for value in leaves(values)):
                 raise ValueError("cannot convert missing value to integer")
+        if dt.kind == "b":
+            def as_bool(value):
+                if source_na is not _UNSET and value is source_na:
+                    if isinstance(source_na, float) and source_na != source_na:
+                        return True
+                    if isinstance(source_na, str):
+                        return source_na == ""
+                    try:
+                        return bool(source_na)
+                    except TypeError:
+                        return True
+                return bool(value)
+
+            values = walk(values, as_bool)
         return _pkg().array(values, dtype=dt, copy=True)
     if src.kind == "O" and dt.kind in "mM":
         # The engine's datetime coercion handles every object form numpy
@@ -635,8 +686,17 @@ def setitem(self, key, value):
     # `a[dst] = a[src]` must behave as if the right-hand side were read in
     # full before anything is written, exactly as numpy's PyArray_AssignArray
     # does: when source and destination alias, materialise the source first.
+    if self.dtype.kind == "T" and isinstance(value, ndarray):
+        value = value.tolist()
     if isinstance(value, ndarray) and value.size and self.size:
-        if may_share_memory(self, value):
+        try:
+            overlaps = may_share_memory(self, value)
+        except (BufferError, ValueError):
+            # Datetime and reference-backed dtypes intentionally do not
+            # export Python buffers; taking a defensive copy is still the
+            # correct overlap-safe behavior.
+            overlaps = True
+        if overlaps:
             value = _ordered_copy(value, value.dtype, "C")
     if isinstance(value, str) and self.dtype.kind in "fciub":
         value = _b.float(value) if self.dtype.kind in "fc" else _b.int(value)
@@ -800,17 +860,21 @@ def _make_str_binop(name, fn, reflected):
     _orig = getattr(ndarray, name)
 
     def binop(self, other):
-        if self.dtype.kind in "SUT":
+        other_kind = getattr(getattr(other, "dtype", None), "kind", None)
+        if self.dtype.kind in "SUT" or other_kind == "T":
             strings = _pkg().strings
             if fn == "multiply":
                 # Repetition takes (string, count) whichever side the count
                 # was written on, so `2 * arr` and `arr * 2` agree.
-                a, b = self, other
+                a, b = ((self, other) if self.dtype.kind in "SUT"
+                        else (other, self))
             else:
                 a, b = (other, self) if reflected else (self, other)
             try:
                 return getattr(strings, fn)(a, b)
             except (TypeError, ValueError):
+                if self.dtype.kind == "T" or other_kind == "T":
+                    raise
                 # Not a combination `numpy.strings` accepts — defer to the
                 # engine so its own error (or NotImplemented) is what shows.
                 pass
@@ -846,7 +910,9 @@ def _make_str_inplace(name, fn):
             except OverflowError:
                 raise OverflowError(
                     "Overflow detected in string multiply") from None
-            self[...] = res.astype(self.dtype)
+            converted = res.astype(self.dtype)
+            self[...] = (converted.tolist()
+                         if self.dtype.kind == "T" else converted)
             return self
         return _orig(self, other)
 
@@ -855,11 +921,124 @@ def _make_str_inplace(name, fn):
     return inplace
 
 
+def _string_sort_values(arr):
+    """Return StringDType values in NumPy order, with NaN-like NAs last."""
+    from ._core.strings import _is_nan_na
+    values = arr.tolist()
+    strings = []
+    missing = []
+    for index, value in enumerate(values):
+        if isinstance(value, str):
+            strings.append((value, index))
+        elif _is_nan_na(arr, value):
+            missing.append((value, index))
+        else:
+            raise ValueError("Cannot compare null that is not a nan-like value")
+    strings.sort(key=lambda item: item[0])
+    return strings + missing
+
+
+def sort_method(self, axis=-1, kind=None, order=None, *, stable=None):
+    if self.dtype.kind != "T" or self.ndim != 1 or axis not in (-1, 0):
+        return _orig_sort(self, axis, kind, order, stable=stable)
+    ordered = _string_sort_values(self)
+    self[:] = [value for value, _ in ordered]
+    return None
+
+
+def argsort_method(self, axis=-1, kind=None, order=None, *, stable=None):
+    if self.dtype.kind != "T" or self.ndim != 1 or axis not in (-1, 0):
+        return _orig_argsort(self, axis, kind, order, stable=stable)
+    ordered = _string_sort_values(self)
+    return _pkg().array([index for _, index in ordered], dtype=_pkg().intp)
+
+
+def nonzero_method(self):
+    if self.dtype.kind == "T":
+        return _orig_nonzero(self.astype(_pkg().bool_))
+    return _orig_nonzero(self)
+
+
+def _string_extreme_method(self, take_max, axis=None, out=None,
+                           keepdims=False, initial=None, where=True):
+    if (self.dtype.kind != "T" or self.ndim != 1
+            or axis not in (None, -1, 0) or where is not True):
+        original = _orig_max if take_max else _orig_min
+        return original(self, axis=axis, out=out, keepdims=keepdims,
+                        initial=initial, where=where)
+    ordered = _string_sort_values(self)
+    if not ordered and initial is None:
+        name = "maximum" if take_max else "minimum"
+        raise ValueError(
+            f"zero-size array to reduction operation {name} which has no identity")
+    value = ordered[-1][0] if take_max else ordered[0][0]
+    if initial is not None:
+        value = max(value, initial) if take_max else min(value, initial)
+    if keepdims:
+        result = _pkg().array([value], dtype=self.dtype)
+    else:
+        result = value
+    if out is not None:
+        out[...] = result
+        return out
+    return result
+
+
+def min_method(self, axis=None, out=None, keepdims=False, initial=None,
+               where=True):
+    return _string_extreme_method(
+        self, False, axis, out, keepdims, initial, where)
+
+
+def max_method(self, axis=None, out=None, keepdims=False, initial=None,
+               where=True):
+    return _string_extreme_method(
+        self, True, axis, out, keepdims, initial, where)
+
+
+def _string_argextreme_method(self, take_max, axis=None, out=None,
+                              keepdims=False):
+    if self.dtype.kind != "T" or self.ndim != 1 or axis not in (None, -1, 0):
+        original = _orig_argmax if take_max else _orig_argmin
+        return original(self, axis=axis, out=out, keepdims=keepdims)
+    ordered = _string_sort_values(self)
+    if not ordered:
+        name = "argmax" if take_max else "argmin"
+        raise ValueError(f"attempt to get {name} of an empty sequence")
+    if take_max:
+        extreme = ordered[-1][0]
+        index = next(i for value, i in ordered if value == extreme)
+    else:
+        index = ordered[0][1]
+    result = _pkg().array(index, dtype=_pkg().intp)
+    if keepdims:
+        result = result.reshape((1,))
+    if out is not None:
+        out[...] = result
+        return out
+    return result[()] if result.ndim == 0 else result
+
+
+def argmin_method(self, axis=None, out=None, *, keepdims=False):
+    return _string_argextreme_method(self, False, axis, out, keepdims)
+
+
+def argmax_method(self, axis=None, out=None, *, keepdims=False):
+    return _string_argextreme_method(self, True, axis, out, keepdims)
+
+
 def install():
     ndarray.astype = astype
     ndarray.__array__ = array_protocol
     ndarray.copy = copy_method
     ndarray.__setitem__ = setitem
+    ndarray.sort = sort_method
+    ndarray.argsort = argsort_method
+    ndarray.nonzero = nonzero_method
+    ndarray.min = min_method
+    ndarray.max = max_method
+    ndarray.argmin = argmin_method
+    ndarray.argmax = argmax_method
 
     def array_function(self, func, types, args, kwargs):
         if not isinstance(args, tuple):
