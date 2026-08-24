@@ -3584,7 +3584,7 @@ class MaskedArray(ndarray):
                 current_mask[...] = mask
             # Otherwise fall back to the slower, general purpose way.
             else:
-                current_mask.flat = mask
+                current_mask.reshape(-1)[...] = np.asarray(mask).reshape(-1)
         else:
             # Named fields w/
             mdtype = current_mask.dtype
@@ -3619,7 +3619,7 @@ class MaskedArray(ndarray):
                 current_mask[...] = mask
             # Otherwise fall back to the slower, general purpose way.
             else:
-                current_mask.flat = mask
+                current_mask.reshape(-1)[...] = np.asarray(mask).reshape(-1)
         # Reshape if needed
         if current_mask.shape:
             self._mask = current_mask.reshape(self.shape)
