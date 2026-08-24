@@ -1,0 +1,197 @@
+=== scalar comparisons out of bound ===
+eq(int8(10), -200)                                         -> OK (np.False_, 'bool')
+lt(int8(10), -200)                                         -> OK (np.False_, 'bool')
+ge(int8(10), -200)                                         -> OK (np.True_, 'bool')
+eq(int8(10), -1)                                           -> OK (np.False_, 'bool')
+lt(int8(10), -1)                                           -> OK (np.False_, 'bool')
+ge(int8(10), -1)                                           -> OK (np.True_, 'bool')
+eq(int8(10), 0)                                            -> OK (np.False_, 'bool')
+lt(int8(10), 0)                                            -> OK (np.False_, 'bool')
+ge(int8(10), 0)                                            -> OK (np.True_, 'bool')
+eq(int8(10), 9)                                            -> OK (np.False_, 'bool')
+lt(int8(10), 9)                                            -> OK (np.False_, 'bool')
+ge(int8(10), 9)                                            -> OK (np.True_, 'bool')
+eq(int8(10), 10)                                           -> OK (np.True_, 'bool')
+lt(int8(10), 10)                                           -> OK (np.False_, 'bool')
+ge(int8(10), 10)                                           -> OK (np.True_, 'bool')
+eq(int8(10), 11)                                           -> OK (np.False_, 'bool')
+lt(int8(10), 11)                                           -> OK (np.True_, 'bool')
+ge(int8(10), 11)                                           -> OK (np.False_, 'bool')
+eq(int8(10), 9223372036854775808)                          -> OK (np.False_, 'bool')
+lt(int8(10), 9223372036854775808)                          -> OK (np.True_, 'bool')
+ge(int8(10), 9223372036854775808)                          -> OK (np.False_, 'bool')
+eq(int8(10), 200)                                          -> OK (np.False_, 'bool')
+lt(int8(10), 200)                                          -> OK (np.True_, 'bool')
+ge(int8(10), 200)                                          -> OK (np.False_, 'bool')
+eq(uint8(10), -200)                                        -> OK (np.False_, 'bool')
+lt(uint8(10), -200)                                        -> OK (np.False_, 'bool')
+ge(uint8(10), -200)                                        -> OK (np.True_, 'bool')
+eq(uint8(10), -1)                                          -> OK (np.False_, 'bool')
+lt(uint8(10), -1)                                          -> OK (np.False_, 'bool')
+ge(uint8(10), -1)                                          -> OK (np.True_, 'bool')
+eq(uint8(10), 0)                                           -> OK (np.False_, 'bool')
+lt(uint8(10), 0)                                           -> OK (np.False_, 'bool')
+ge(uint8(10), 0)                                           -> OK (np.True_, 'bool')
+eq(uint8(10), 9)                                           -> OK (np.False_, 'bool')
+lt(uint8(10), 9)                                           -> OK (np.False_, 'bool')
+ge(uint8(10), 9)                                           -> OK (np.True_, 'bool')
+eq(uint8(10), 10)                                          -> OK (np.True_, 'bool')
+lt(uint8(10), 10)                                          -> OK (np.False_, 'bool')
+ge(uint8(10), 10)                                          -> OK (np.True_, 'bool')
+eq(uint8(10), 11)                                          -> OK (np.False_, 'bool')
+lt(uint8(10), 11)                                          -> OK (np.True_, 'bool')
+ge(uint8(10), 11)                                          -> OK (np.False_, 'bool')
+eq(uint8(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+lt(uint8(10), 9223372036854775808)                         -> OK (np.True_, 'bool')
+ge(uint8(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+eq(uint8(10), 200)                                         -> OK (np.False_, 'bool')
+lt(uint8(10), 200)                                         -> OK (np.True_, 'bool')
+ge(uint8(10), 200)                                         -> OK (np.False_, 'bool')
+eq(uint64(10), -200)                                       -> OK (np.False_, 'bool')
+lt(uint64(10), -200)                                       -> OK (np.False_, 'bool')
+ge(uint64(10), -200)                                       -> OK (np.True_, 'bool')
+eq(uint64(10), -1)                                         -> OK (np.False_, 'bool')
+lt(uint64(10), -1)                                         -> OK (np.False_, 'bool')
+ge(uint64(10), -1)                                         -> OK (np.True_, 'bool')
+eq(uint64(10), 0)                                          -> OK (np.False_, 'bool')
+lt(uint64(10), 0)                                          -> OK (np.False_, 'bool')
+ge(uint64(10), 0)                                          -> OK (np.True_, 'bool')
+eq(uint64(10), 9)                                          -> OK (np.False_, 'bool')
+lt(uint64(10), 9)                                          -> OK (np.False_, 'bool')
+ge(uint64(10), 9)                                          -> OK (np.True_, 'bool')
+eq(uint64(10), 10)                                         -> OK (np.True_, 'bool')
+lt(uint64(10), 10)                                         -> OK (np.False_, 'bool')
+ge(uint64(10), 10)                                         -> OK (np.True_, 'bool')
+eq(uint64(10), 11)                                         -> OK (np.False_, 'bool')
+lt(uint64(10), 11)                                         -> OK (np.True_, 'bool')
+ge(uint64(10), 11)                                         -> OK (np.False_, 'bool')
+eq(uint64(10), 9223372036854775808)                        -> OK (np.False_, 'bool')
+lt(uint64(10), 9223372036854775808)                        -> OK (np.True_, 'bool')
+ge(uint64(10), 9223372036854775808)                        -> OK (np.False_, 'bool')
+eq(uint64(10), 200)                                        -> OK (np.False_, 'bool')
+lt(uint64(10), 200)                                        -> OK (np.True_, 'bool')
+ge(uint64(10), 200)                                        -> OK (np.False_, 'bool')
+eq(int64(10), -200)                                        -> OK (np.False_, 'bool')
+lt(int64(10), -200)                                        -> OK (np.False_, 'bool')
+ge(int64(10), -200)                                        -> OK (np.True_, 'bool')
+eq(int64(10), -1)                                          -> OK (np.False_, 'bool')
+lt(int64(10), -1)                                          -> OK (np.False_, 'bool')
+ge(int64(10), -1)                                          -> OK (np.True_, 'bool')
+eq(int64(10), 0)                                           -> OK (np.False_, 'bool')
+lt(int64(10), 0)                                           -> OK (np.False_, 'bool')
+ge(int64(10), 0)                                           -> OK (np.True_, 'bool')
+eq(int64(10), 9)                                           -> OK (np.False_, 'bool')
+lt(int64(10), 9)                                           -> OK (np.False_, 'bool')
+ge(int64(10), 9)                                           -> OK (np.True_, 'bool')
+eq(int64(10), 10)                                          -> OK (np.True_, 'bool')
+lt(int64(10), 10)                                          -> OK (np.False_, 'bool')
+ge(int64(10), 10)                                          -> OK (np.True_, 'bool')
+eq(int64(10), 11)                                          -> OK (np.False_, 'bool')
+lt(int64(10), 11)                                          -> OK (np.True_, 'bool')
+ge(int64(10), 11)                                          -> OK (np.False_, 'bool')
+eq(int64(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+lt(int64(10), 9223372036854775808)                         -> OK (np.True_, 'bool')
+ge(int64(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+eq(int64(10), 200)                                         -> OK (np.False_, 'bool')
+lt(int64(10), 200)                                         -> OK (np.True_, 'bool')
+ge(int64(10), 200)                                         -> OK (np.False_, 'bool')
+=== strings to int dtype ===/private/tmp/rnp-wt-nep50/probe2.py:58: RuntimeWarning: overflow encountered in cast
+  t(f"{np.dtype(dt).name}(1) + too_big", lambda s=sct,b=big: (s(1)+b, (s(1)+b).dtype))
+/private/tmp/rnp-wt-nep50/probe2.py:59: RuntimeWarning: overflow encountered in cast
+  t(f"np.add(np.array(1,{np.dtype(dt).name}), big, dtype={dt})", lambda d=dt,b=big: np.add(np.array(1,dtype=d), b, dtype=d))
+/private/tmp/rnp-wt-nep50/probe2.py:60: RuntimeWarning: overflow encountered in cast
+  t(f"np.array(1,{np.dtype(dt).name}) + too_big", lambda d=dt,b=big: np.array(1,dtype=d)+b)
+/private/tmp/rnp-wt-nep50/probe2.py:58: RuntimeWarning: overflow encountered in conversion from python long
+  t(f"{np.dtype(dt).name}(1) + too_big", lambda s=sct,b=big: (s(1)+b, (s(1)+b).dtype))
+/private/tmp/rnp-wt-nep50/probe2.py:59: RuntimeWarning: overflow encountered in conversion from python long
+  t(f"np.add(np.array(1,{np.dtype(dt).name}), big, dtype={dt})", lambda d=dt,b=big: np.add(np.array(1,dtype=d), b, dtype=d))
+/private/tmp/rnp-wt-nep50/probe2.py:60: RuntimeWarning: overflow encountered in conversion from python long
+  t(f"np.array(1,{np.dtype(dt).name}) + too_big", lambda d=dt,b=big: np.array(1,dtype=d)+b)
+/private/tmp/rnp-wt-nep50/probe2.py:63: RuntimeWarning: overflow encountered in scalar add
+  t("np.uint8(100) + 200", lambda: np.uint8(100)+200)
+/private/tmp/rnp-wt-nep50/probe2.py:64: RuntimeWarning: overflow encountered in cast
+  t("np.float32(1) + 3e100", lambda: np.float32(1)+3e100)
+/private/tmp/rnp-wt-nep50/probe2.py:65: RuntimeWarning: overflow encountered in cast
+  t("np.complex64(3) + complex(2**300)", lambda: np.complex64(3)+complex(2**300))
+
+np.array(['-129'], dtype=np.int8)                          -> OverflowError: Python integer -129 out of bounds for int8
+np.array(['-129'], dtype=np.int16)                         -> OK array([-129], dtype=int16)
+np.int8('-129')                                            -> OverflowError: Python integer -129 out of bounds for int8
+np.int8('-128')                                            -> OK np.int8(-128)
+np.array(['-128'], dtype=np.int8)                          -> OK array([-128], dtype=int8)
+np.uint8('256')                                            -> OverflowError: Python integer 256 out of bounds for uint8
+np.array(['256'], dtype=np.uint8)                          -> OverflowError: Python integer 256 out of bounds for uint8
+np.array(['12'], dtype=np.float32)                         -> OK array([12.], dtype=float32)
+np.int64('9223372036854775808')                            -> OverflowError: Python int too large to convert to C long
+np.array(['9223372036854775808'],dtype=np.int64)           -> OverflowError: Python int too large to convert to C long
+np.uint64('-1')                                            -> OverflowError: Python integer -1 out of bounds for uint64
+np.array(['-1'],dtype=np.uint64)                           -> OverflowError: Python integer -1 out of bounds for uint64
+np.uint64('18446744073709551616')                          -> OverflowError: Python int too large to convert to C long
+np.array(['18446744073709551616'],dtype=np.uint64)         -> OverflowError: Python int too large to convert to C long
+np.array(2**63, dtype=np.int64)                            -> OverflowError: Python int too large to convert to C long
+np.array([2**63], dtype=np.int64)                          -> OverflowError: Python int too large to convert to C long
+np.int64(2**63)                                            -> OverflowError: Python int too large to convert to C long
+np.array([-2**63-1], dtype=np.int64)                       -> OverflowError: Python int too large to convert to C long
+np.array([2**64], dtype=np.uint64)                         -> OverflowError: Python int too large to convert to C long
+=== huge int ufunc paths ===
+add(np.int64(0), 2**63)                                    -> OverflowError: Python int too large to convert to C long
+add(np.uint64(0), 2**64)                                   -> OverflowError: Python int too large to convert to C long
+add(np.uint64(1), 2**63)                                   -> OK (np.uint64(9223372036854775809), dtype('uint64'))
+add(np.int64(1), 2**63)                                    -> OverflowError: Python int too large to convert to C long
+add(np.int64(1), 2**100)                                   -> OverflowError: Python int too large to convert to C long
+add(1.0, 2**100)                                           -> OK (np.float64(1.2676506002282294e+30), 'float64')
+add(1, 2**63, dtype=object)                                -> OK 9223372036854775809
+power(np.int64(0), 2**63)                                  -> OverflowError: Python int too large to convert to C long
+power(np.uint64(0), 2**64)                                 -> OverflowError: Python int too large to convert to C long
+power(np.uint64(1), 2**63)                                 -> OK (np.uint64(1), dtype('uint64'))
+power(np.int64(1), 2**63)                                  -> OverflowError: Python int too large to convert to C long
+power(np.int64(1), 2**100)                                 -> OverflowError: Python int too large to convert to C long
+power(1.0, 2**100)                                         -> OK (np.float64(1.0), 'float64')
+power(1, 2**63, dtype=object)                              -> OK 1
+equal(2**200, -2**200)                                     -> OK np.False_
+equal(2**200,-2**200,dtype=object)                         -> OK False
+not_equal(2**200, -2**200)                                 -> OK np.True_
+not_equal(2**200,-2**200,dtype=object)                     -> OK True
+less_equal(2**200, -2**200)                                -> OK np.False_
+less_equal(2**200,-2**200,dtype=object)                    -> OK False
+less(2**200, -2**200)                                      -> OK np.False_
+less(2**200,-2**200,dtype=object)                          -> OK False
+greater_equal(2**200, -2**200)                             -> OK np.True_
+greater_equal(2**200,-2**200,dtype=object)                 -> OK True
+greater(2**200, -2**200)                                   -> OK np.True_
+greater(2**200,-2**200,dtype=object)                       -> OK True
+=== weak int with inexact ===
+float16(1) + too_big                                       -> OK (np.float16(inf), dtype('float16'))
+np.add(np.array(1,float16), big, dtype=e)                  -> OK np.float16(inf)
+np.array(1,float16) + too_big                              -> OK np.float16(inf)
+float32(1) + too_big                                       -> OK (np.float32(inf), dtype('float32'))
+np.add(np.array(1,float32), big, dtype=f)                  -> OK np.float32(inf)
+np.array(1,float32) + too_big                              -> OK np.float32(inf)
+float64(1) + too_big                                       -> OverflowError: int too large to convert to float
+np.add(np.array(1,float64), big, dtype=d)                  -> OverflowError: int too large to convert to float
+np.array(1,float64) + too_big                              -> OverflowError: int too large to convert to float
+float64(1) + too_big                                       -> OK (np.longdouble('inf'), dtype('float64'))
+np.add(np.array(1,float64), big, dtype=g)                  -> OK np.longdouble('inf')
+np.array(1,float64) + too_big                              -> OK np.longdouble('inf')
+complex64(1) + too_big                                     -> OK (np.complex64(inf+0j), dtype('complex64'))
+np.add(np.array(1,complex64), big, dtype=F)                -> OK np.complex64(inf+0j)
+np.array(1,complex64) + too_big                            -> OK np.complex64(inf+0j)
+complex128(1) + too_big                                    -> OverflowError: int too large to convert to float
+np.add(np.array(1,complex128), big, dtype=D)               -> OverflowError: int too large to convert to float
+np.array(1,complex128) + too_big                           -> OverflowError: int too large to convert to float
+complex128(1) + too_big                                    -> OverflowError: int too large to convert to float
+np.add(np.array(1,complex128), big, dtype=G)               -> OverflowError: int too large to convert to float
+np.array(1,complex128) + too_big                           -> OverflowError: int too large to convert to float
+=== misc ===
+np.uint8(100) + 200                                        -> OK np.uint8(44)
+np.float32(1) + 3e100                                      -> OK np.float32(inf)
+np.complex64(3) + complex(2**300)                          -> OK np.complex64(inf+0j)
+np.array([1],np.uint8) + 300                               -> OverflowError: Python integer 300 out of bounds for uint8
+np.uint8(1) + 300                                          -> OverflowError: Python integer 300 out of bounds for uint8
+np.uint8(1) + -1                                           -> OverflowError: Python integer -1 out of bounds for uint8
+np.uint8(3) ** 1000                                        -> OverflowError: Python integer 1000 out of bounds for uint8
+np.concatenate([np.float32(1), 1.], axis=None).dtype       -> OK dtype('float32')
+np.choose(1,[np.float32(1),1.]).dtype                      -> OK dtype('float32')
+np.r_[np.arange(5,dtype=np.int8), 255]                     -> OverflowError: Python integer 255 out of bounds for int8
+np.ones(100,'>u4') >= -1                                   -> OK np.True_
+np.ones(100,'>u4') < -1                                    -> OK np.False_

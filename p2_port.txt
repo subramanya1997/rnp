@@ -1,0 +1,141 @@
+=== scalar comparisons out of bound ===
+eq(int8(10), -200)                                         -> OK (np.False_, 'bool')
+lt(int8(10), -200)                                         -> OK (np.True_, 'bool')
+ge(int8(10), -200)                                         -> OK (np.False_, 'bool')
+eq(int8(10), -1)                                           -> OK (np.False_, 'bool')
+lt(int8(10), -1)                                           -> OK (np.False_, 'bool')
+ge(int8(10), -1)                                           -> OK (np.True_, 'bool')
+eq(int8(10), 0)                                            -> OK (np.False_, 'bool')
+lt(int8(10), 0)                                            -> OK (np.False_, 'bool')
+ge(int8(10), 0)                                            -> OK (np.True_, 'bool')
+eq(int8(10), 9)                                            -> OK (np.False_, 'bool')
+lt(int8(10), 9)                                            -> OK (np.False_, 'bool')
+ge(int8(10), 9)                                            -> OK (np.True_, 'bool')
+eq(int8(10), 10)                                           -> OK (np.True_, 'bool')
+lt(int8(10), 10)                                           -> OK (np.False_, 'bool')
+ge(int8(10), 10)                                           -> OK (np.True_, 'bool')
+eq(int8(10), 11)                                           -> OK (np.False_, 'bool')
+lt(int8(10), 11)                                           -> OK (np.True_, 'bool')
+ge(int8(10), 11)                                           -> OK (np.False_, 'bool')
+eq(int8(10), 9223372036854775808)                          -> OK (np.False_, 'bool')
+lt(int8(10), 9223372036854775808)                          -> OK (np.False_, 'bool')
+ge(int8(10), 9223372036854775808)                          -> OK (np.True_, 'bool')
+eq(int8(10), 200)                                          -> OK (np.False_, 'bool')
+lt(int8(10), 200)                                          -> OK (np.False_, 'bool')
+ge(int8(10), 200)                                          -> OK (np.True_, 'bool')
+eq(uint8(10), -200)                                        -> OK (np.False_, 'bool')
+lt(uint8(10), -200)                                        -> OK (np.True_, 'bool')
+ge(uint8(10), -200)                                        -> OK (np.False_, 'bool')
+eq(uint8(10), -1)                                          -> OK (np.False_, 'bool')
+lt(uint8(10), -1)                                          -> OK (np.True_, 'bool')
+ge(uint8(10), -1)                                          -> OK (np.False_, 'bool')
+eq(uint8(10), 0)                                           -> OK (np.False_, 'bool')
+lt(uint8(10), 0)                                           -> OK (np.False_, 'bool')
+ge(uint8(10), 0)                                           -> OK (np.True_, 'bool')
+eq(uint8(10), 9)                                           -> OK (np.False_, 'bool')
+lt(uint8(10), 9)                                           -> OK (np.False_, 'bool')
+ge(uint8(10), 9)                                           -> OK (np.True_, 'bool')
+eq(uint8(10), 10)                                          -> OK (np.True_, 'bool')
+lt(uint8(10), 10)                                          -> OK (np.False_, 'bool')
+ge(uint8(10), 10)                                          -> OK (np.True_, 'bool')
+eq(uint8(10), 11)                                          -> OK (np.False_, 'bool')
+lt(uint8(10), 11)                                          -> OK (np.True_, 'bool')
+ge(uint8(10), 11)                                          -> OK (np.False_, 'bool')
+eq(uint8(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+lt(uint8(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+ge(uint8(10), 9223372036854775808)                         -> OK (np.True_, 'bool')
+eq(uint8(10), 200)                                         -> OK (np.False_, 'bool')
+lt(uint8(10), 200)                                         -> OK (np.True_, 'bool')
+ge(uint8(10), 200)                                         -> OK (np.False_, 'bool')
+eq(uint64(10), -200)                                       -> OK (np.False_, 'bool')
+lt(uint64(10), -200)                                       -> OK (np.True_, 'bool')
+ge(uint64(10), -200)                                       -> OK (np.False_, 'bool')
+eq(uint64(10), -1)                                         -> OK (np.False_, 'bool')
+lt(uint64(10), -1)                                         -> OK (np.True_, 'bool')
+ge(uint64(10), -1)                                         -> OK (np.False_, 'bool')
+eq(uint64(10), 0)                                          -> OK (np.False_, 'bool')
+lt(uint64(10), 0)                                          -> OK (np.False_, 'bool')
+ge(uint64(10), 0)                                          -> OK (np.True_, 'bool')
+eq(uint64(10), 9)                                          -> OK (np.False_, 'bool')
+lt(uint64(10), 9)                                          -> OK (np.False_, 'bool')
+ge(uint64(10), 9)                                          -> OK (np.True_, 'bool')
+eq(uint64(10), 10)                                         -> OK (np.True_, 'bool')
+lt(uint64(10), 10)                                         -> OK (np.False_, 'bool')
+ge(uint64(10), 10)                                         -> OK (np.True_, 'bool')
+eq(uint64(10), 11)                                         -> OK (np.False_, 'bool')
+lt(uint64(10), 11)                                         -> OK (np.True_, 'bool')
+ge(uint64(10), 11)                                         -> OK (np.False_, 'bool')
+eq(uint64(10), 9223372036854775808)                        -> OK (np.False_, 'bool')
+lt(uint64(10), 9223372036854775808)                        -> OK (np.True_, 'bool')
+ge(uint64(10), 9223372036854775808)                        -> OK (np.False_, 'bool')
+eq(uint64(10), 200)                                        -> OK (np.False_, 'bool')
+lt(uint64(10), 200)                                        -> OK (np.True_, 'bool')
+ge(uint64(10), 200)                                        -> OK (np.False_, 'bool')
+eq(int64(10), -200)                                        -> OK (np.False_, 'bool')
+lt(int64(10), -200)                                        -> OK (np.False_, 'bool')
+ge(int64(10), -200)                                        -> OK (np.True_, 'bool')
+eq(int64(10), -1)                                          -> OK (np.False_, 'bool')
+lt(int64(10), -1)                                          -> OK (np.False_, 'bool')
+ge(int64(10), -1)                                          -> OK (np.True_, 'bool')
+eq(int64(10), 0)                                           -> OK (np.False_, 'bool')
+lt(int64(10), 0)                                           -> OK (np.False_, 'bool')
+ge(int64(10), 0)                                           -> OK (np.True_, 'bool')
+eq(int64(10), 9)                                           -> OK (np.False_, 'bool')
+lt(int64(10), 9)                                           -> OK (np.False_, 'bool')
+ge(int64(10), 9)                                           -> OK (np.True_, 'bool')
+eq(int64(10), 10)                                          -> OK (np.True_, 'bool')
+lt(int64(10), 10)                                          -> OK (np.False_, 'bool')
+ge(int64(10), 10)                                          -> OK (np.True_, 'bool')
+eq(int64(10), 11)                                          -> OK (np.False_, 'bool')
+lt(int64(10), 11)                                          -> OK (np.True_, 'bool')
+ge(int64(10), 11)                                          -> OK (np.False_, 'bool')
+eq(int64(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+lt(int64(10), 9223372036854775808)                         -> OK (np.False_, 'bool')
+ge(int64(10), 9223372036854775808)                         -> OK (np.True_, 'bool')
+eq(int64(10), 200)                                         -> OK (np.False_, 'bool')
+lt(int64(10), 200)                                         -> OK (np.True_, 'bool')
+ge(int64(10), 200)                                         -> OK (np.False_, 'bool')
+=== strings to int dtype ===
+thread '<unnamed>' (14046766) panicked at crates/rnp-core/src/array.rs:766:17:
+dispatch_dtype: Object is not a numeric dtype
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+np.array(['-129'], dtype=np.int8)                          -> OK array([127], dtype=int8)
+np.array(['-129'], dtype=np.int16)                         -> OK array([-129], dtype=int16)
+np.int8('-129')                                            -> OverflowError: Python integer -129 out of bounds for int8
+np.int8('-128')                                            -> OK np.int8(-128)
+np.array(['-128'], dtype=np.int8)                          -> OK array([-128], dtype=int8)
+np.uint8('256')                                            -> OverflowError: Python integer 256 out of bounds for uint8
+np.array(['256'], dtype=np.uint8)                          -> OK array([0], dtype=uint8)
+np.array(['12'], dtype=np.float32)                         -> OK array([12.], dtype=float32)
+np.int64('9223372036854775808')                            -> OverflowError: Python integer 9223372036854775808 out of bounds for int64
+np.array(['9223372036854775808'],dtype=np.int64)           -> OK array([-9223372036854775808])
+np.uint64('-1')                                            -> OverflowError: Python integer -1 out of bounds for uint64
+np.array(['-1'],dtype=np.uint64)                           -> OK array([18446744073709551615], dtype=uint64)
+np.uint64('18446744073709551616')                          -> OverflowError: Python integer 18446744073709551616 out of bounds for uint64
+np.array(['18446744073709551616'],dtype=np.uint64)         -> TypeError: unsupported element type in array(): int
+np.array(2**63, dtype=np.int64)                            -> OK array(-9223372036854775808)
+np.array([2**63], dtype=np.int64)                          -> OK array([-9223372036854775808])
+np.int64(2**63)                                            -> OverflowError: Python integer 9223372036854775808 out of bounds for int64
+np.array([-2**63-1], dtype=np.int64)                       -> TypeError: unsupported element type in array(): int
+np.array([2**64], dtype=np.uint64)                         -> TypeError: unsupported element type in array(): int
+=== huge int ufunc paths ===
+add(np.int64(0), 2**63)                                    -> OverflowError: Python integer 9223372036854775808 out of bounds for int64
+add(np.uint64(0), 2**64)                                   -> TypeError: could not convert int to an array
+add(np.uint64(1), 2**63)                                   -> OK (np.uint64(9223372036854775809), dtype('uint64'))
+add(np.int64(1), 2**63)                                    -> OverflowError: Python integer 9223372036854775808 out of bounds for int64
+add(np.int64(1), 2**100)                                   -> TypeError: could not convert int to an array
+add(1.0, 2**100)                                           -> TypeError: could not convert int to an array
+Traceback (most recent call last):
+  File "/private/tmp/rnp-wt-nep50/probe2.py", line 46, in <module>
+    t(f"{n}(1, 2**63, dtype=object)", lambda uf=uf: uf(1, 2**63, dtype=object))
+    ~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/private/tmp/rnp-wt-nep50/probe2.py", line 5, in t
+    r = fn()
+  File "/private/tmp/rnp-wt-nep50/probe2.py", line 46, in <lambda>
+    t(f"{n}(1, 2**63, dtype=object)", lambda uf=uf: uf(1, 2**63, dtype=object))
+                                                    ~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/rnp-wt-nep50/shim/rnp_numpy/_ufunc.py", line 236, in __call__
+    res = _rnp._ufunc_call(self.__name__, args, out=out, where_=where,
+                           casting=casting, dtype=dtype)
+pyo3_runtime.PanicException: dispatch_dtype: Object is not a numeric dtype

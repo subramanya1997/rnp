@@ -114,11 +114,22 @@ fn full(
     fill_value: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
+    // A Python int too wide for any integer dtype cannot fill an integer
+    // array at all: probed, `np.full((2,), 2**100, dtype=np.uint8)` is
+    // `OverflowError: Python int too large to convert to C long`.
+    if convert::huge_int(fill_value)?.is_some() {
+        if let Some(o) = dtype {
+            if !o.is_none() && descr_from_any(o)?.dt.is_integer() {
+                return Err(convert::too_large());
+            }
+        }
+    }
     let v = any_scalar(fill_value)?
         .ok_or_else(|| PyTypeError::new_err("full() fill_value must be a scalar"))?;
     // numpy infers the dtype from the fill value when none is given; a numpy
     // scalar contributes its own dtype, a Python number its natural one.
-    let inferred = match convert::np_scalar(fill_value)? {
+    let np = convert::np_scalar(fill_value)?;
+    let inferred = match np {
         Some((d, _)) => d,
         None => v.natural_dtype(),
     };
@@ -127,6 +138,9 @@ fn full(
         Some(o) if o.is_none() => Descr::native(inferred),
         Some(o) => descr_from_any(o)?,
     };
+    if dtype.is_some_and(|o| !o.is_none()) {
+        convert::check_int_store(d.dt, np.map(|(t, _)| t), v)?;
+    }
     wrap(py, NdArray::full_descr(shape_from_any(shape)?, d, v).map_err(err)?)
 }
 
@@ -279,6 +293,12 @@ fn type_arg(a: &Bound<'_, PyAny>) -> PyResult<TypeArg> {
         return Ok(TypeArg::Weak(WeakKind::Bool));
     }
     if a.is_instance_of::<pyo3::types::PyInt>() {
+        // Probed: `np.result_type(2**100)` is `object` (it is the dtype
+        // `np.array(2**100)` would have), but `np.result_type(np.int8,
+        // 2**100)` is `int8` -- the huge int is still a *weak* integer.
+        if convert::huge_int(a)?.is_some() {
+            return Ok(TypeArg::HugeInt);
+        }
         return Ok(TypeArg::Weak(WeakKind::Int));
     }
     if a.is_instance_of::<pyo3::types::PyFloat>() {
@@ -328,6 +348,11 @@ fn min_scalar_type(value: &Bound<'_, PyAny>) -> PyResult<PyDType> {
             return Ok(PyDType::new(a.dtype()));
         }
         return Ok(PyDType::new(rnp_core::min_scalar_type(a.get_flat(0))));
+    }
+    // Probed: `np.min_scalar_type(2**100)` is `object` -- no integer dtype
+    // holds it, so numpy falls back to the one that holds anything.
+    if convert::huge_int(value)?.is_some() {
+        return Ok(PyDType::new(DType::Object));
     }
     let s = scalar_from_py(value)
         .ok_or_else(|| PyTypeError::new_err("min_scalar_type() needs a scalar or an array"))?;
@@ -379,7 +404,16 @@ fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
         parsed.push(type_arg(&a)?);
     }
     let d = rnp_core::result_type(&parsed).ok_or_else(|| {
-        PyValueError::new_err("at least one array or dtype is required")
+        if parsed.is_empty() {
+            PyValueError::new_err("at least one array or dtype is required")
+        } else {
+            // numpy raises `np.exceptions.DTypePromotionError`, a TypeError.
+            PyTypeError::new_err(
+                "The DTypes do not have a common DType. For example they \
+                 cannot be stored in a single array unless the dtype is \
+                 `object`.",
+            )
+        }
     })?;
     Ok(PyDType::new(d))
 }
