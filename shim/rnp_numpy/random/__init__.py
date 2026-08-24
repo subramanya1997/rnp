@@ -28,6 +28,7 @@ from ._bit_generators import (
     Philox,
     SFC64,
 )
+from ._generator import Generator
 
 _rng = _random.Random()
 
@@ -399,51 +400,12 @@ class RandomState:
         return _randint(self._r, 0, 2 ** 63 - 1, size)
 
 
-class Generator:
-    """A stand-in for `np.random.Generator` (not stream-compatible)."""
-
-    def __init__(self, seed=None):
-        self._r = _random.Random(seed)
-
-    def random(self, size=None, dtype=float64):
-        if size is None:
-            return self._r.random()
-        return _fill(_shape(size), self._r.random, dtype)
-
-    def integers(self, low, high=None, size=None, dtype=int_, endpoint=False):
-        low = _operator.index(low)
-        if high is None:
-            low, high = 0, low
-        else:
-            high = _operator.index(high)
-        hi = high + 1 if endpoint else high
-        if size is None:
-            return self._r.randrange(low, hi)
-        return _fill(_shape(size), lambda: self._r.randrange(low, hi), dtype)
-
-    def standard_normal(self, size=None, dtype=float64):
-        if size is None:
-            return self._r.gauss(0.0, 1.0)
-        return _fill(_shape(size), lambda: self._r.gauss(0.0, 1.0), dtype)
-
-    def normal(self, loc=0.0, scale=1.0, size=None):
-        return _normal(self._r, loc, scale, size)
-
-    def uniform(self, low=0.0, high=1.0, size=None):
-        return _uniform(self._r, low, high, size)
-
-    def permutation(self, x):
-        return _permutation(self._r, x)
-
-    def shuffle(self, x):
-        return _shuffle(self._r, x)
-
-    def choice(self, a, size=None, replace=True, p=None):
-        return _choice(self._r, a, size, replace, p)
-
-
 def default_rng(seed=None):
-    return Generator(seed)
+    if isinstance(seed, Generator):
+        return seed
+    if isinstance(seed, BitGenerator):
+        return Generator(seed)
+    return Generator(PCG64(seed))
 
 
 __all__ = [n for n in dir() if not n.startswith("_")]

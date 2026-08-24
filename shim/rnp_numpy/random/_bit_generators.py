@@ -40,7 +40,7 @@ class BitGenerator:
 
     def random_raw(self, size=None, output=True):
         if size is None:
-            value = self.next_uint64()
+            value = self.next_raw()
             return value if output else None
         try:
             shape = (operator.index(size),)
@@ -51,13 +51,16 @@ class BitGenerator:
             if dim < 0:
                 raise ValueError("negative dimensions are not allowed")
             count *= dim
-        values = [self.next_uint64() for _ in range(count)]
+        values = [self.next_raw() for _ in range(count)]
         if not output:
             return None
         return array(values, dtype=uint64).reshape(shape)
 
     def next_double(self):
         return (self.next_uint64() >> 11) * (1.0 / 9007199254740992.0)
+
+    def next_raw(self):
+        return self.next_uint64()
 
     def _benchmark(self, count, method="uint64"):
         count = operator.index(count)
@@ -250,12 +253,10 @@ class MT19937(BitGenerator):
         return value & _MASK32
 
     def next_uint64(self):
-        # MT19937's raw stream is 32-bit.  ``random_raw`` therefore calls
-        # this override but receives one zero-extended uint32 per element.
-        return self.next_uint32()
-
-    def next_u64_pair(self):
         return (self.next_uint32() << 32) | self.next_uint32()
+
+    def next_raw(self):
+        return self.next_uint32()
 
     def next_double(self):
         a = self.next_uint32() >> 5

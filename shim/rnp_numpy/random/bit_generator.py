@@ -72,7 +72,7 @@ def _coerce_to_uint32_words(value, _seen=None):
 
     words = []
     for item in values:
-        if not isinstance(item, str) and hasattr(item, "__len__"):
+        if not isinstance(item, str) and not hasattr(item, "__index__"):
             raise TypeError("SeedSequence does not accept nested sequences.")
         words.extend(_coerce_to_uint32_words(item, _seen))
     return words
