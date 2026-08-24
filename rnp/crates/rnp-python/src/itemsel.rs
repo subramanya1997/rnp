@@ -253,7 +253,12 @@ pub fn _as_strided<'py>(
     out.flags.writeable = writeable;
     out.update_flags();
     out.flags.writeable = writeable;
-    PyNdArray::into_py_any(out, py)
+    if let Ok(parent) = x.cast::<PyNdArray>() {
+        PyNdArray::view_of(out, parent)
+    }
+    else {
+        PyNdArray::into_py_any(out, py)
+    }
 }
 
 /// A dtype constant the shim uses for its bool-typed helpers.

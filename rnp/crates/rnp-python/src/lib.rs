@@ -9,6 +9,7 @@ use rnp_core::reduce::ReduceOp;
 use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod adopt;
+mod einsum;
 mod convert;
 mod dlpack;
 mod fields;
@@ -1317,6 +1318,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(itemsel::where_, m)?)?;
     m.add_function(wrap_pyfunction!(itemsel::broadcast_to, m)?)?;
     m.add_function(wrap_pyfunction!(itemsel::_as_strided, m)?)?;
+    m.add_function(wrap_pyfunction!(einsum::_einsum_numeric, m)?)?;
     m.add_function(wrap_pyfunction!(straggler::lexsort, m)?)?;
     m.add_function(wrap_pyfunction!(straggler::_reconstruct, m)?)?;
     m.add_function(wrap_pyfunction!(straggler::_frombuffer, m)?)?;

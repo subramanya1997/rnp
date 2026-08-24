@@ -100,6 +100,8 @@ def arange(start, stop=None, step=None, dtype=None, *, device=None,
         d = _dtype(dtype)
         if d.kind in "mM":
             kind = "M" if "M" in (kind, d.kind) else "m"
+        elif d.kind == "O" and kind is None:
+            return _raw_arange(start, stop, step, None).astype(d)
         elif kind is None:
             return _raw_arange(start, stop, step, dtype)
     if kind is None:

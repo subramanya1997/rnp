@@ -361,7 +361,10 @@ def asarray(obj, dtype=None, order=None, *, device=None, copy=None, like=None):
         raise ValueError(
             f'Device not understood. Only "cpu" is allowed, but received: {device}'
         )
-    if order is not None or copy is not None:
+    _nested_dtypes = []
+    if isinstance(obj, (list, tuple)):
+        _flatten_nested_ndarrays(obj, _nested_dtypes)
+    if order is not None or copy is not None or _nested_dtypes:
         return globals()["array"](
             obj, dtype, copy=copy, order="K" if order is None else order
         )
@@ -1303,6 +1306,10 @@ def dot(a, b, out=None):
 
 def inner(a, b):
     """Inner product: the last axes of `a` and `b` are contracted."""
+    if (getattr(getattr(a, "dtype", None), "kind", None) == "O" or
+            getattr(getattr(b, "dtype", None), "kind", None) == "O"):
+        from .lib._rnp_corecompat import inner as _compat_inner
+        return _compat_inner(a, b)
     res = _rnp._inner(a, b)
     if isinstance(res, ndarray) and res.ndim == 0:
         return res[()]

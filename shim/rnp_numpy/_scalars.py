@@ -285,7 +285,14 @@ class generic(metaclass=_ScalarMeta):
         cls = _SCALAR_BY_NAME.get(_type_key(d))
         if cls is None:
             return self.__array__().astype(d)
-        return cls(self._v)
+        try:
+            return cls(self._v)
+        except OverflowError:
+            # ``astype`` is a C cast, not a scalar constructor.  Narrow
+            # integer results wrap instead of raising on an out-of-range
+            # value, while the established constructor path remains intact
+            # for every representable conversion.
+            return cls._wrap(_rnp._scalar_cast(d, self))
 
     def copy(self, *a, **k):
         return self

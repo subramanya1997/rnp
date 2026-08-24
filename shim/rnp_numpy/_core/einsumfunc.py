@@ -6,10 +6,11 @@ import functools
 import itertools
 import operator
 
-from rnp_numpy._core.multiarray import c_einsum, matmul
+from rnp_numpy import matmul
+from rnp_numpy._core._einsum_core import c_einsum
 from rnp_numpy._core.numeric import asanyarray, reshape
 from rnp_numpy._core.overrides import array_function_dispatch
-from rnp_numpy._core.umath import multiply
+from rnp_numpy import multiply
 
 __all__ = ['einsum', 'einsum_path']
 
@@ -507,6 +508,8 @@ def _parse_einsum_input(operands):
                             "For this input type lists must contain "
                             "either int or Ellipsis"
                         ) from e
+                    if s < 0 or s >= len(einsum_symbols):
+                        raise ValueError("subscript is not within the valid range [0, 52)")
                     subscripts += einsum_symbols[s]
             if num != last:
                 subscripts += ","
@@ -524,6 +527,8 @@ def _parse_einsum_input(operands):
                             "For this input type lists must contain "
                             "either int or Ellipsis"
                         ) from e
+                    if s < 0 or s >= len(einsum_symbols):
+                        raise ValueError("subscript is not within the valid range [0, 52)")
                     subscripts += einsum_symbols[s]
     # Check for proper "->"
     if ("-" in subscripts) or (">" in subscripts):
@@ -1630,7 +1635,13 @@ def einsum(*operands, out=None, optimize=False, **kwargs):
         if handle_out:
             kwargs["out"] = out
 
-        if len(tmp_operands) == 2:
+        # The native matmul route has no object loop.  Keep the planner's
+        # contraction order, but execute object contractions with c_einsum's
+        # scalar Python-object loop instead.
+        use_bmm = len(tmp_operands) == 2 and all(
+            operand.dtype.kind != "O" for operand in tmp_operands
+        )
+        if use_bmm:
             # Call (batched) matrix multiplication if possible
             new_view = bmm_einsum(einsum_str, *tmp_operands, **kwargs)
         else:

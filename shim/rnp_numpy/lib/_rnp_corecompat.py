@@ -66,9 +66,9 @@ def asanyarray(a, dtype=None, order=None, *, device=None, copy=None, like=None):
     # The port has no ndarray subclasses that survive a conversion, so
     # `asanyarray` and `asarray` coincide except that an ndarray input is
     # passed through untouched.
-    if isinstance(a, np.ndarray) and dtype is None:
+    if isinstance(a, np.ndarray) and dtype is None and order in (None, 'K'):
         return a
-    return np.asarray(a, dtype)
+    return np.asarray(a, dtype, order=order)
 
 
 def ascontiguousarray(a, dtype=None, *, like=None):
@@ -502,16 +502,20 @@ def diagonal(a, offset=0, axis1=0, axis2=1):
     n, m = a.shape[-2], a.shape[-1]
     if offset >= 0:
         length = builtins.max(builtins.min(n, m - offset), 0)
-        rows = list(builtins.range(length))
-        cols = [r + offset for r in rows]
+        cropped = a[..., :length, offset:offset + length]
     else:
         length = builtins.max(builtins.min(n + offset, m), 0)
-        rows = [r - offset for r in builtins.range(length)]
-        cols = list(builtins.range(length))
-    out = np.empty(a.shape[:-2] + (length,), a.dtype)
-    for i, (r, c) in enumerate(zip(rows, cols)):
-        out[..., i] = a[..., r, c]
-    return out
+        cropped = a[..., -offset:-offset + length, :length]
+    # A diagonal is one strided axis whose step is the sum of the two source
+    # strides.  The native helper preserves the collapsed ndarray base chain,
+    # so einsum can return this as a write-through view just like NumPy.
+    from _rnp import _as_strided
+    return _as_strided(
+        cropped,
+        cropped.shape[:-2] + (length,),
+        cropped.strides[:-2] + (cropped.strides[-2] + cropped.strides[-1],),
+        cropped.flags.writeable,
+    )
 
 
 def trace(a, offset=0, axis1=0, axis2=1, dtype=None, out=None):
@@ -531,6 +535,14 @@ def dot(a, b, out=None):
             f"{b.shape[-2 if b.ndim > 1 else -1]} "
             f"(dim {builtins.max(b.ndim - 2, 0)})")
     n = a.shape[-1]
+    if n == 0:
+        shape = a.shape[:-1]
+        if b.ndim > 1:
+            shape += b.shape[:-2] + b.shape[-1:]
+        res = np.zeros(shape, dtype=np.result_type(a, b))
+        if res.ndim == 0:
+            res = res[()]
+        return _to_out(res, out) if out is not None else res
     a2 = a.reshape(-1, n)
     if b.ndim == 1:
         res = np.add.reduce(np.multiply(a2, b.reshape(1, n)), axis=1)
@@ -562,6 +574,10 @@ def inner(a, b):
         raise ValueError(
             f"shapes {a.shape} and {b.shape} not aligned: {n} (dim "
             f"{a.ndim - 1}) != {b.shape[-1]} (dim {b.ndim - 1})")
+    if n == 0:
+        res = np.zeros(a.shape[:-1] + b.shape[:-1],
+                       dtype=np.result_type(a, b))
+        return res[()] if res.ndim == 0 else res
     a2 = a.reshape(-1, n)
     b2 = b.reshape(-1, n)
     res = np.add.reduce(
@@ -645,7 +661,7 @@ def tensordot(a, b, axes=2):
         return out
     at = a.transpose(tuple(newaxes_a)).reshape(-1, N2a)
     bt = b.transpose(tuple(newaxes_b)).reshape(N2a, -1)
-    res = dot(at, bt)
+    res = np.dot(at, bt)
     return np.asarray(res).reshape(olda + oldb)
 
 
@@ -1286,7 +1302,7 @@ def _install_ndarray_methods():
        keepdims=False, **k: std(self, axis, dtype, out, ddof, keepdims, **k))
     _m("ptp", lambda self, axis=None, out=None, keepdims=False:
        ptp(self, axis, out, keepdims))
-    _m("dot", lambda self, b, out=None: dot(self, b, out))
+    _m("dot", lambda self, b, out=None: np.dot(self, b, out=out))
     _m("diagonal", lambda self, offset=0, axis1=0, axis2=1:
        diagonal(self, offset, axis1, axis2))
     _m("trace", lambda self, offset=0, axis1=0, axis2=1, dtype=None,
@@ -1366,62 +1382,9 @@ def _parse_einsum(subscripts, operands):
 
 def einsum(*operands, out=None, dtype=None, order='K', casting='safe',
            optimize=False):
-    if not operands or not isinstance(operands[0], str):
-        raise NotImplementedError(
-            "np.einsum's interleaved (operand, subscript-list) form is not "
-            "implemented by rnp yet")
-    subscripts, arrays = operands[0], [np.asanyarray(a) for a in operands[1:]]
-    terms, out_sub = _parse_einsum(subscripts, arrays)
-
-    # Collapse an index repeated within one operand onto its diagonal.
-    reduced = []
-    for term, arr in zip(terms, arrays):
-        while len(set(term)) != len(term):
-            for ch in term:
-                if term.count(ch) > 1:
-                    i = term.index(ch)
-                    j = term.index(ch, i + 1)
-                    arr = diagonal(arr, 0, i, j)
-                    term = ("".join(c for k, c in enumerate(term)
-                                    if k not in (i, j)) + ch)
-                    break
-        reduced.append((term, arr))
-
-    sizes = {}
-    for term, arr in reduced:
-        for ch, n in zip(term, arr.shape):
-            if sizes.get(ch, n) != n and n != 1 and sizes[ch] != 1:
-                raise ValueError(
-                    f"operands could not be broadcast together for einsum "
-                    f"index {ch!r}")
-            sizes[ch] = builtins.max(sizes.get(ch, 1), n)
-
-    all_idx = out_sub + "".join(
-        sorted({ch for term, _ in reduced for ch in term}
-               - set(out_sub)))
-    full_shape = tuple(sizes[ch] for ch in all_idx)
-
-    product = None
-    for term, arr in reduced:
-        perm = tuple(term.index(ch) for ch in all_idx if ch in term)
-        arr = arr.transpose(perm)
-        shape = tuple(sizes[ch] if ch in term else 1 for ch in all_idx)
-        arr = arr.reshape(shape)
-        arr = np.broadcast_to(arr, full_shape)
-        product = arr if product is None else np.multiply(product, arr)
-
-    if dtype is not None:
-        product = product.astype(dtype)
-    n_out = len(out_sub)
-    if n_out < len(all_idx):
-        product = np.add.reduce(
-            product, axis=tuple(builtins.range(n_out, len(all_idx))))
-    if np.ndim(product) == 0:
-        product = product[()]
-    if out is not None:
-        out[...] = product
-        return out
-    return product
+    from rnp_numpy._core.einsumfunc import einsum as _einsum
+    return _einsum(*operands, out=out, optimize=optimize, dtype=dtype,
+                   order=order, casting=casting)
 
 
 def einsum_path(*operands, optimize='greedy', einsum_call=False):

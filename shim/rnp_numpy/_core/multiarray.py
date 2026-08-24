@@ -62,7 +62,11 @@ vdot = not_implemented("numpy._core.multiarray.vdot")
 matmul = not_implemented("numpy._core.multiarray.matmul")
 lexsort = not_implemented("numpy._core.multiarray.lexsort")
 bincount = not_implemented("numpy._core.multiarray.bincount")
-c_einsum = not_implemented("numpy._core.multiarray.c_einsum")
+def c_einsum(*args, **kwargs):
+    # Lazy to avoid importing einsumfunc while the top-level namespace is
+    # still wiring its core compatibility layer.
+    from ._einsum_core import c_einsum as implementation
+    return implementation(*args, **kwargs)
 copyto = not_implemented("numpy._core.multiarray.copyto")
 concatenate = not_implemented("numpy._core.multiarray.concatenate")
 correlate = not_implemented("numpy._core.multiarray.correlate")
