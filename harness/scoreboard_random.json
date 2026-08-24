@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T17:21:30.222243+00:00",
-  "overall_passed": 1188,
+  "timestamp": "2026-08-24T20:09:08.980747+00:00",
+  "overall_passed": 1256,
   "overall_total": 1349,
   "files": [
     {
@@ -37,24 +37,24 @@
     },
     {
       "file": "random/test_random.py",
-      "passed": 93,
-      "failed": 49,
+      "passed": 126,
+      "failed": 16,
       "errors": 0,
       "skipped": 0,
       "total": 142
     },
     {
       "file": "random/test_randomstate.py",
-      "passed": 135,
-      "failed": 46,
+      "passed": 168,
+      "failed": 13,
       "errors": 0,
       "skipped": 0,
       "total": 181
     },
     {
       "file": "random/test_randomstate_regression.py",
-      "passed": 12,
-      "failed": 9,
+      "passed": 14,
+      "failed": 7,
       "errors": 0,
       "skipped": 0,
       "total": 21

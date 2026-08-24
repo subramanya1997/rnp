@@ -12,6 +12,8 @@ Every message below was probed from real numpy 2.5.2.
 import operator as _operator
 import random as _random
 import warnings as _warnings
+import functools as _functools
+import inspect as _inspect
 import math
 import types as _types
 
@@ -381,6 +383,8 @@ class RandomState:
     `RandomState` in 2.0 (they survive only as module-level aliases), and the
     upstream tests check for their absence.  Probed on 2.5.2.
     """
+
+    _poisson_lam_max = 9.223372006484771e18
 
     def __init__(self, s=None):
         if isinstance(s, type) and issubclass(s, BitGenerator):
@@ -953,6 +957,141 @@ class RandomState:
 
     def tomaxint(self, size=None):
         return self._fill(size, lambda: self._bit_generator.next_uint64() >> 1, int_)
+
+
+def _broadcast_distribution(method):
+    """Vectorize a legacy scalar distribution over broadcast parameters.
+
+    NumPy's legacy ``RandomState`` broadcasts distribution parameters first,
+    then consumes the scalar kernel once per output element in C order.  The
+    scalar kernels above already carry the validation and exact stream logic;
+    this adapter supplies only that shared outer loop.
+    """
+    signature = _inspect.signature(method)
+
+    @_functools.wraps(method)
+    def broadcasted(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        values = dict(bound.arguments)
+        values.pop("self", None)
+        size = values.pop("size", None)
+        arrays = {name: asarray(value) for name, value in values.items()}
+        if all(value.ndim == 0 for value in arrays.values()):
+            _validate_broadcast_distribution(
+                method.__name__,
+                {name: value.reshape(-1)[0] for name, value in arrays.items()},
+            )
+            return method(self, *args, **kwargs)
+
+        names = list(arrays)
+        from .. import broadcast_arrays, broadcast_to
+        if size is None:
+            expanded = broadcast_arrays(*(arrays[name] for name in names))
+            shape = expanded[0].shape
+        else:
+            shape = _shape(size)
+            expanded = [broadcast_to(arrays[name], shape) for name in names]
+
+        # Repeated parameter arrays are common (and the thread-safety tests
+        # use a 100x1000 array of ones).  Preserve the same scalar-kernel
+        # stream while letting the existing bulk fill avoid a Python call per
+        # element.
+        constants = []
+        for value in expanded:
+            first = value.reshape(-1)[0]
+            if not bool((value == first).all()):
+                break
+            constants.append(first)
+        else:
+            scalar_args = dict(zip(names, constants))
+            _validate_broadcast_distribution(method.__name__, scalar_args)
+            return method(self, **scalar_args, size=shape)
+
+        flat = [value.reshape(-1) for value in expanded]
+        result = []
+        for index in range(_count(shape)):
+            scalar_args = {name: flat[pos][index]
+                           for pos, name in enumerate(names)}
+            _validate_broadcast_distribution(method.__name__, scalar_args)
+            result.append(method(self, **scalar_args, size=None))
+        return array(result).reshape(shape)
+
+    return broadcasted
+
+
+def _validate_broadcast_distribution(name, values):
+    """Validate scalar parameters before entering rejection-sampling kernels."""
+    value = {key: float(item) for key, item in values.items()}
+
+    def reject(condition, message):
+        if condition:
+            raise ValueError(message)
+
+    if name == "beta":
+        reject(value["a"] <= 0, "a <= 0")
+        reject(value["b"] <= 0, "b <= 0")
+    elif name == "f":
+        reject(value["dfnum"] <= 0, "dfnum <= 0")
+        reject(value["dfden"] <= 0, "dfden <= 0")
+    elif name == "noncentral_f":
+        reject(value["dfnum"] <= 0, "dfnum <= 0")
+        reject(value["dfden"] <= 0, "dfden <= 0")
+        reject(value["nonc"] < 0, "nonc < 0")
+    elif name == "chisquare":
+        reject(value["df"] <= 0, "df <= 0")
+    elif name == "noncentral_chisquare":
+        reject(value["df"] <= 0, "df <= 0")
+        reject(value["nonc"] < 0, "nonc < 0")
+    elif name == "vonmises":
+        reject(value["kappa"] < 0, "kappa < 0")
+    elif name in ("pareto", "power"):
+        reject(value["a"] <= 0, "a <= 0")
+    elif name == "logistic":
+        reject(value["scale"] < 0, "scale < 0")
+    elif name == "wald":
+        reject(value["mean"] <= 0, "mean <= 0")
+        reject(value["scale"] <= 0, "scale <= 0")
+    elif name == "triangular":
+        reject(value["left"] > value["mode"], "left > mode")
+        reject(value["mode"] > value["right"], "mode > right")
+        reject(value["left"] == value["right"], "left == right")
+    elif name == "binomial":
+        reject(value["n"] < 0, "n < 0")
+        reject(not 0 <= value["p"] <= 1, "p < 0, p > 1 or p is NaN")
+    elif name == "negative_binomial":
+        reject(value["n"] <= 0, "n <= 0")
+        reject(not 0 < value["p"] <= 1, "p <= 0, p > 1 or p contains NaNs")
+    elif name == "poisson":
+        lam = value["lam"]
+        reject(not 0 <= lam <= RandomState._poisson_lam_max,
+               "lam < 0 or lam contains NaNs")
+    elif name == "zipf":
+        reject(not value["a"] > 1, "a <= 1 or a contains NaNs")
+    elif name == "geometric":
+        reject(not 0 < value["p"] <= 1,
+               "p <= 0, p > 1 or p contains NaNs")
+    elif name == "hypergeometric":
+        reject(value["ngood"] < 0, "ngood < 0")
+        reject(value["nbad"] < 0, "nbad < 0")
+        reject(value["nsample"] < 1, "nsample < 1")
+        reject(value["ngood"] + value["nbad"] < value["nsample"],
+               "ngood + nbad < nsample")
+    elif name == "logseries":
+        reject(not 0 < value["p"] < 1,
+               "p < 0, p >= 1 or p contains NaNs")
+
+
+for _broadcast_name in (
+    "uniform", "normal", "beta", "exponential", "standard_gamma", "gamma",
+    "f", "noncentral_f", "chisquare", "noncentral_chisquare", "standard_t",
+    "vonmises", "pareto", "weibull", "power", "laplace", "gumbel",
+    "logistic", "lognormal", "rayleigh", "wald", "triangular", "binomial",
+    "negative_binomial", "poisson", "zipf", "geometric", "hypergeometric",
+    "logseries",
+):
+    setattr(RandomState, _broadcast_name,
+            _broadcast_distribution(getattr(RandomState, _broadcast_name)))
 
 
 def default_rng(seed=None):
