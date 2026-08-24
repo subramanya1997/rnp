@@ -365,14 +365,27 @@ pub fn check_int_store(target: DType, src: Option<DType>, v: Scalar) -> PyResult
         Scalar::Complex(_) => return Ok(()),
     };
     let signed = target.category() == rnp_core::dtype::Kind::Int;
-    // Signed targets convert through a C `long`; unsigned ones accept the
-    // whole `[i64::MIN, u64::MAX]` span before wrapping.
-    let reaches_c = if signed {
-        n >= i64::MIN as i128 && n <= i64::MAX as i128
+    // An *unsigned* target does not check a numpy scalar at all: probed,
+    // `np.array([np.int64(-1)], dtype=np.uint8)` is 255 and
+    // `np.array([np.uint64(2**63)], dtype=np.uint8)` is 0, while the same
+    // values written as Python ints both raise.
+    if src.is_some() && !signed {
+        return Ok(());
+    }
+    // Every dtype first converts the Python object through one C integer
+    // type, and a value that does not fit *that* never reaches the range
+    // check. numpy picks the C type per dtype (`arraytypes.c.src`): only
+    // `uint`/`ulong` use an unsigned conversion, so `uint8` and `uint16`
+    // reject 2**63 with "too large" while `uint32` calls it out of bounds.
+    // Probed for all eight integer dtypes x {2**63, 2**64-1, 2**64,
+    // -2**63, -2**63-1}.
+    let unsigned_conversion = matches!(target, DType::U32 | DType::U64);
+    let hi_c = if unsigned_conversion {
+        u64::MAX as i128
     } else {
-        n >= i64::MIN as i128 && n <= u64::MAX as i128
+        i64::MAX as i128
     };
-    if !reaches_c {
+    if !(n >= i64::MIN as i128 && n <= hi_c) {
         return Err(too_large());
     }
     if n < lo || n > hi {
@@ -821,12 +834,17 @@ pub fn weak_dtype(arr: DType, s: Scalar, comparison: bool) -> PyResult<DType> {
     if v >= lo && v <= hi {
         return Ok(d);
     }
-    if comparison {
-        return Ok(s.natural_dtype());
+    // A comparison against an *integer* array always answers, in whatever
+    // dtype holds both sides -- probed over every integer dtype crossed with
+    // every out-of-range value. A `bool` array is the exception: numpy has no
+    // loop for it and lets the conversion error out (`np.ones(3, bool) <
+    // 2**63` is an OverflowError, while `np.ones(3, np.uint8) < 2**63` is
+    // not), which `check_int_store` below reproduces.
+    if comparison && arr != DType::Bool {
+        return Ok(promote(d, s.natural_dtype()));
     }
-    Err(pyo3::exceptions::PyOverflowError::new_err(format!(
-        "Python integer {v} out of bounds for {d}"
-    )))
+    check_int_store(d, None, s)?;
+    Ok(d)
 }
 
 /// Coerce the right-hand operand of a binary op into an array, applying weak
@@ -864,7 +882,8 @@ pub fn operand_for(
         if !(self_dtype.is_integer() || self_dtype == DType::Bool) {
             return Ok(None);
         }
-        if !comparison {
+        // A `bool` array has no large-integer loop at all, comparison or not.
+        if !comparison || self_dtype == DType::Bool {
             // Probed: `np.arange(3) + 2**100` is this OverflowError.
             return Err(too_large());
         }

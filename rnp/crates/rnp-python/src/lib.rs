@@ -288,18 +288,30 @@ fn type_arg(a: &Bound<'_, PyAny>) -> PyResult<TypeArg> {
     if let Ok(arr) = a.cast::<PyNdArray>() {
         return Ok(TypeArg::Concrete(arr.borrow().arr.dtype()));
     }
+    // A numpy scalar is *strong*: `np.result_type(np.float64(1), np.float16)`
+    // is float64. It has to be recognised before the Python-number tests
+    // below, because our `float64` / `complex128` scalars subclass `float` /
+    // `complex` (and `bool_` is not a `bool`, but `int64` is not an `int`).
+    if let Some((d, _)) = convert::np_scalar(a)? {
+        return Ok(TypeArg::Concrete(d));
+    }
     // A bare Python number is *weak*: it contributes its kind, not its value.
     if a.is_instance_of::<pyo3::types::PyBool>() {
         return Ok(TypeArg::Weak(WeakKind::Bool));
     }
     if a.is_instance_of::<pyo3::types::PyInt>() {
-        // Probed: `np.result_type(2**100)` is `object` (it is the dtype
-        // `np.array(2**100)` would have), but `np.result_type(np.int8,
-        // 2**100)` is `int8` -- the huge int is still a *weak* integer.
-        if convert::huge_int(a)?.is_some() {
-            return Ok(TypeArg::HugeInt);
-        }
-        return Ok(TypeArg::Weak(WeakKind::Int));
+        // A weak integer, carrying the dtype it would have *alone*, which is
+        // still value-based: `np.result_type(2**63)` is uint64 and
+        // `np.result_type(2**100)` is object, but both are weak `int` as soon
+        // as anything else joins them.
+        let alone = if a.extract::<i64>().is_ok() {
+            DType::I64
+        } else if a.extract::<u64>().is_ok() {
+            DType::U64
+        } else {
+            DType::Object
+        };
+        return Ok(TypeArg::WeakInt(alone));
     }
     if a.is_instance_of::<pyo3::types::PyFloat>() {
         return Ok(TypeArg::Weak(WeakKind::Float));

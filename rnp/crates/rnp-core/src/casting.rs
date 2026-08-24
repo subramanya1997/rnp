@@ -197,13 +197,14 @@ pub enum TypeArg {
     Concrete(DType),
     /// A Python `bool`/`int`/`float`/`complex` literal.
     Weak(WeakKind),
-    /// A Python `int` too wide for any integer dtype. It behaves exactly like
-    /// `Weak(Int)` when promoted against anything else, but *alone* it is the
-    /// dtype `np.array(2**100)` would have, which is `object`.
+    /// A Python `int`, carrying the dtype `np.array(v)` would give it.
     ///
-    /// Probed: `np.result_type(2**100)` is `object`, `np.result_type(np.int8,
-    /// 2**100)` is `int8`, `np.result_type(2**100, 2**100)` is `int64`.
-    HugeInt,
+    /// It promotes exactly like `Weak(Int)` against anything else, but numpy
+    /// short-circuits a *single* argument straight to the array's own dtype,
+    /// which for an integer is still value-based. Probed:
+    /// `np.result_type(2**63)` is `uint64` and `np.result_type(2**100)` is
+    /// `object`, yet `np.result_type(np.int8, 2**100)` is `int8`.
+    WeakInt(DType),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
@@ -439,7 +440,7 @@ pub fn result_type(args: &[TypeArg]) -> Option<DType> {
         // `np.result_type(np.int8, 2**100)` is `int8`.
         [TypeArg::Concrete(d)] => return Some(*d),
         [TypeArg::Weak(k)] => return Some(k.default_dtype()),
-        [TypeArg::HugeInt] => return Some(DType::Object),
+        [TypeArg::WeakInt(d)] => return Some(*d),
         _ => {}
     }
     let parts: Vec<Part> = args
@@ -448,7 +449,7 @@ pub fn result_type(args: &[TypeArg]) -> Option<DType> {
             TypeArg::Concrete(d) => Part::Concrete(d),
             TypeArg::Weak(WeakKind::Bool) => Part::Concrete(DType::Bool),
             TypeArg::Weak(k) => Part::Abstract(k),
-            TypeArg::HugeInt => Part::Abstract(WeakKind::Int),
+            TypeArg::WeakInt(_) => Part::Abstract(WeakKind::Int),
         })
         .collect();
     promote_sequence(&parts).map(Part::resolve)
