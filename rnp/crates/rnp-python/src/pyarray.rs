@@ -956,6 +956,8 @@ impl PyNdArray {
             } else {
                 self.arr.clone()
             }
+        } else if d.dt.is_object() {
+            crate::objects::astype_object(py, &self.arr)?
         } else if d.is_struct() || self.arr.descr.is_struct() {
             // Structured casts must be resolved before the same-storage
             // shortcut: distinct record layouts can have equal item widths

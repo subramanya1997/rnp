@@ -176,6 +176,10 @@ fn zeros(
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
     let d = descr_or_default(dtype, DType::F64)?;
+    if d.dt.is_object() {
+        let zero = 0_i64.into_pyobject(py)?.into_any();
+        return wrap(py, objects::full_object(shape_from_any(shape)?, d, &zero)?);
+    }
     wrap(py, NdArray::zeros_descr(shape_from_any(shape)?, d).map_err(err)?)
 }
 
@@ -187,6 +191,10 @@ fn ones(
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
     let d = descr_or_default(dtype, DType::F64)?;
+    if d.dt.is_object() {
+        let one = 1_i64.into_pyobject(py)?.into_any();
+        return wrap(py, objects::full_object(shape_from_any(shape)?, d, &one)?);
+    }
     if d.dt.is_string() {
         let one = pyo3::types::PyString::new(py, "1");
         let scalar = array_from_any(one.as_any(), Some(d.dt), false)?;

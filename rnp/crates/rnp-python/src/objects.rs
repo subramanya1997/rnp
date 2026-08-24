@@ -17,7 +17,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::pyclass::CompareOp;
 use pyo3::prelude::*;
 
-use rnp_core::{DType, NdArray, Scalar};
+use rnp_core::{DType, Descr, NdArray, Scalar};
 
 static SLAB: Mutex<Vec<Py<PyAny>>> = Mutex::new(Vec::new());
 
@@ -177,6 +177,27 @@ pub fn array_from_objects(obj: &Bound<'_, PyAny>) -> PyResult<NdArray> {
     let out = NdArray::zeros(shape, DType::Object).map_err(crate::err)?;
     for (i, it) in items.iter().enumerate() {
         write(&out, out.byte_offset + (i * 8) as isize, it);
+    }
+    Ok(out)
+}
+
+/// Cast any ndarray to object dtype by interning each converted Python value.
+pub fn astype_object(py: Python<'_>, arr: &NdArray) -> PyResult<NdArray> {
+    let out = NdArray::zeros(arr.shape.clone(), DType::Object).map_err(crate::err)?;
+    let src = rnp_core::iter::offsets(&arr.shape, &arr.strides, arr.byte_offset);
+    let dst = rnp_core::iter::offsets(&out.shape, &out.strides, out.byte_offset);
+    for (source, target) in src.zip(dst) {
+        let value = crate::convert::element_to_py(py, arr, source)?;
+        write(&out, target, &value);
+    }
+    Ok(out)
+}
+
+/// Allocate an object array whose every cell owns the same Python value.
+pub fn full_object(shape: Vec<isize>, descr: Descr, value: &Bound<'_, PyAny>) -> PyResult<NdArray> {
+    let out = NdArray::zeros_descr(shape, descr).map_err(crate::err)?;
+    for target in rnp_core::iter::offsets(&out.shape, &out.strides, out.byte_offset) {
+        write(&out, target, value);
     }
     Ok(out)
 }
