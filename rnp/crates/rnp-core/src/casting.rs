@@ -271,11 +271,19 @@ fn min_unsigned(v: u64) -> DType {
 /// One argument to `np.result_type`: either a concrete dtype (from an array,
 /// a dtype object or a numpy scalar) or a *weak* Python scalar, which under
 /// NEP 50 contributes only its kind, never its value.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TypeArg {
     Concrete(DType),
     /// A Python `bool`/`int`/`float`/`complex` literal.
     Weak(WeakKind),
+    /// A Python `int`, carrying the dtype `np.array(v)` would give it.
+    ///
+    /// It promotes exactly like `Weak(Int)` against anything else, but numpy
+    /// short-circuits a *single* argument straight to the array's own dtype,
+    /// which for an integer is still value-based. Probed:
+    /// `np.result_type(2**63)` is `uint64` and `np.result_type(2**100)` is
+    /// `object`, yet `np.result_type(np.int8, 2**100)` is `int8`.
+    WeakInt(DType),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
@@ -298,6 +306,7 @@ impl WeakKind {
         }
     }
 
+    #[allow(dead_code)]
     fn of(d: DType) -> WeakKind {
         match d.category() {
             Kind::Bool => WeakKind::Bool,
@@ -308,53 +317,221 @@ impl WeakKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// numpy's promotion of a *sequence* of DTypes
+// ---------------------------------------------------------------------------
+//
+// Promotion is neither associative nor commutative in numpy (unsigned and
+// signed integers see to that), so `np.result_type(a, b, c)` is deliberately
+// *not* `promote(promote(a, b), c)`. Probed from numpy 2.5.2:
+//
+//     result_type(uint8,  int8,   float16) -> float16   (left fold: float32)
+//     result_type(int8,   uint16, float16) -> float32   (left fold: float64)
+//     result_type(int16,  uint16, float32) -> float32   (left fold: float64)
+//
+// The algorithm below is `PyArray_PromoteDTypeSequence` from
+// `upstream/numpy/_core/src/multiarray/common_dtype.c`, transcribed. Its two
+// moving parts are:
+//
+//   * `common_dtype(a, b)` is one-sided and may answer "not implemented":
+//     `default_builtin_common_dtype` defers whenever `b`'s *type number* is
+//     larger than `a`'s (and `float16`'s type number, 23, is the largest of
+//     all, which is exactly why it wins above).
+//   * the reduction first sorts the "most knowledgeable" DType to the front
+//     by swapping on every deferral, then promotes every remaining
+//     participant against *that* one rather than against the running result.
+//
+// A weak Python scalar takes part as one of numpy's abstract DTypes
+// (`PyLongDType` / `PyFloatDType` / `PyComplexDType`), whose one-sided
+// `common_dtype` rules are transcribed from `abstractdtypes.c`.
+
+/// One participant of the promotion: a real dtype, or the abstract dtype of a
+/// weak Python scalar.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Part {
+    Concrete(DType),
+    /// `PyLongDType` / `PyFloatDType` / `PyComplexDType`. A Python `bool` is
+    /// *not* abstract in numpy -- it coerces to `np.bool_` -- so `WeakKind`
+    /// only reaches here as `Int`, `Float` or `Complex`.
+    Abstract(WeakKind),
+}
+
+impl Part {
+    /// The concrete dtype an abstract participant falls back to when it is
+    /// the final answer (numpy's `default_descr`).
+    fn resolve(self) -> DType {
+        match self {
+            Part::Concrete(d) => d,
+            Part::Abstract(k) => k.default_dtype(),
+        }
+    }
+}
+
+/// numpy's one-sided `NPY_DT_CALL_common_dtype(a, b)`.
+///
+/// `None` is numpy's `NotImplemented`: "`a` does not know how to promote with
+/// `b`; ask `b`".
+fn one_sided_common(a: Part, b: Part) -> Option<Part> {
+    use Part::*;
+    match (a, b) {
+        // `object_common_dtype`: object swallows everything.
+        (Concrete(DType::Object), _) => Some(Concrete(DType::Object)),
+        // `default_builtin_common_dtype`, the abstract half.
+        (Concrete(c), Abstract(k)) => match k {
+            WeakKind::Complex => match c {
+                d if d.is_complex() => Some(Concrete(d)),
+                DType::F16 | DType::F32 => Some(Concrete(DType::C64)),
+                DType::F64 => Some(Concrete(DType::C128)),
+                _ => None,
+            },
+            WeakKind::Float => {
+                if c.is_complex() || c.is_float() {
+                    Some(Concrete(c))
+                } else {
+                    None
+                }
+            }
+            WeakKind::Int => {
+                if c.is_complex()
+                    || c.is_float()
+                    || c.is_integer()
+                    || matches!(c, DType::TimeDelta(_))
+                {
+                    Some(Concrete(c))
+                } else {
+                    None
+                }
+            }
+            // Never constructed; a Python bool is concrete `np.bool_`.
+            WeakKind::Bool => Some(Concrete(c)),
+        },
+        // `default_builtin_common_dtype`, the legacy half: defer to whoever
+        // has the larger type number.
+        (Concrete(c), Concrete(o)) => {
+            if o.num() > c.num() {
+                None
+            } else if o == DType::Object {
+                Some(Concrete(DType::Object))
+            } else {
+                Some(Concrete(crate::dtype::promote(c, o)))
+            }
+        }
+        // `int_common_dtype`: a Python int knows only how to lift a bool to
+        // the default integer; everything else is the other side's problem.
+        (Abstract(WeakKind::Int), Concrete(DType::Bool)) => Some(Concrete(DType::I64)),
+        (Abstract(WeakKind::Int), _) => None,
+        // `float_common_dtype`.
+        (Abstract(WeakKind::Float), Concrete(c)) => {
+            if c == DType::Bool || c.is_integer() {
+                Some(Concrete(DType::F64))
+            } else {
+                None
+            }
+        }
+        (Abstract(WeakKind::Float), Abstract(WeakKind::Int)) => Some(Abstract(WeakKind::Float)),
+        (Abstract(WeakKind::Float), _) => None,
+        // `complex_common_dtype`.
+        (Abstract(WeakKind::Complex), Concrete(c)) => {
+            if c == DType::Bool || c.is_integer() {
+                Some(Concrete(DType::C128))
+            } else {
+                None
+            }
+        }
+        (Abstract(WeakKind::Complex), Abstract(WeakKind::Int | WeakKind::Float)) => {
+            Some(Abstract(WeakKind::Complex))
+        }
+        (Abstract(WeakKind::Complex), _) => None,
+        (Abstract(WeakKind::Bool), _) => None,
+    }
+}
+
+/// numpy's symmetric `PyArray_CommonDType`: try both directions.
+fn two_sided_common(a: Part, b: Part) -> Option<Part> {
+    if a == b {
+        return Some(a);
+    }
+    one_sided_common(a, b).or_else(|| one_sided_common(b, a))
+}
+
+/// `reduce_dtypes_to_most_knowledgeable`: partially sort `parts[..length]` so
+/// that `parts[0]` is the participant every other one defers to, clearing the
+/// entries that provably cannot influence the answer. Returns the last
+/// pairwise result (`None` for numpy's `NotImplemented`).
+fn reduce_to_most_knowledgeable(parts: &mut [Option<Part>], length: usize) -> Option<Part> {
+    debug_assert!(length >= 2);
+    let half = length / 2;
+    let mut res = None;
+    for low in 0..half {
+        let high = length - 1 - low;
+        // Entries are only ever cleared at an index at or above
+        // `length - half`, which is past the prefix any recursive call looks
+        // at, so both ends are still present here.
+        let (a, b) = (parts[low].unwrap(), parts[high].unwrap());
+        res = if a == b { Some(a) } else { one_sided_common(a, b) };
+        match res {
+            // "Guess at the other being more knowledgeable."
+            None => parts.swap(low, high),
+            // `parts[high]` cannot influence the result any more.
+            Some(p) if p == a => parts[high] = None,
+            Some(_) => {}
+        }
+    }
+    if length == 2 {
+        return res;
+    }
+    reduce_to_most_knowledgeable(parts, length - half)
+}
+
+/// `PyArray_PromoteDTypeSequence`. `None` is numpy's `DTypePromotionError`.
+fn promote_sequence(input: &[Part]) -> Option<Part> {
+    if input.len() == 1 {
+        return Some(input[0]);
+    }
+    let n = input.len();
+    let mut parts: Vec<Option<Part>> = input.iter().map(|&p| Some(p)).collect();
+    let mut result = reduce_to_most_knowledgeable(&mut parts, n);
+    let main = parts[0].unwrap();
+    // When the reduction ended in "not implemented" its result is unusable and
+    // `parts[0]` itself has not been folded in yet.
+    let reduce_start = if result.is_some() { 2 } else { 1 };
+    for slot in parts.iter().take(n).skip(reduce_start) {
+        let Some(part) = *slot else { continue };
+        let promotion = one_sided_common(main, part)?;
+        result = Some(match result {
+            None => promotion,
+            Some(r) => two_sided_common(r, promotion)?,
+        });
+    }
+    result
+}
+
 /// `np.result_type(*args)` under NEP 50.
 ///
-/// Concrete dtypes promote among themselves as usual. A Python scalar only
-/// bumps the *kind* of the result (`int8` + `300` is still `int8`), and only
-/// when its kind is higher than the concrete result's.
+/// Concrete dtypes promote among themselves as a whole sequence (see the note
+/// above `Part`), while a Python scalar contributes only its *kind*, never its
+/// value: `np.result_type(np.int8, 300)` is `int8`.
 pub fn result_type(args: &[TypeArg]) -> Option<DType> {
-    let mut concrete: Option<DType> = None;
-    let mut weak: Option<WeakKind> = None;
-    for a in args {
-        match *a {
-            TypeArg::Concrete(d) => {
-                concrete = Some(match concrete {
-                    None => d,
-                    Some(p) => crate::dtype::promote(p, d),
-                });
-            }
-            TypeArg::Weak(k) => {
-                weak = Some(match weak {
-                    None => k,
-                    Some(p) => p.max(k),
-                });
-            }
-        }
+    match args {
+        [] => return None,
+        // numpy short-circuits a single argument entirely: it is handed back
+        // as-is, which is why `np.result_type(2**100)` is `object` even though
+        // `np.result_type(np.int8, 2**100)` is `int8`.
+        [TypeArg::Concrete(d)] => return Some(*d),
+        [TypeArg::Weak(k)] => return Some(k.default_dtype()),
+        [TypeArg::WeakInt(d)] => return Some(*d),
+        _ => {}
     }
-    match (concrete, weak) {
-        (None, None) => None,
-        (None, Some(k)) => Some(k.default_dtype()),
-        (Some(d), None) => Some(d),
-        (Some(d), Some(k)) => {
-            if k <= WeakKind::of(d) {
-                Some(d)
-            } else {
-                // The scalar's kind wins, at the narrowest width that holds
-                // the concrete operand: int8 + 1.0 -> float64 (numpy uses the
-                // default precision for the kind), float32 + 1j -> complex64.
-                Some(match k {
-                    WeakKind::Bool => d,
-                    WeakKind::Int => crate::dtype::promote(d, DType::I64),
-                    WeakKind::Float => crate::dtype::promote(d, DType::F64),
-                    WeakKind::Complex => match d {
-                        DType::F32 | DType::F16 => DType::C64,
-                        _ => crate::dtype::promote(d, DType::C128),
-                    },
-                })
-            }
-        }
-    }
+    let parts: Vec<Part> = args
+        .iter()
+        .map(|a| match *a {
+            TypeArg::Concrete(d) => Part::Concrete(d),
+            TypeArg::Weak(WeakKind::Bool) => Part::Concrete(DType::Bool),
+            TypeArg::Weak(k) => Part::Abstract(k),
+            TypeArg::WeakInt(_) => Part::Abstract(WeakKind::Int),
+        })
+        .collect();
+    promote_sequence(&parts).map(Part::resolve)
 }
 
 /// `np.common_type(*arrays)`: the inexact dtype every argument fits into.
@@ -494,6 +671,92 @@ mod tests {
             result_type(&[Concrete(DType::F32), Weak(WeakKind::Float)]),
             Some(DType::F32)
         );
+    }
+
+    #[test]
+    fn result_type_promotes_the_whole_sequence() {
+        use TypeArg::Concrete as C;
+        let d = |s: &str| Descr::parse(s).unwrap().dt;
+        // Every one of these differs from `promote(promote(a, b), c)`, and
+        // every one was probed from numpy 2.5.2. The left fold is given in
+        // the comment.
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["uint8", "int8", "float16"], "float16", "float32"),
+            (&["int8", "uint16", "float16"], "float32", "float64"),
+            (&["uint16", "int8", "float16"], "float32", "float64"),
+            (&["int16", "uint16", "float32"], "float32", "float64"),
+            (&["int32", "uint32", "float16"], "float64", "float64"),
+            (&["float16", "int64", "uint64"], "float64", "float64"),
+            (&["int8", "uint8", "int8"], "int16", "int16"),
+        ];
+        for (args, want, left_fold) in cases {
+            let parts: Vec<TypeArg> = args.iter().map(|s| C(d(s))).collect();
+            assert_eq!(
+                result_type(&parts),
+                Some(d(want)),
+                "result_type{args:?}"
+            );
+            let mut fold = d(args[0]);
+            for a in &args[1..] {
+                fold = crate::dtype::promote(fold, d(a));
+            }
+            assert_eq!(fold, d(left_fold), "left fold of {args:?} moved");
+        }
+    }
+
+    #[test]
+    fn result_type_is_order_independent_for_the_probed_sets() {
+        use TypeArg::Concrete as C;
+        let d = |s: &str| Descr::parse(s).unwrap().dt;
+        // numpy guarantees a stable answer whatever the argument order; the
+        // reduction is what buys that, so assert it directly.
+        for set in [
+            ["uint8", "int8", "float16"],
+            ["int8", "uint16", "float16"],
+            ["int16", "uint16", "float32"],
+        ] {
+            let want = result_type(&set.map(|s| C(d(s))));
+            for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+                let mut p = set;
+                p.swap(i, j);
+                assert_eq!(result_type(&p.map(|s| C(d(s)))), want, "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn result_type_weak_int_is_value_based_only_when_alone() {
+        use TypeArg::*;
+        // Probed: np.result_type(2**63) is uint64, np.result_type(2**100) is
+        // object, but as soon as anything else joins in they are plain weak
+        // integers again.
+        assert_eq!(result_type(&[WeakInt(DType::U64)]), Some(DType::U64));
+        assert_eq!(result_type(&[WeakInt(DType::Object)]), Some(DType::Object));
+        assert_eq!(
+            result_type(&[Concrete(DType::I8), WeakInt(DType::Object)]),
+            Some(DType::I8)
+        );
+        assert_eq!(
+            result_type(&[WeakInt(DType::Object), WeakInt(DType::U64)]),
+            Some(DType::I64)
+        );
+    }
+
+    #[test]
+    fn result_type_object_swallows_everything() {
+        use TypeArg::*;
+        for d in ALL_DTYPES {
+            assert_eq!(
+                result_type(&[Concrete(d), Concrete(DType::Object)]),
+                Some(DType::Object),
+                "{d} + object"
+            );
+            assert_eq!(
+                result_type(&[Concrete(DType::Object), Concrete(d)]),
+                Some(DType::Object),
+                "object + {d}"
+            );
+        }
     }
 
     #[test]

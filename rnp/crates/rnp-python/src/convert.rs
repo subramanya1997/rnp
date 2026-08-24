@@ -186,16 +186,27 @@ fn discover_shape(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) -> PyResult<()
     Ok(())
 }
 
-/// One leaf of a nested sequence: its value plus, for a numpy scalar, the
-/// dtype it contributes *strongly* to the inferred result.
-type Leaf = (Option<DType>, Scalar);
+/// One leaf of a nested sequence.
+#[derive(Copy, Clone)]
+struct Leaf {
+    /// For a numpy scalar, the dtype it contributes *strongly* to the
+    /// inferred result; `None` for a bare Python number.
+    src: Option<DType>,
+    val: Scalar,
+    /// Set when the leaf was a Python `int` too wide for any integer dtype.
+    huge: Option<Huge>,
+}
 
 fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<Leaf>) -> PyResult<()> {
     if depth == shape.len() {
         // A numpy scalar keeps its own dtype: `np.array([np.int8(1)])` is
         // int8, not int64.
         if let Some((d, v)) = np_scalar(obj)? {
-            out.push((Some(d), v));
+            out.push(Leaf { src: Some(d), val: v, huge: None });
+            return Ok(());
+        }
+        if let Some(h) = huge_int(obj)? {
+            out.push(Leaf { src: None, val: h.placeholder(), huge: Some(h) });
             return Ok(());
         }
         let s = scalar_from_py(obj).ok_or_else(|| {
@@ -204,7 +215,7 @@ fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<
                 obj.get_type().name().map(|n| n.to_string()).unwrap_or_default()
             ))
         })?;
-        out.push((None, s));
+        out.push(Leaf { src: None, val: s, huge: None });
         return Ok(());
     }
     if !is_sequence(obj) {
@@ -237,12 +248,175 @@ fn infer_dtype(values: &[Leaf]) -> DType {
     if values.is_empty() {
         return DType::F64;
     }
-    let dt = |l: &Leaf| l.0.unwrap_or_else(|| l.1.natural_dtype());
+    // A Python int too wide for uint64/int64 drags the whole array to object:
+    // probed, `np.array([1, 2**100])` and `np.array([2**100, 1.0])` are both
+    // `dtype('O')`.
+    if values.iter().any(|l| l.huge.is_some()) {
+        return DType::Object;
+    }
+    let dt = |l: &Leaf| l.src.unwrap_or_else(|| l.val.natural_dtype());
     let mut d = dt(&values[0]);
     for v in &values[1..] {
         d = promote(d, dt(v));
     }
     d
+}
+
+/// A Python `int` too wide for `Scalar` (outside `i64::MIN ..= u64::MAX`).
+///
+/// numpy carries these as `object` when it can, converts them to a C `double`
+/// for the inexact dtypes (`np.array(2**100, dtype=np.float32)` is
+/// `1.2676506e+30`), and raises an `OverflowError` when neither works.
+#[derive(Copy, Clone, Debug)]
+pub struct Huge {
+    /// `float(obj)`, or `None` when even that overflowed (past ~1.8e308).
+    /// Probed: numpy then raises `OverflowError: int too large to convert to
+    /// float`, but *only* if the target dtype is inexact --
+    /// `np.array(2**2000, dtype=bool)` is `True` and `np.array(2**2000)` is
+    /// an object array.
+    pub as_f64: Option<f64>,
+    pub negative: bool,
+}
+
+impl Huge {
+    /// The value to store in an inexact array, or numpy's `OverflowError`.
+    fn float(self) -> PyResult<f64> {
+        self.as_f64.ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("int too large to convert to float")
+        })
+    }
+
+    /// The `Scalar` this contributes to a *non*-inexact target, where the
+    /// exact value never matters: `bool` only asks whether it is zero (it
+    /// never is), and integer targets reject it outright.
+    fn placeholder(self) -> Scalar {
+        Scalar::Float(self.as_f64.unwrap_or(if self.negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }))
+    }
+}
+
+/// Classify `obj` as a [`Huge`] Python integer, or `None`.
+pub fn huge_int(obj: &Bound<'_, PyAny>) -> PyResult<Option<Huge>> {
+    if obj.is_instance_of::<PyBool>() || !obj.is_instance_of::<PyInt>() {
+        return Ok(None);
+    }
+    if obj.extract::<i64>().is_ok() || obj.extract::<u64>().is_ok() {
+        return Ok(None);
+    }
+    let negative = obj.lt(0i64)?;
+    let as_f64 = match obj.extract::<f64>() {
+        Ok(f) => Some(f),
+        Err(e) => {
+            // Swallow the CPython error; whether it is fatal depends on the
+            // target dtype, which the caller decides.
+            e.restore(obj.py());
+            PyErr::fetch(obj.py());
+            None
+        }
+    };
+    Ok(Some(Huge { as_f64, negative }))
+}
+
+/// The inclusive value range of an integer dtype.
+fn int_bounds(d: DType) -> Option<(i128, i128)> {
+    Some(match d {
+        DType::I8 => (i8::MIN as i128, i8::MAX as i128),
+        DType::I16 => (i16::MIN as i128, i16::MAX as i128),
+        DType::I32 => (i32::MIN as i128, i32::MAX as i128),
+        DType::I64 => (i64::MIN as i128, i64::MAX as i128),
+        DType::U8 => (0, u8::MAX as i128),
+        DType::U16 => (0, u16::MAX as i128),
+        DType::U32 => (0, u32::MAX as i128),
+        DType::U64 => (0, u64::MAX as i128),
+        _ => return None,
+    })
+}
+
+/// numpy's `OverflowError` for a Python integer that cannot even reach the
+/// C conversion function. Probed message, verbatim, for every target dtype:
+/// `np.array(2**63, dtype=np.int64)`, `np.array([2**64], dtype=np.uint64)`,
+/// `np.int64(2**100)` all say exactly this.
+pub fn too_large() -> PyErr {
+    pyo3::exceptions::PyOverflowError::new_err(
+        "Python int too large to convert to C long",
+    )
+}
+
+/// numpy's range check when a value is *stored into* an integer array by
+/// `np.array(..., dtype=D)` (and the assignment paths that share it).
+///
+/// The rule is not symmetric and was probed one cell at a time (see
+/// `harness/dev_check_nep50.py`, which asserts the whole matrix):
+///
+/// | leaf                     | signed target | unsigned target |
+/// |--------------------------|---------------|-----------------|
+/// | Python `int` / `float`   | OverflowError | OverflowError   |
+/// | numpy scalar             | OverflowError | wraps silently  |
+///
+/// and, either way, a value outside the C conversion type raises
+/// [`too_large`] instead. Python `bool` and non-finite floats are never
+/// checked.
+pub fn check_int_store(target: DType, src: Option<DType>, v: Scalar) -> PyResult<()> {
+    let Some((lo, hi)) = int_bounds(target) else {
+        return Ok(());
+    };
+    let n: i128 = match v {
+        // `np.array([True], dtype=np.int8)` is 1, never an error.
+        Scalar::Bool(_) => return Ok(()),
+        Scalar::Int(i) => i as i128,
+        Scalar::Uint(u) => u as i128,
+        // numpy converts through `int(obj)`, which truncates toward zero.
+        Scalar::Float(f) => {
+            if !f.is_finite() {
+                return Ok(());
+            }
+            let t = f.trunc();
+            if t >= 1.7e38 {
+                i128::MAX
+            } else if t <= -1.7e38 {
+                i128::MIN
+            } else {
+                t as i128
+            }
+        }
+        Scalar::Complex(_) => return Ok(()),
+    };
+    let signed = target.category() == rnp_core::dtype::Kind::Int;
+    // An *unsigned* target does not check a numpy scalar at all: probed,
+    // `np.array([np.int64(-1)], dtype=np.uint8)` is 255 and
+    // `np.array([np.uint64(2**63)], dtype=np.uint8)` is 0, while the same
+    // values written as Python ints both raise.
+    if src.is_some() && !signed {
+        return Ok(());
+    }
+    // Every dtype first converts the Python object through one C integer
+    // type, and a value that does not fit *that* never reaches the range
+    // check. numpy picks the C type per dtype (`arraytypes.c.src`): only
+    // `uint`/`ulong` use an unsigned conversion, so `uint8` and `uint16`
+    // reject 2**63 with "too large" while `uint32` calls it out of bounds.
+    // Probed for all eight integer dtypes x {2**63, 2**64-1, 2**64,
+    // -2**63, -2**63-1}.
+    let unsigned_conversion = matches!(target, DType::U32 | DType::U64);
+    let hi_c = if unsigned_conversion {
+        u64::MAX as i128
+    } else {
+        i64::MAX as i128
+    };
+    if !(n >= i64::MIN as i128 && n <= hi_c) {
+        return Err(too_large());
+    }
+    if n < lo || n > hi {
+        if signed || src.is_none() {
+            return Err(pyo3::exceptions::PyOverflowError::new_err(format!(
+                "Python integer {n} out of bounds for {}",
+                target.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Does the first leaf of a (possibly nested) sequence look like text?
@@ -469,9 +643,29 @@ pub fn array_from_any(
     if wants_text || (dtype.is_none() && first_leaf_is_text(obj)) {
         return array_from_text(obj, dtype);
     }
+    // A Python int too wide for any integer dtype: object, or an error.
+    if let Some(h) = huge_int(obj)? {
+        match dtype {
+            None => return crate::objects::array_from_objects(obj),
+            Some(d) if int_bounds(d).is_some() => return Err(too_large()),
+            Some(d) => {
+                let v = if d.is_float() || d.is_complex() {
+                    Scalar::Float(h.float()?)
+                } else {
+                    h.placeholder()
+                };
+                let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
+                a.set(&[], v).map_err(crate::err)?;
+                return Ok(a);
+            }
+        }
+    }
     // A bare scalar becomes a 0-d array.
     if let Some(s) = scalar_from_py(obj) {
         let d = dtype.unwrap_or_else(|| s.natural_dtype());
+        if dtype.is_some() {
+            check_int_store(d, None, s)?;
+        }
         let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
         a.set(&[], s).map_err(crate::err)?;
         return Ok(a);
@@ -482,7 +676,27 @@ pub fn array_from_any(
         let mut values = Vec::new();
         flatten(obj, 0, &shape, &mut values)?;
         let d = dtype.unwrap_or_else(|| infer_dtype(&values));
-        let plain: Vec<Scalar> = values.iter().map(|(_, v)| *v).collect();
+        if d == DType::Object {
+            return crate::objects::array_from_objects(obj);
+        }
+        if values.iter().any(|l| l.huge.is_some()) {
+            if int_bounds(d).is_some() {
+                return Err(too_large());
+            }
+            if d.is_float() || d.is_complex() {
+                for l in &values {
+                    if let Some(h) = l.huge {
+                        h.float()?;
+                    }
+                }
+            }
+        }
+        if dtype.is_some() {
+            for l in &values {
+                check_int_store(d, l.src, l.val)?;
+            }
+        }
+        let plain: Vec<Scalar> = values.iter().map(|l| l.val).collect();
         let flat = NdArray::from_scalars(&plain, d).map_err(crate::err)?;
         return flat.reshape(&shape).map_err(crate::err);
     }
@@ -571,12 +785,36 @@ fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
     Ok(out)
 }
 
-/// NEP 50 promotion for `array OP python-scalar`: the Python scalar is
-/// "weak" and adopts the array's dtype unless its own kind is higher.
+/// NEP 50 promotion for `array OP python-scalar`, taking the scalar's *value*
+/// into account when its kind alone would not hold it.
+///
+/// The kind rule is [`weak_kind_promote`]. On top of it, an integer that does
+/// not fit the dtype that rule picks widens to one that does:
+/// `np.uint8(10) < -1` has to answer `False`, not `10 < 255`, and the only way
+/// to get there is to compare in a dtype that holds `-1`.
+///
+/// numpy raises an `OverflowError` instead for the *arithmetic* ops (see
+/// [`weak_dtype`], which is what the array path uses); the widening here is
+/// the answer for everything that cannot raise.
+pub fn weak_promote(arr: DType, s: Scalar) -> DType {
+    let d = weak_kind_promote(arr, s);
+    let v: i128 = match s {
+        Scalar::Int(i) => i as i128,
+        Scalar::Uint(u) => u as i128,
+        _ => return d,
+    };
+    match int_bounds(d) {
+        Some((lo, hi)) if v < lo || v > hi => promote(d, s.natural_dtype()),
+        _ => d,
+    }
+}
+
+/// The kind-only half of NEP 50 weak promotion: the Python scalar adopts the
+/// array's dtype unless its own kind is higher.
 ///
 /// Probed from numpy 2.5.2: `int8 + 1 -> int8`, `int8 + 1.0 -> float64`,
 /// `float32 + 1j -> complex64`, `bool + 1 -> int64`.
-pub fn weak_promote(arr: DType, s: Scalar) -> DType {
+pub fn weak_kind_promote(arr: DType, s: Scalar) -> DType {
     if arr.is_datetime_like() {
         // A weak Python number keeps its own dtype against a datetime-like
         // array: the datetime type resolvers are what decide whether it is
@@ -616,35 +854,29 @@ pub fn weak_promote(arr: DType, s: Scalar) -> DType {
 /// still answers correctly -- so a comparison widens the *weak* operand to its
 /// own natural dtype instead of raising.
 pub fn weak_dtype(arr: DType, s: Scalar, comparison: bool) -> PyResult<DType> {
-    let d = weak_promote(arr, s);
+    let d = weak_kind_promote(arr, s);
     let v: i128 = match s {
         Scalar::Int(i) => i as i128,
         Scalar::Uint(u) => u as i128,
         _ => return Ok(d),
     };
-    if !d.is_integer() {
+    let Some((lo, hi)) = int_bounds(d) else {
         return Ok(d);
-    }
-    let (lo, hi): (i128, i128) = match d {
-        DType::I8 => (i8::MIN as i128, i8::MAX as i128),
-        DType::I16 => (i16::MIN as i128, i16::MAX as i128),
-        DType::I32 => (i32::MIN as i128, i32::MAX as i128),
-        DType::I64 => (i64::MIN as i128, i64::MAX as i128),
-        DType::U8 => (0, u8::MAX as i128),
-        DType::U16 => (0, u16::MAX as i128),
-        DType::U32 => (0, u32::MAX as i128),
-        DType::U64 => (0, u64::MAX as i128),
-        _ => return Ok(d),
     };
     if v >= lo && v <= hi {
         return Ok(d);
     }
-    if comparison {
-        return Ok(s.natural_dtype());
+    // A comparison against an *integer* array always answers, in whatever
+    // dtype holds both sides -- probed over every integer dtype crossed with
+    // every out-of-range value. A `bool` array is the exception: numpy has no
+    // loop for it and lets the conversion error out (`np.ones(3, bool) <
+    // 2**63` is an OverflowError, while `np.ones(3, np.uint8) < 2**63` is
+    // not), which `check_int_store` below reproduces.
+    if comparison && arr != DType::Bool {
+        return Ok(promote(d, s.natural_dtype()));
     }
-    Err(pyo3::exceptions::PyOverflowError::new_err(format!(
-        "Python integer {v} out of bounds for {d}"
-    )))
+    check_int_store(d, None, s)?;
+    Ok(d)
 }
 
 /// Coerce the right-hand operand of a binary op into an array, applying weak
@@ -667,6 +899,36 @@ pub fn operand_for(
     if let Some((d, s)) = np_scalar(obj)? {
         let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
         a.set(&[], s).map_err(crate::err)?;
+        return Ok(Some(a));
+    }
+    // A Python int too wide for any integer dtype.
+    if let Some(h) = huge_int(obj)? {
+        if self_dtype.is_float() || self_dtype.is_complex() {
+            // Probed: `np.arange(3.0) + 2**100` is float64 `1.2676506e+30`,
+            // and `np.arange(3.0) + 2**2000` is an OverflowError even for a
+            // comparison.
+            let mut a = NdArray::zeros(vec![], self_dtype).map_err(crate::err)?;
+            a.set(&[], Scalar::Float(h.float()?)).map_err(crate::err)?;
+            return Ok(Some(a));
+        }
+        if !(self_dtype.is_integer() || self_dtype == DType::Bool) {
+            return Ok(None);
+        }
+        // A `bool` array has no large-integer loop at all, comparison or not.
+        if !comparison || self_dtype == DType::Bool {
+            // Probed: `np.arange(3) + 2**100` is this OverflowError.
+            return Err(too_large());
+        }
+        // A comparison still has to answer, and correctly: probed,
+        // `np.arange(3, dtype=np.uint8) < 2**100` is all-True. Every value an
+        // integer array can hold lies inside (-2**63, 2**64), so replacing the
+        // scalar with +-2**65 gives every one of the six comparisons the same
+        // answer as the true value would -- exactly, with no rounding to worry
+        // about, since 2**65 is a power of two.
+        const BEYOND: f64 = 36893488147419103232.0; // 2**65
+        let v = Scalar::Float(if h.negative { -BEYOND } else { BEYOND });
+        let mut a = NdArray::zeros(vec![], DType::F64).map_err(crate::err)?;
+        a.set(&[], v).map_err(crate::err)?;
         return Ok(Some(a));
     }
     if let Some(s) = scalar_from_py(obj) {

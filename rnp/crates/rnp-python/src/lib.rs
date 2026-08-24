@@ -143,11 +143,22 @@ fn full(
     fill_value: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
+    // A Python int too wide for any integer dtype cannot fill an integer
+    // array at all: probed, `np.full((2,), 2**100, dtype=np.uint8)` is
+    // `OverflowError: Python int too large to convert to C long`.
+    if convert::huge_int(fill_value)?.is_some() {
+        if let Some(o) = dtype {
+            if !o.is_none() && descr_from_any(o)?.dt.is_integer() {
+                return Err(convert::too_large());
+            }
+        }
+    }
     let v = any_scalar(fill_value)?
         .ok_or_else(|| PyTypeError::new_err("full() fill_value must be a scalar"))?;
     // numpy infers the dtype from the fill value when none is given; a numpy
     // scalar contributes its own dtype, a Python number its natural one.
-    let inferred = match convert::np_scalar(fill_value)? {
+    let np = convert::np_scalar(fill_value)?;
+    let inferred = match np {
         Some((d, _)) => d,
         None => v.natural_dtype(),
     };
@@ -156,6 +167,9 @@ fn full(
         Some(o) if o.is_none() => Descr::native(inferred),
         Some(o) => descr_from_any(o)?,
     };
+    if dtype.is_some_and(|o| !o.is_none()) {
+        convert::check_int_store(d.dt, np.map(|(t, _)| t), v)?;
+    }
     wrap(py, NdArray::full_descr(shape_from_any(shape)?, d, v).map_err(err)?)
 }
 
@@ -496,12 +510,30 @@ fn type_arg(a: &Bound<'_, PyAny>) -> PyResult<TypeArg> {
     if let Ok(arr) = a.cast::<PyNdArray>() {
         return Ok(TypeArg::Concrete(arr.borrow().arr.dtype()));
     }
+    // A numpy scalar is *strong*: `np.result_type(np.float64(1), np.float16)`
+    // is float64. It has to be recognised before the Python-number tests
+    // below, because our `float64` / `complex128` scalars subclass `float` /
+    // `complex` (and `bool_` is not a `bool`, but `int64` is not an `int`).
+    if let Some((d, _)) = convert::np_scalar(a)? {
+        return Ok(TypeArg::Concrete(d));
+    }
     // A bare Python number is *weak*: it contributes its kind, not its value.
     if a.is_instance_of::<pyo3::types::PyBool>() {
         return Ok(TypeArg::Weak(WeakKind::Bool));
     }
     if a.is_instance_of::<pyo3::types::PyInt>() {
-        return Ok(TypeArg::Weak(WeakKind::Int));
+        // A weak integer, carrying the dtype it would have *alone*, which is
+        // still value-based: `np.result_type(2**63)` is uint64 and
+        // `np.result_type(2**100)` is object, but both are weak `int` as soon
+        // as anything else joins them.
+        let alone = if a.extract::<i64>().is_ok() {
+            DType::I64
+        } else if a.extract::<u64>().is_ok() {
+            DType::U64
+        } else {
+            DType::Object
+        };
+        return Ok(TypeArg::WeakInt(alone));
     }
     if a.is_instance_of::<pyo3::types::PyFloat>() {
         return Ok(TypeArg::Weak(WeakKind::Float));
@@ -550,6 +582,11 @@ fn min_scalar_type(value: &Bound<'_, PyAny>) -> PyResult<PyDType> {
             return Ok(PyDType::new(a.dtype()));
         }
         return Ok(PyDType::new(rnp_core::min_scalar_type(a.get_flat(0))));
+    }
+    // Probed: `np.min_scalar_type(2**100)` is `object` -- no integer dtype
+    // holds it, so numpy falls back to the one that holds anything.
+    if convert::huge_int(value)?.is_some() {
+        return Ok(PyDType::new(DType::Object));
     }
     let s = scalar_from_py(value)
         .ok_or_else(|| PyTypeError::new_err("min_scalar_type() needs a scalar or an array"))?;
@@ -601,7 +638,16 @@ fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
         parsed.push(type_arg(&a)?);
     }
     let d = rnp_core::result_type(&parsed).ok_or_else(|| {
-        PyValueError::new_err("at least one array or dtype is required")
+        if parsed.is_empty() {
+            PyValueError::new_err("at least one array or dtype is required")
+        } else {
+            // numpy raises `np.exceptions.DTypePromotionError`, a TypeError.
+            PyTypeError::new_err(
+                "The DTypes do not have a common DType. For example they \
+                 cannot be stored in a single array unless the dtype is \
+                 `object`.",
+            )
+        }
     })?;
     Ok(PyDType::new(d))
 }
