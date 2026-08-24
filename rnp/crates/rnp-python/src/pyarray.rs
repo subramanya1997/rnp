@@ -920,13 +920,15 @@ impl PyNdArray {
             } else {
                 self.arr.clone()
             }
+        } else if d.is_struct() || self.arr.descr.is_struct() {
+            // Structured casts must be resolved before the same-storage
+            // shortcut: distinct record layouts can have equal item widths
+            // but still require positional field transfer.
+            crate::fields::struct_astype(py, &self.arr, d)?
         } else if d.dt == self.arr.dtype() {
             // Same storage, different byte order (or C-type spelling): a
             // straight swap-and-relabel, no value cast involved.
             self.arr.copy().into_descr(d)
-        } else if d.is_struct() || self.arr.descr.is_struct() {
-            // Structured casts are field-by-field; see `fields.rs`.
-            crate::fields::struct_astype(&self.arr, d)?
         } else if d.dt.is_flexible() || self.arr.dtype().is_flexible() {
             return Err(PyNotImplementedError::new_err(format!(
                 "astype from {} to {} is not implemented yet",

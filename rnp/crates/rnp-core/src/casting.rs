@@ -48,7 +48,7 @@ fn numeric_cast(from: DType, to: DType, same_kind: bool) -> bool {
 }
 
 /// The number of characters numpy needs to render any value of `d`.
-fn string_length(d: DType) -> Option<u32> {
+pub fn string_length(d: DType) -> Option<u32> {
     STRING_LENGTHS
         .iter()
         .find(|(a, _)| *a == d)
@@ -205,12 +205,69 @@ pub fn can_cast(from: Descr, to: Descr, casting: Casting) -> bool {
         to.dt,
         DType::Bytes(0) | DType::Str(0) | DType::Void(0)
     ) && from.dt.category() == to.dt.category();
+    if let Some(result) = compound_can_cast(from, to, casting) {
+        return result;
+    }
     match casting {
         Casting::No => from == to || unsized_target,
         Casting::Equiv => from.dt == to.dt || unsized_target,
         Casting::Unsafe => true,
         Casting::Safe => cast_ok(from.dt, to.dt, false),
         Casting::SameKind => cast_ok(from.dt, to.dt, true),
+    }
+}
+
+/// Descriptor-aware half of `can_cast`. Structured dtypes are not ordinary
+/// VOID blobs: fields are checked by position, field counts must match even
+/// for `unsafe`, and subarray shapes participate in the cast safety.
+fn compound_can_cast(from: Descr, to: Descr, casting: Casting) -> Option<bool> {
+    match (from.struct_def(), to.struct_def()) {
+        (Some(src), Some(dst)) => {
+            if src.fields.len() != dst.fields.len() {
+                return Some(false);
+            }
+            return Some(match casting {
+                Casting::No => from == to,
+                Casting::Equiv => from.dt == to.dt,
+                Casting::Safe | Casting::SameKind | Casting::Unsafe => src
+                    .fields
+                    .iter()
+                    .zip(dst.fields.iter())
+                    .all(|(a, b)| can_cast(a.descr, b.descr, casting)),
+            });
+        }
+        (Some(src), None) => {
+            return Some(
+                casting == Casting::Unsafe
+                    && src.fields.len() == 1
+                    && can_cast(src.fields[0].descr, to, Casting::Unsafe),
+            );
+        }
+        (None, Some(dst)) => {
+            return Some(
+                casting == Casting::Unsafe
+                    && dst
+                        .fields
+                        .iter()
+                        .all(|field| can_cast(from, field.descr, Casting::Unsafe)),
+            );
+        }
+        (None, None) => {}
+    }
+
+    match (from.subarray_def(), to.subarray_def()) {
+        (Some(src), Some(dst)) => Some(if src.shape == dst.shape {
+            can_cast(src.base, dst.base, casting)
+        } else {
+            casting == Casting::Unsafe
+        }),
+        (Some(src), None) => Some(
+            casting == Casting::Unsafe && can_cast(src.base, to, Casting::Unsafe),
+        ),
+        (None, Some(dst)) => Some(
+            casting == Casting::Unsafe && can_cast(from, dst.base, Casting::Unsafe),
+        ),
+        (None, None) => None,
     }
 }
 

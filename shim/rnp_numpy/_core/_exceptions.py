@@ -202,6 +202,11 @@ def _binary_resolution_error(ufunc_name, dtype_strs):
     return _UFuncBinaryResolutionError(ufunc, tuple(_dtype(s) for s in dtype_strs))
 
 
+def _dtype_promotion_error(message):
+    from ..exceptions import DTypePromotionError
+    return DTypePromotionError(message)
+
+
 def _install_error_factories():
     # The engine-side hook is optional: an older/mid-rebuild `_rnp` may not
     # export it yet.  Registering is a pure enhancement (it upgrades the
@@ -211,7 +216,8 @@ def _install_error_factories():
     if setter is None:
         return
     setter({"ufunc_no_loop": _no_loop_error,
-            "ufunc_binary_resolution": _binary_resolution_error})
+            "ufunc_binary_resolution": _binary_resolution_error,
+            "dtype_promotion": _dtype_promotion_error})
 
 
 _install_error_factories()

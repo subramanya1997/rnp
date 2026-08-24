@@ -247,7 +247,7 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
             f"according to the rule {casting!r}")
     if src.kind == "c" and dt.kind in "iufmM":
         _warnings.warn(_COMPLEX_MSG, ComplexWarning, stacklevel=2)
-    if dt.kind == "V":
+    if dt.kind == "V" and dt.names is None and dt.subdtype is None:
         dt = _resolve_void(self, dt)
         if dt.itemsize == src.itemsize and src.kind != "O":
             return _ordered_copy(self, src, "C").view(dt)

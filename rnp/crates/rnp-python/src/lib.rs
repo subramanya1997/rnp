@@ -55,6 +55,22 @@ fn ufunc_no_loop_err(ufunc: String, dtypes: Vec<String>, fallback: String) -> Py
     })
 }
 
+/// Build numpy's public `DTypePromotionError` through the shim's factory.
+fn dtype_promotion_err(message: String) -> PyErr {
+    Python::attach(|py| {
+        let Some(d) = ERROR_FACTORIES.get() else {
+            return PyTypeError::new_err(message);
+        };
+        match d.bind(py).get_item("dtype_promotion") {
+            Ok(Some(f)) => match f.call1((message.clone(),)) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(e) => e,
+            },
+            _ => PyTypeError::new_err(message),
+        }
+    })
+}
+
 /// Map a core error onto the Python exception numpy would raise.
 pub(crate) fn err(e: rnp_core::Error) -> PyErr {
     match e {
@@ -66,10 +82,11 @@ pub(crate) fn err(e: rnp_core::Error) -> PyErr {
             dtypes,
             message,
         } => ufunc_no_loop_err(ufunc, dtypes, message),
-        // The shim re-raises these as np.exceptions.AxisError /
-        // DTypePromotionError, both of which numpy derives from ValueError.
+        // The shim re-raises AxisError; promotion errors use the registered
+        // public exception class directly because descriptor-level helpers
+        // are exported without another Python wrapper.
         rnp_core::Error::AxisError(m) => PyValueError::new_err(m),
-        rnp_core::Error::DTypePromotionError(m) => PyValueError::new_err(m),
+        rnp_core::Error::DTypePromotionError(m) => dtype_promotion_err(m),
         rnp_core::Error::NotImplemented(m) => PyNotImplementedError::new_err(m),
         rnp_core::Error::OverflowError(m) => pyo3::exceptions::PyOverflowError::new_err(m),
         rnp_core::Error::RuntimeError(m) => pyo3::exceptions::PyRuntimeError::new_err(m),
@@ -440,7 +457,90 @@ binary_ufunc!(greater_equal, BinOp::Ge);
 #[pyfunction]
 fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDType> {
     let (da, db) = (descr_from_any(a)?, descr_from_any(b)?);
+    promote_descr(da, db).map(PyDType::from_descr)
+}
+
+/// NumPy's descriptor-level common instance operation. Compound dtypes keep
+/// their field/subarray metadata here; reducing them to `DType::Void` loses
+/// the information `_promote_fields` needs.
+fn promote_descr(da: Descr, db: Descr) -> PyResult<Descr> {
+    match (da.struct_def(), db.struct_def()) {
+        (Some(a), Some(b)) => {
+            let a_names: Vec<&str> = a.fields.iter().map(|f| f.name.as_str()).collect();
+            let b_names: Vec<&str> = b.fields.iter().map(|f| f.name.as_str()).collect();
+            if a_names != b_names {
+                return Err(dtype_promotion_error(format!(
+                    "field names `{}` and `{}` mismatch.",
+                    names_tuple(&a_names),
+                    names_tuple(&b_names)
+                )));
+            }
+            let mut fields = Vec::with_capacity(a.fields.len());
+            for (left, right) in a.fields.iter().zip(b.fields.iter()) {
+                if left.title != right.title {
+                    return Err(dtype_promotion_error(format!(
+                        "field titles of field '{}' mismatch",
+                        left.name
+                    )));
+                }
+                fields.push(rnp_core::FieldSpec {
+                    name: left.name.clone(),
+                    descr: promote_descr(left.descr, right.descr)?,
+                    title: left.title.clone(),
+                    offset: None,
+                });
+            }
+            return rnp_core::descr::make_struct(fields, None, a.aligned || b.aligned)
+                .map_err(err);
+        }
+        (Some(_), None) | (None, Some(_)) => return Err(promotion_error(da.dt, db.dt)),
+        (None, None) => {}
+    }
+
+    match (da.subarray_def(), db.subarray_def()) {
+        (Some(a), Some(b)) => {
+            if a.shape != b.shape {
+                return Err(dtype_promotion_error(
+                    "invalid type promotion with subarray datatypes (shape mismatch).".into(),
+                ));
+            }
+            return Ok(rnp_core::descr::make_subarray(
+                promote_descr(a.base, b.base)?,
+                a.shape.clone(),
+            ));
+        }
+        (Some(_), None) | (None, Some(_)) => return Err(promotion_error(da.dt, db.dt)),
+        (None, None) => {}
+    }
+
+    if da == db {
+        // NumPy's common-instance operation normalizes primitive byte order,
+        // including leaves of an otherwise identical structured dtype.
+        return Ok(Descr::native(da.dt));
+    }
     if da.dt.is_flexible() || db.dt.is_flexible() {
+        let text = match (da.dt, db.dt) {
+            (d @ (DType::Bytes(_) | DType::Str(_)), other) if other.is_numeric() => {
+                Some((d, other))
+            }
+            (other, d @ (DType::Bytes(_) | DType::Str(_))) if other.is_numeric() => {
+                Some((d, other))
+            }
+            _ => None,
+        };
+        if let Some((text, numeric)) = text {
+            let current = match text {
+                DType::Bytes(n) | DType::Str(n) => n,
+                _ => unreachable!(),
+            };
+            let width = current.max(rnp_core::casting::string_length(numeric).unwrap_or(0));
+            let promoted = match text {
+                DType::Bytes(_) => DType::Bytes(width),
+                DType::Str(_) => DType::Str(width),
+                _ => unreachable!(),
+            };
+            return Ok(Descr::native(promoted));
+        }
         let p = rnp_core::dtype::promote_flexible(da.dt, db.dt).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "The DType {} could not be promoted by {}.",
@@ -448,21 +548,40 @@ fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDType
                 db.str_code()
             ))
         })?;
-        return Ok(PyDType::from_descr(Descr::native(p)));
+        return Ok(Descr::native(p));
     }
     if da.dt.is_datetime_like() || db.dt.is_datetime_like() {
         // Datetime promotion has its own failure modes (nonlinear units,
         // multiplier overflow) with numpy's own exception types.
         if da.dt.is_datetime_like() && db.dt.is_datetime_like() {
             let p = rnp_core::datetime::promote_meta(da.dt, db.dt).map_err(err)?;
-            return Ok(PyDType::from_descr(Descr::native(p)));
+            return Ok(Descr::native(p));
         }
         let p = rnp_core::dtype::promote_datetime(da.dt, db.dt).ok_or_else(|| {
             promotion_error(da.dt, db.dt)
         })?;
-        return Ok(PyDType::from_descr(Descr::native(p)));
+        return Ok(Descr::native(p));
     }
-    Ok(PyDType::new(rnp_core::promote(da.dt, db.dt)))
+    Ok(Descr::native(rnp_core::promote(da.dt, db.dt)))
+}
+
+fn dtype_promotion_error(message: String) -> PyErr {
+    err(rnp_core::Error::DTypePromotionError(message))
+}
+
+fn names_tuple(names: &[&str]) -> String {
+    match names {
+        [] => "()".into(),
+        [name] => format!("('{}',)", name),
+        _ => format!(
+            "({})",
+            names
+                .iter()
+                .map(|name| format!("'{}'", name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// numpy's `DTypePromotionError` text for two DTypes with no common type.
@@ -633,6 +752,25 @@ fn shape<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, P
 #[pyfunction]
 #[pyo3(signature = (*args))]
 fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
+    let descriptors: Vec<Descr> = args
+        .iter()
+        .map(|arg| result_type_descr(&arg))
+        .collect::<PyResult<_>>()?;
+    if descriptors
+        .iter()
+        .any(|d| d.is_struct() || d.subarray_def().is_some())
+    {
+        let Some((&first, rest)) = descriptors.split_first() else {
+            return Err(PyValueError::new_err(
+                "at least one array or dtype is required",
+            ));
+        };
+        let promoted = rest
+            .iter()
+            .try_fold(first, |acc, &d| promote_descr(acc, d))?;
+        return Ok(PyDType::from_descr(promoted));
+    }
+
     let mut parsed = Vec::with_capacity(args.len());
     for a in args.iter() {
         parsed.push(type_arg(&a)?);
@@ -650,6 +788,39 @@ fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
         }
     })?;
     Ok(PyDType::new(d))
+}
+
+/// Keep the full descriptor while deciding whether `result_type` needs the
+/// compound path. Python scalars use their normal standalone defaults; once a
+/// structured dtype participates, no weak-scalar promotion can combine with
+/// it anyway.
+fn result_type_descr(a: &Bound<'_, PyAny>) -> PyResult<Descr> {
+    if let Ok(arr) = a.cast::<PyNdArray>() {
+        return Ok(arr.borrow().arr.descr);
+    }
+    if let Some((d, _)) = convert::np_scalar_descr(a)? {
+        return Ok(d);
+    }
+    if a.is_instance_of::<pyo3::types::PyBool>() {
+        return Ok(Descr::native(DType::Bool));
+    }
+    if a.is_instance_of::<pyo3::types::PyInt>() {
+        let d = if a.extract::<i64>().is_ok() {
+            DType::I64
+        } else if a.extract::<u64>().is_ok() {
+            DType::U64
+        } else {
+            DType::Object
+        };
+        return Ok(Descr::native(d));
+    }
+    if a.is_instance_of::<pyo3::types::PyFloat>() {
+        return Ok(Descr::native(DType::F64));
+    }
+    if a.is_instance_of::<pyo3::types::PyComplex>() {
+        return Ok(Descr::native(DType::C128));
+    }
+    descr_from_any(a)
 }
 
 /// Reductions as free functions (`np.sum(a, axis=0)`), delegating to the
