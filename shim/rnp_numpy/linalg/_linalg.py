@@ -2555,6 +2555,7 @@ def lstsq(a, b, rcond=None):
                   over='ignore', divide='ignore', under='ignore'):
         x, resids, rank, s = _umath_linalg.lstsq(a, b, rcond,
                                                  signature=signature)
+    rank = fortran_int(rank)
     if m == 0:
         x[...] = 0
     if n_rhs == 0:

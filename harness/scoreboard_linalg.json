@@ -1,28 +1,28 @@
 {
-  "timestamp": "2026-08-24T14:13:19.993644+00:00",
-  "overall_passed": 1,
-  "overall_total": 17,
+  "timestamp": "2026-08-24T15:11:12.137825+00:00",
+  "overall_passed": 485,
+  "overall_total": 485,
   "files": [
     {
       "file": "linalg/test_deprecations.py",
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 1
     },
     {
       "file": "linalg/test_linalg.py",
-      "passed": 0,
+      "passed": 468,
       "failed": 0,
       "errors": 0,
-      "skipped": 0,
-      "total": 0
+      "skipped": 4,
+      "total": 472
     },
     {
       "file": "linalg/test_regression.py",
-      "passed": 1,
-      "failed": 15,
+      "passed": 16,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 16
