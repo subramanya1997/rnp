@@ -444,26 +444,28 @@ impl PyFlatIter {
         };
         let source = converted.as_ref().unwrap_or(value);
         let src = array_from_any(source, Some(self.arr.dtype()), false)?;
-        let want = [resolved.len() as isize];
-        let src = match rnp_core::iter::broadcast_to(&src, &want) {
-            Ok(s) => s,
-            Err(_) => {
-                // A multi-dimensional value is flattened first, as numpy does
-                // for flatiter assignment.
-                let n = src.size() as isize;
-                let flat = src.copy().reshape(&[n]).map_err(crate::err)?;
-                rnp_core::iter::broadcast_to(&flat, &want).map_err(crate::err)?
-            }
-        };
-        let src = src.in_order_of(&self.arr);
+        let src_len = src.size();
+        if src_len == 0 || resolved.is_empty() {
+            return Ok(());
+        }
+        // Flat assignment consumes the source in C order, repeating it when
+        // it is shorter than the destination and truncating it when longer.
+        // Materialising also protects overlapping assignments such as
+        // `a.flat = a[::-1]` from reading values after they were overwritten.
+        let flat = src
+            .copy()
+            .reshape(&[src_len as isize])
+            .map_err(crate::err)?;
+        let src = flat.in_order_of(&self.arr);
         let src_offs: Vec<isize> =
             rnp_core::iter::offsets(&src.shape, &src.strides, src.byte_offset).collect();
         for (k, &v) in resolved.iter().enumerate() {
             let d = self.offset(v);
+            let s = src_offs[k % src_len];
             if self.arr.dtype().is_flexible() {
-                self.arr.write_raw_at(d, src.raw_bytes_at(src_offs[k]));
+                self.arr.write_raw_at(d, src.raw_bytes_at(s));
             } else {
-                self.arr.write_at(d, src.read_at(src_offs[k]));
+                self.arr.write_at(d, src.read_at(s));
             }
         }
         crate::ufuncs::report_fpe(py, "cast")?;
@@ -1841,6 +1843,17 @@ impl PyNdArray {
                 base,
             },
         )
+    }
+
+    #[setter]
+    fn set_flat(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let mut iter = PyFlatIter {
+            arr: slf.borrow().arr.clone(),
+            pos: 0,
+            base: slf.clone().into_any().unbind(),
+        };
+        iter.__setitem__(py, py.Ellipsis().bind(py), value)
     }
 
     // ---- reductions ----------------------------------------------------
