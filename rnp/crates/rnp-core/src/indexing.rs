@@ -316,6 +316,136 @@ fn resolve_one(raw: i64, n: i64, axis: usize) -> Result<isize> {
     Ok(v as isize)
 }
 
+/// Whether an integer array can drive the fused contiguous axis-0 gather.
+fn can_fuse_contiguous_axis0(arr: &NdArray, indices: &NdArray) -> bool {
+    !(arr.ndim() == 0
+        || !arr.flags.c_contiguous
+        || arr.dtype().is_flexible()
+        || arr.dtype().is_object()
+        || indices.ndim() == 0
+        || !indices.flags.c_contiguous
+        || !indices.is_native()
+        || !indices.dtype().is_integer())
+}
+
+/// Walk a contiguous integer index array, resolving negatives and bounds.
+#[inline]
+fn for_each_contiguous_index<F: FnMut(usize, usize)>(
+    indices: &NdArray,
+    axis_len: isize,
+    mut f: F,
+) -> Result<()> {
+    if indices.dtype() == DType::I64 {
+        // SAFETY: `indices` is C-contiguous and has `size()` initialized i64
+        // elements beginning at `byte_offset`.
+        unsafe {
+            let p = indices.buffer.as_ptr().offset(indices.byte_offset) as *const i64;
+            for i in 0..indices.size() {
+                let raw = std::ptr::read_unaligned(p.add(i));
+                f(i, resolve_one(raw, axis_len as i64, 0)? as usize);
+            }
+        }
+        return Ok(());
+    }
+    let mut err = None;
+    crate::dispatch_dtype!(indices.dtype(), T, {
+        // SAFETY: `indices` is C-contiguous and has `size()` initialized
+        // elements of `T` beginning at `byte_offset`.
+        unsafe {
+            let p = indices.buffer.as_ptr().offset(indices.byte_offset) as *const T;
+            for i in 0..indices.size() {
+                let raw = scalar_to_i64(std::ptr::read_unaligned(p.add(i)).to_scalar());
+                match resolve_one(raw, axis_len as i64, 0) {
+                    Ok(v) => f(i, v as usize),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Fused gather for the common `contiguous_array[contiguous_int_indices]`
+/// case. `Ok(None)` asks the caller to use the general fancy-index planner.
+pub fn gather_contiguous_axis0(arr: &NdArray, indices: &NdArray) -> Result<Option<NdArray>> {
+    if !can_fuse_contiguous_axis0(arr, indices) {
+        return Ok(None);
+    }
+    let mut shape = indices.shape.clone();
+    shape.extend_from_slice(&arr.shape[1..]);
+    let out = NdArray::empty_descr(shape, arr.descr)?;
+    let row_elems = shape_size(&arr.shape[1..]);
+    let row_bytes = row_elems * arr.itemsize();
+    let src = arr.buffer.as_ptr();
+    // SAFETY: `out` is a fresh C-contiguous allocation large enough for one
+    // `row_bytes` block per index. Every resolved row is within axis 0, and
+    // the source and fresh destination allocations cannot overlap.
+    let dst = unsafe { out.buffer.as_mut_ptr() };
+    if row_elems == 1 {
+        if indices.dtype() == DType::I64 {
+            let mut err = None;
+            crate::dispatch_dtype!(arr.dtype(), T, {
+                // SAFETY: both arrays are contiguous; `indices` has one i64
+                // per output slot and every successfully resolved row is an
+                // in-bounds `T` in `arr`.
+                unsafe {
+                    let ip = indices.buffer.as_ptr().offset(indices.byte_offset) as *const i64;
+                    let sp = src.offset(arr.byte_offset) as *const T;
+                    let dp = dst as *mut T;
+                    for i in 0..indices.size() {
+                        let raw = std::ptr::read_unaligned(ip.add(i));
+                        let row = if (raw as u64) < arr.shape[0] as u64 {
+                            raw as usize
+                        } else {
+                            match resolve_one(raw, arr.shape[0] as i64, 0) {
+                                Ok(row) => row as usize,
+                                Err(e) => {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                        };
+                        std::ptr::write_unaligned(
+                            dp.add(i),
+                            std::ptr::read_unaligned(sp.add(row)),
+                        );
+                    }
+                }
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+            return Ok(Some(out));
+        }
+        let copied;
+        crate::dispatch_dtype!(arr.dtype(), T, {
+            // SAFETY: each resolved row is an in-bounds scalar and `out` has
+            // one `T` slot for every index entry.
+            let sp = unsafe { src.offset(arr.byte_offset) as *const T };
+            let dp = dst as *mut T;
+            copied = for_each_contiguous_index(indices, arr.shape[0], |i, row| unsafe {
+                std::ptr::write_unaligned(dp.add(i), std::ptr::read_unaligned(sp.add(row)));
+            });
+        });
+        copied?;
+        return Ok(Some(out));
+    }
+    for_each_contiguous_index(indices, arr.shape[0], |i, row| unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.offset(arr.byte_offset).add(row * row_bytes),
+            dst.add(i * row_bytes),
+            row_bytes,
+        );
+    })?;
+    Ok(Some(out))
+}
+
 /// Add `index * stride` into `outer` straight from the index array, without
 /// materialising the widened index values first.
 fn fold_index_array(
@@ -327,6 +457,23 @@ fn fold_index_array(
 ) -> Result<()> {
     let n = len as i64;
     if a.flags.c_contiguous && !a.dtype().is_flexible() {
+        if a.dtype() == DType::I64 && a.is_native() {
+            // SAFETY: `a` is contiguous with `outer.len()` initialized i64
+            // elements beginning at `byte_offset`.
+            unsafe {
+                let p = a.buffer.as_ptr().offset(a.byte_offset) as *const i64;
+                for (i, slot) in outer.iter_mut().enumerate() {
+                    let raw = std::ptr::read_unaligned(p.add(i));
+                    let v = if (raw as u64) < n as u64 {
+                        raw as isize
+                    } else {
+                        resolve_one(raw, n, axis)?
+                    };
+                    *slot += v * stride;
+                }
+            }
+            return Ok(());
+        }
         let mut err: Option<Error> = None;
         crate::dispatch_dtype!(a.dtype(), T, {
             // SAFETY: `a` is contiguous with `outer.len()` elements of `T`.
@@ -1086,6 +1233,32 @@ mod tests {
                 &[IndexItem::Slice(SliceSpec { start: None, stop: None, step: Some(-1) })]
             ),
             vec![2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn fused_contiguous_axis0_gather() {
+        let a = a234();
+        let idx = ints(&[1, -2, 0]);
+        let out = gather_contiguous_axis0(&a, &idx).unwrap().unwrap();
+        assert_eq!(out.shape, vec![3, 3, 4]);
+        let expected = (12..24)
+            .chain(0..12)
+            .chain(0..12)
+            .map(Scalar::Int)
+            .collect::<Vec<_>>();
+        assert_eq!(out.to_vec(), expected);
+
+        let same = NdArray::arange(0.0, 4.0, 1.0, DType::I64).unwrap();
+        assert_eq!(
+            gather_contiguous_axis0(&same, &same).unwrap().unwrap().to_vec(),
+            same.to_vec(),
+        );
+        assert_eq!(
+            gather_contiguous_axis0(&same, &ints(&[4]))
+                .unwrap_err()
+                .to_string(),
+            "index 4 is out of bounds for axis 0 with size 4",
         );
     }
 

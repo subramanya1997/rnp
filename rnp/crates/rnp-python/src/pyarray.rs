@@ -2097,6 +2097,14 @@ impl PyNdArray {
                 return npscalar_to_py(py, me.dtype(), me.read_at(off));
             }
         }
+        if let Ok(index) = key.cast::<PyNdArray>() {
+            let indices = index.borrow().arr.clone();
+            if let Some(out) =
+                rnp_core::indexing::gather_contiguous_axis0(&me, &indices).map_err(crate::err)?
+            {
+                return Ok(PyNdArray::into_py_any(out, py)?.into_bound(py).into_any());
+            }
+        }
         // Structured field access: `a['f0']` / `a[['f0','f2']]`.
         if let Some(out) = crate::fields::getitem(slf, key)? {
             return Ok(out);
