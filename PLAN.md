@@ -87,7 +87,23 @@ predicate — new rnp-core/src/blas.rs), and structured dtypes
 astype, structured can_cast/promote_types/result_type +
 DTypePromotionError). The last two lanes were implemented by Codex
 (gpt-5.6-sol) during a sustained Anthropic API 529 outage, spec'd and
-verified by Fable. Full-suite scoreboard rerun in progress.
+verified by Fable.
+
+M5-final scoreboard: core 25830/31309 (82.5%), lib 2268/4575, ma 3671/4352,
+polynomial 383/610, random 23/363, matrixlib 2/89, top 3/6, linalg 0/0,
+fft 0/0 — GRAND TOTAL 32180/41304 (77.9%).
+
+## M6 (started 2026-08-24): finish the core + unblock collection
+
+Lanes (disjoint scopes):
+- nditer: a real np.nditer object (multi-iter, flags, op_flags, buffering,
+  external_loop, index tracking) — test_nditer 125/923.
+- __array_function__ overrides protocol + test_numeric failure clusters —
+  test_overrides 34/155, test_numeric 306/1706.
+- collection unblockers: test_ufunc/test_einsum/test_casting_unittests/
+  test_deprecations import errors; testing._private.utils.run_subprocess
+  (+extbuild stub) which alone unblocks 4 files in random/top.
+Later in M6: dlpack, scalarbuffer, casting-FP-error warnings, StringDType.
 
 ## Revised ladder after M5 (2026-08-23)
 
