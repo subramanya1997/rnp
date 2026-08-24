@@ -1157,6 +1157,113 @@ for _name in (
 del _name
 
 
+# ---- structured dtypes: records, recarray, and structured promotion --------
+from ._core.records import record, recarray, format_parser  # noqa: E402
+from . import rec  # noqa: E402
+
+#
+# Imported *after* the not-implemented stub loop above so that the real
+# `recarray` replaces its placeholder.
+
+
+#: `arr.view(np.recarray)` is how the numpy docs tell you to make a record
+#: array, and `numpy._core.records` uses it throughout. The engine's `view`
+#: only understands dtypes, so the *type* argument is handled here.
+_ndarray_view_base = ndarray.view
+
+
+def _ndarray_view(self, dtype=None, type=None):
+    cls = None
+    if isinstance(dtype, _builtins.type) and issubclass(dtype, recarray):
+        cls, dtype = dtype, None
+    if isinstance(type, _builtins.type) and issubclass(type, recarray):
+        cls, type = type, None
+    if isinstance(dtype, tuple) and len(dtype) == 2 \
+            and isinstance(dtype[0], _builtins.type) \
+            and issubclass(dtype[0], recarray):
+        cls, dtype = dtype[0], dtype[1]
+    out = self if dtype is None else _ndarray_view_base(self, dtype)
+    if cls is not None:
+        return cls._wrap(out)
+    if type is not None and not (isinstance(type, _builtins.type)
+                                 and issubclass(type, ndarray)):
+        raise TypeError("view(type=) must be a subclass of ndarray")
+    return out
+
+
+ndarray.view = _ndarray_view
+
+_promote_types_scalar = promote_types
+_can_cast_scalar = can_cast
+
+
+def promote_types(type1, type2):
+    """numpy's `promote_types`, with the structured rules layered on.
+
+    Probed from numpy 2.5.2: two structured dtypes promote field-by-field and
+    must have *identical* field-name tuples; the result is a freshly packed
+    (unaligned) struct unless the two dtypes were already equal, in which case
+    the dtype itself comes back.
+    """
+    from .exceptions import DTypePromotionError
+    a, b = dtype(type1), dtype(type2)
+    if a.names is None and b.names is None:
+        return _promote_types_scalar(a, b)
+    # Two identical *native* dtypes come straight back, keeping `align=True`;
+    # a non-native one still gets normalised field by field, which is what
+    # `np.promote_types(d, d)` does for a dtype holding a '>i4'.
+    if a == b and a.isnative:
+        return a
+    if a.names is None or b.names is None:
+        raise DTypePromotionError(
+            f"The DTypes {_dtype_class_repr(a)} and {_dtype_class_repr(b)} do "
+            "not have a common DType. For example they cannot be stored in a "
+            "single array unless the dtype is `object`.")
+    if a.names != b.names:
+        raise DTypePromotionError(
+            f"field names `{a.names}` and `{b.names}` mismatch.")
+    fields = []
+    for name in a.names:
+        fa, fb = a[name], b[name]
+        ta = a.fields[name][2] if len(a.fields[name]) > 2 else None
+        tb = b.fields[name][2] if len(b.fields[name]) > 2 else None
+        if ta != tb:
+            raise DTypePromotionError(
+                f"field titles of field '{name}' mismatch")
+        if fa.shape != fb.shape:
+            # A subarray field and a scalar field never share a DType.
+            raise DTypePromotionError(
+                f"The DTypes {_dtype_class_repr(a)} and "
+                f"{_dtype_class_repr(b)} do not have a common DType. For "
+                "example they cannot be stored in a single array unless the "
+                "dtype is `object`.")
+        base = promote_types(fa.base if fa.shape else fa,
+                             fb.base if fb.shape else fb)
+        fields.append((name, base, fa.shape) if fa.shape else (name, base))
+    return dtype(fields)
+
+
+def can_cast(from_, to, casting="safe"):
+    """As numpy: a structured dtype only casts to an *equal* structured dtype,
+    and never to or from an unstructured one."""
+    try:
+        a = from_ if isinstance(from_, _rnp.ndarray) else dtype(from_)
+    except Exception:  # noqa: BLE001
+        return _can_cast_scalar(from_, to, casting)
+    b = dtype(to)
+    da = a.dtype if isinstance(a, _rnp.ndarray) else a
+    if da.names is None and b.names is None:
+        return _can_cast_scalar(from_, to, casting)
+    return bool(da == b)
+
+
+def _dtype_class_repr(d):
+    """numpy spells the DType *class* in its promotion errors."""
+    name = {"V": "Void", "S": "Bytes", "U": "Str", "O": "Object"}.get(
+        d.kind, d.name.capitalize().replace("Uint", "UInt"))
+    return f"<class 'numpy.dtypes.{name}DType'>"
+
+
 __all__ = [n for n in dir() if not n.startswith("_")]
 
 

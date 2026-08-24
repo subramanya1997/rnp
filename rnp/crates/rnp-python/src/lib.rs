@@ -10,6 +10,7 @@ use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod adopt;
 mod convert;
+mod fields;
 mod index;
 mod itemsel;
 mod linalgops;

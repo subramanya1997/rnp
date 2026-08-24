@@ -924,6 +924,9 @@ impl PyNdArray {
             // Same storage, different byte order (or C-type spelling): a
             // straight swap-and-relabel, no value cast involved.
             self.arr.copy().into_descr(d)
+        } else if d.is_struct() || self.arr.descr.is_struct() {
+            // Structured casts are field-by-field; see `fields.rs`.
+            crate::fields::struct_astype(&self.arr, d)?
         } else if d.dt.is_flexible() || self.arr.dtype().is_flexible() {
             return Err(PyNotImplementedError::new_err(format!(
                 "astype from {} to {} is not implemented yet",
@@ -1192,6 +1195,27 @@ impl PyNdArray {
         scalar_to_py(py, v)
     }
 
+
+    /// `a.getfield(dtype, offset)` — a field-typed view at a byte offset.
+    #[pyo3(signature = (dtype, offset = 0))]
+    fn getfield<'py>(
+        slf: &Bound<'py, Self>,
+        dtype: &Bound<'py, PyAny>,
+        offset: isize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::fields::getfield(slf, dtype, offset)
+    }
+
+    /// `a.setfield(value, dtype, offset)`.
+    #[pyo3(signature = (value, dtype, offset = 0))]
+    fn setfield(
+        slf: &Bound<'_, Self>,
+        value: &Bound<'_, PyAny>,
+        dtype: &Bound<'_, PyAny>,
+        offset: isize,
+    ) -> PyResult<()> {
+        crate::fields::setfield(slf, value, dtype, offset)
+    }
 
     /// `a.view(dtype)` — reinterpret the same bytes under another dtype.
     #[pyo3(signature = (dtype = None, type_ = None))]
@@ -1735,10 +1759,17 @@ impl PyNdArray {
                 return npscalar_to_py(py, me.dtype(), me.read_at(off));
             }
         }
+        // Structured field access: `a['f0']` / `a[['f0','f2']]`.
+        if let Some(out) = crate::fields::getitem(slf, key)? {
+            return Ok(out);
+        }
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
             Indexed::View { arr: view, scalarize } => {
                 if scalarize {
+                    if crate::fields::is_struct_element(view.descr) {
+                        return crate::fields::struct_scalar(py, view, slf);
+                    }
                     if view.dtype().is_flexible() || view.dtype().is_object() {
                         return npflexible_to_py(py, &view, view.byte_offset);
                     }
@@ -1749,6 +1780,10 @@ impl PyNdArray {
             Indexed::Fancy(plan) => {
                 let out = rnp_core::indexing::gather(&me, &plan).map_err(crate::err)?;
                 if plan.scalarize {
+                    if crate::fields::is_struct_element(out.descr) {
+                        let off = out.byte_offset;
+                        return crate::fields::struct_scalar_owned(py, &out, off);
+                    }
                     if out.dtype().is_flexible() || out.dtype().is_object() {
                         return npflexible_to_py(py, &out, out.byte_offset);
                     }
@@ -1772,6 +1807,10 @@ impl PyNdArray {
             return Err(PyValueError::new_err(
                 "assignment destination is read-only",
             ));
+        }
+        // Structured field assignment: `a['f0'] = v` / `a[['f0','f1']] = v`.
+        if crate::fields::setitem(slf, key, value)? {
+            return Ok(());
         }
         let items = crate::index::parse_index(key)?;
         match rnp_core::indexing::index(&me, &items).map_err(crate::err)? {
@@ -2078,11 +2117,14 @@ impl PyNdArray {
     }
 
     fn __richcmp__(
-        &self,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         other: &Bound<'_, PyAny>,
         op: CompareOp,
     ) -> PyResult<Py<PyAny>> {
+        // Structured/void comparison has its own rules; see `fields.rs`.
+        crate::fields::check_comparable(slf, other)?;
+        let this = slf.borrow();
         let bop = match op {
             CompareOp::Eq => BinOp::Eq,
             CompareOp::Ne => BinOp::Ne,
@@ -2091,7 +2133,7 @@ impl PyNdArray {
             CompareOp::Gt => BinOp::Gt,
             CompareOp::Ge => BinOp::Ge,
         };
-        self.binop(py, other, bop, false)
+        this.binop(py, other, bop, false)
     }
 
     // ---- buffer protocol -----------------------------------------------
