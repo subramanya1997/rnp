@@ -1555,6 +1555,10 @@ _ndarray_view_base = ndarray.view
 
 def _ndarray_view(self, dtype=None, type=None):
     cls = None
+    if dtype is matrix:
+        cls, dtype = matrix, None
+    if type is matrix:
+        cls, type = matrix, None
     if isinstance(dtype, _builtins.type) and issubclass(dtype, recarray):
         cls, dtype = dtype, None
     if isinstance(type, _builtins.type) and issubclass(type, recarray):
@@ -1564,6 +1568,10 @@ def _ndarray_view(self, dtype=None, type=None):
             and issubclass(dtype[0], recarray):
         cls, dtype = dtype[0], dtype[1]
     out = self if dtype is None else _ndarray_view_base(self, dtype)
+    if cls is matrix:
+        if out.ndim != 2:
+            raise ValueError("shape too large to be a matrix.")
+        return out
     if cls is not None:
         return cls._wrap(out)
     if type is not None and not (isinstance(type, _builtins.type)

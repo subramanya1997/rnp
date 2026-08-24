@@ -12,6 +12,7 @@ import importlib
 import importlib.abc
 import importlib.util
 import sys
+from pathlib import Path
 
 _PREFIX = "numpy"
 _TARGET = "rnp_numpy"
@@ -38,6 +39,12 @@ class _NumpyRedirector(importlib.abc.MetaPathFinder):
         if fullname != _PREFIX and not fullname.startswith(_PREFIX + "."):
             return None
         target_name = _TARGET + fullname[len(_PREFIX):]
+        if ".tests" in fullname:
+            try:
+                if importlib.util.find_spec(target_name) is None:
+                    return None
+            except (ImportError, AttributeError, ValueError):
+                return None
         spec = importlib.util.spec_from_loader(
             fullname, _ShimLoader(target_name), is_package=True
         )
@@ -105,6 +112,15 @@ class _TestPkgShim(importlib.abc.MetaPathFinder):
                 return None
         except (ImportError, AttributeError, ValueError):
             pass
+        upstream = Path(__file__).resolve().parents[2] / "upstream" / "numpy"
+        candidate = upstream.joinpath(*parts[1:])
+        if candidate.is_dir() and (candidate / "__init__.py").is_file():
+            return importlib.util.spec_from_file_location(
+                fullname, candidate / "__init__.py",
+                submodule_search_locations=[str(candidate)])
+        module_file = candidate.with_suffix(".py")
+        if module_file.is_file():
+            return importlib.util.spec_from_file_location(fullname, module_file)
         return importlib.util.spec_from_loader(
             fullname, _TestPkgLoader(), is_package=True
         )
