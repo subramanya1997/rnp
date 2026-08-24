@@ -173,9 +173,8 @@ struct Leaf {
     /// inferred result; `None` for a bare Python number.
     src: Option<DType>,
     val: Scalar,
-    /// True when the leaf was a Python `int` too wide for any integer dtype.
-    /// `val` then holds `float(obj)`, which is all the inexact dtypes need.
-    huge: bool,
+    /// Set when the leaf was a Python `int` too wide for any integer dtype.
+    huge: Option<Huge>,
 }
 
 fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<Leaf>) -> PyResult<()> {
@@ -183,11 +182,11 @@ fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<
         // A numpy scalar keeps its own dtype: `np.array([np.int8(1)])` is
         // int8, not int64.
         if let Some((d, v)) = np_scalar(obj)? {
-            out.push(Leaf { src: Some(d), val: v, huge: false });
+            out.push(Leaf { src: Some(d), val: v, huge: None });
             return Ok(());
         }
-        if let Some(f) = huge_int(obj)? {
-            out.push(Leaf { src: None, val: Scalar::Float(f), huge: true });
+        if let Some(h) = huge_int(obj)? {
+            out.push(Leaf { src: None, val: h.placeholder(), huge: Some(h) });
             return Ok(());
         }
         let s = scalar_from_py(obj).ok_or_else(|| {
@@ -196,7 +195,7 @@ fn flatten(obj: &Bound<'_, PyAny>, depth: usize, shape: &[isize], out: &mut Vec<
                 obj.get_type().name().map(|n| n.to_string()).unwrap_or_default()
             ))
         })?;
-        out.push(Leaf { src: None, val: s, huge: false });
+        out.push(Leaf { src: None, val: s, huge: None });
         return Ok(());
     }
     if !is_sequence(obj) {
@@ -232,7 +231,7 @@ fn infer_dtype(values: &[Leaf]) -> DType {
     // A Python int too wide for uint64/int64 drags the whole array to object:
     // probed, `np.array([1, 2**100])` and `np.array([2**100, 1.0])` are both
     // `dtype('O')`.
-    if values.iter().any(|l| l.huge) {
+    if values.iter().any(|l| l.huge.is_some()) {
         return DType::Object;
     }
     let dt = |l: &Leaf| l.src.unwrap_or_else(|| l.val.natural_dtype());
@@ -243,28 +242,62 @@ fn infer_dtype(values: &[Leaf]) -> DType {
     d
 }
 
-/// `float(obj)` for a Python `int` too wide for `Scalar` (outside
-/// `i64::MIN ..= u64::MAX`), or `None` when `obj` is not such an int.
+/// A Python `int` too wide for `Scalar` (outside `i64::MIN ..= u64::MAX`).
 ///
-/// numpy carries these as `object` when it can and rejects them with an
-/// `OverflowError` when it cannot; `Scalar` cannot hold them at all, so the
-/// float value is kept for the inexact dtypes that *can* take them
-/// (`np.array(2**100, dtype=np.float32)` is `1.2676506e+30`).
-pub fn huge_int(obj: &Bound<'_, PyAny>) -> PyResult<Option<f64>> {
+/// numpy carries these as `object` when it can, converts them to a C `double`
+/// for the inexact dtypes (`np.array(2**100, dtype=np.float32)` is
+/// `1.2676506e+30`), and raises an `OverflowError` when neither works.
+#[derive(Copy, Clone, Debug)]
+pub struct Huge {
+    /// `float(obj)`, or `None` when even that overflowed (past ~1.8e308).
+    /// Probed: numpy then raises `OverflowError: int too large to convert to
+    /// float`, but *only* if the target dtype is inexact --
+    /// `np.array(2**2000, dtype=bool)` is `True` and `np.array(2**2000)` is
+    /// an object array.
+    pub as_f64: Option<f64>,
+    pub negative: bool,
+}
+
+impl Huge {
+    /// The value to store in an inexact array, or numpy's `OverflowError`.
+    fn float(self) -> PyResult<f64> {
+        self.as_f64.ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("int too large to convert to float")
+        })
+    }
+
+    /// The `Scalar` this contributes to a *non*-inexact target, where the
+    /// exact value never matters: `bool` only asks whether it is zero (it
+    /// never is), and integer targets reject it outright.
+    fn placeholder(self) -> Scalar {
+        Scalar::Float(self.as_f64.unwrap_or(if self.negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }))
+    }
+}
+
+/// Classify `obj` as a [`Huge`] Python integer, or `None`.
+pub fn huge_int(obj: &Bound<'_, PyAny>) -> PyResult<Option<Huge>> {
     if obj.is_instance_of::<PyBool>() || !obj.is_instance_of::<PyInt>() {
         return Ok(None);
     }
     if obj.extract::<i64>().is_ok() || obj.extract::<u64>().is_ok() {
         return Ok(None);
     }
-    // `float(huge)` itself overflows past ~1.8e308; numpy lets the value
-    // saturate to an infinity there, so we do too.
     let negative = obj.lt(0i64)?;
-    Ok(Some(obj.extract::<f64>().unwrap_or_else(|e| {
-        e.restore(obj.py());
-        PyErr::fetch(obj.py());
-        if negative { f64::NEG_INFINITY } else { f64::INFINITY }
-    })))
+    let as_f64 = match obj.extract::<f64>() {
+        Ok(f) => Some(f),
+        Err(e) => {
+            // Swallow the CPython error; whether it is fatal depends on the
+            // target dtype, which the caller decides.
+            e.restore(obj.py());
+            PyErr::fetch(obj.py());
+            None
+        }
+    };
+    Ok(Some(Huge { as_f64, negative }))
 }
 
 /// The inclusive value range of an integer dtype.
@@ -573,13 +606,18 @@ pub fn array_from_any(
         return array_from_text(obj, dtype);
     }
     // A Python int too wide for any integer dtype: object, or an error.
-    if let Some(f) = huge_int(obj)? {
+    if let Some(h) = huge_int(obj)? {
         match dtype {
             None => return crate::objects::array_from_objects(obj),
             Some(d) if int_bounds(d).is_some() => return Err(too_large()),
             Some(d) => {
+                let v = if d.is_float() || d.is_complex() {
+                    Scalar::Float(h.float()?)
+                } else {
+                    h.placeholder()
+                };
                 let mut a = NdArray::zeros(vec![], d).map_err(crate::err)?;
-                a.set(&[], Scalar::Float(f)).map_err(crate::err)?;
+                a.set(&[], v).map_err(crate::err)?;
                 return Ok(a);
             }
         }
@@ -603,8 +641,17 @@ pub fn array_from_any(
         if d == DType::Object {
             return crate::objects::array_from_objects(obj);
         }
-        if values.iter().any(|l| l.huge) && int_bounds(d).is_some() {
-            return Err(too_large());
+        if values.iter().any(|l| l.huge.is_some()) {
+            if int_bounds(d).is_some() {
+                return Err(too_large());
+            }
+            if d.is_float() || d.is_complex() {
+                for l in &values {
+                    if let Some(h) = l.huge {
+                        h.float()?;
+                    }
+                }
+            }
         }
         if dtype.is_some() {
             for l in &values {
@@ -805,12 +852,13 @@ pub fn operand_for(
         return Ok(Some(a));
     }
     // A Python int too wide for any integer dtype.
-    if let Some(f) = huge_int(obj)? {
-        let exact = self_dtype.is_float() || self_dtype.is_complex();
-        if exact {
-            // Probed: `np.arange(3.0) + 2**100` is float64 `1.2676506e+30`.
+    if let Some(h) = huge_int(obj)? {
+        if self_dtype.is_float() || self_dtype.is_complex() {
+            // Probed: `np.arange(3.0) + 2**100` is float64 `1.2676506e+30`,
+            // and `np.arange(3.0) + 2**2000` is an OverflowError even for a
+            // comparison.
             let mut a = NdArray::zeros(vec![], self_dtype).map_err(crate::err)?;
-            a.set(&[], Scalar::Float(f)).map_err(crate::err)?;
+            a.set(&[], Scalar::Float(h.float()?)).map_err(crate::err)?;
             return Ok(Some(a));
         }
         if !(self_dtype.is_integer() || self_dtype == DType::Bool) {
@@ -827,7 +875,7 @@ pub fn operand_for(
         // answer as the true value would -- exactly, with no rounding to worry
         // about, since 2**65 is a power of two.
         const BEYOND: f64 = 36893488147419103232.0; // 2**65
-        let v = Scalar::Float(if f < 0.0 { -BEYOND } else { BEYOND });
+        let v = Scalar::Float(if h.negative { -BEYOND } else { BEYOND });
         let mut a = NdArray::zeros(vec![], DType::F64).map_err(crate::err)?;
         a.set(&[], v).map_err(crate::err)?;
         return Ok(Some(a));
