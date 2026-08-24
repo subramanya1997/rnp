@@ -28,6 +28,7 @@ from .exceptions import ComplexWarning
 
 _orig_astype = ndarray.astype
 _orig_copy = ndarray.copy
+_orig_ravel = ndarray.ravel
 _orig_getitem = ndarray.__getitem__
 _orig_setitem = ndarray.__setitem__
 _orig_sort = ndarray.sort
@@ -428,6 +429,18 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
 
 def copy_method(self, /, order="C"):
     return _ordered_copy(self, self.dtype, _norm_order(order, "C"))
+
+
+def ravel_method(self, /, order="C"):
+    order = _norm_order(order, "C")
+    if order == "A":
+        order = "F" if (self.flags.f_contiguous and
+                         not self.flags.c_contiguous) else "C"
+    if order == "C" or self.ndim < 2:
+        return _orig_ravel(self)
+    perm = (tuple(_b.range(self.ndim - 1, -1, -1)) if order == "F"
+            else _perm_for(self, "K"))
+    return _orig_ravel(self.transpose(perm))
 
 
 def copy(a, order="K", subok=False):
@@ -1093,6 +1106,7 @@ def install():
     ndarray.__array__ = array_protocol
     ndarray.__array_wrap__ = array_wrap
     ndarray.copy = copy_method
+    ndarray.ravel = ravel_method
     ndarray.__getitem__ = getitem
     ndarray.__setitem__ = setitem
     ndarray.sort = sort_method
