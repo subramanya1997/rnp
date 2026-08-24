@@ -1425,24 +1425,12 @@ def einsum(*operands, out=None, dtype=None, order='K', casting='safe',
 
 
 def einsum_path(*operands, optimize='greedy', einsum_call=False):
-    """Return a valid contraction path for the supported einsum syntax.
-
-    The Rust-backed evaluator is correctness-first and does not expose a cost
-    planner yet.  Contracting all operands in one step is nevertheless a
-    valid NumPy path and unblocks callers that use ``einsum_path`` only to
-    feed a path back to ``einsum``.
-    """
-    if not operands:
-        raise ValueError("must specify the einstein sum subscripts string and operands")
-    if not isinstance(operands[0], str):
-        raise NotImplementedError(
-            "np.einsum_path's interleaved form is not implemented by rnp yet")
-    arrays = [np.asanyarray(a) for a in operands[1:]]
-    _parse_einsum(operands[0], arrays)
-    if not arrays:
-        raise ValueError("must specify the einstein sum subscripts string and operands")
-    path = ['einsum_path', tuple(builtins.range(len(arrays)))]
-    return path, "  Complete contraction:  " + operands[0]
+    # Keep NumPy's pure-Python parser and planner intact in its canonical
+    # module.  This wrapper avoids duplicating a 900-line compatibility
+    # surface here and preserves the existing late wiring during package init.
+    from rnp_numpy._core.einsumfunc import einsum_path as _einsum_path
+    return _einsum_path(*operands, optimize=optimize,
+                        einsum_call=einsum_call)
 
 
 # ---------------------------------------------------------------------------
