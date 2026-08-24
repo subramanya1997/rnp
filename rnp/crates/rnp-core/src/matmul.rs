@@ -475,6 +475,25 @@ trait MatElem: Element + Copy {
     fn finish_flags(_acc: Self::Acc, _out: Self) -> u8 {
         0
     }
+
+    /// `@TYPE@_dotc`'s CBLAS branch, for the two dtypes numpy compiles it for
+    /// (`CFLOAT` and `CDOUBLE`; `CLONGDOUBLE` has `USE_BLAS = 0`).
+    ///
+    /// `None` means "numpy has no cblas branch for this type", so the
+    /// transcribed scalar loop is the whole story.
+    ///
+    /// # Safety
+    /// `x` and `y` must each address `n` in-bounds elements of `Self` spaced
+    /// `incx`/`incy` *elements* apart.
+    unsafe fn dotc_cblas(
+        _x: *const u8,
+        _incx: i64,
+        _y: *const u8,
+        _incy: i64,
+        _n: usize,
+    ) -> Option<Self> {
+        None
+    }
 }
 
 /// The `ConjAcc` half of the trait for every type where conjugation does
@@ -663,6 +682,15 @@ impl MatElem for C32 {
     fn conj_finish(acc: (f64, f64)) -> C32 {
         C32::new(acc.0 as f32, acc.1 as f32)
     }
+
+    #[inline]
+    unsafe fn dotc_cblas(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> Option<C32> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own contract.
+        Some(unsafe { crate::blas::cdotc(x, incx, y, incy, n) })
+    }
 }
 
 impl MatElem for C64v {
@@ -700,6 +728,21 @@ impl MatElem for C64v {
     fn conj_finish(acc: C64v) -> C64v {
         acc
     }
+
+    #[inline]
+    unsafe fn dotc_cblas(
+        x: *const u8,
+        incx: i64,
+        y: *const u8,
+        incy: i64,
+        n: usize,
+    ) -> Option<C64v> {
+        if !crate::blas::HAVE_CBLAS {
+            return None;
+        }
+        // SAFETY: forwarded from this method's own contract.
+        Some(unsafe { crate::blas::zdotc(x, incx, y, incy, n) })
+    }
 }
 
 /// Read one `T` out of `arr` at a byte offset.
@@ -718,7 +761,54 @@ unsafe fn read<T: Copy>(base: *const u8, off: isize) -> T {
 /// The blocked inner loop. `a` has shape `loop ++ [rows, inner]`, `b` has
 /// `loop ++ [inner, cols]`, and `out` is a freshly allocated C-contiguous
 /// array whose element count is `nbatch * rows * cols`.
-fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool, p: &Plan) {
+/// `is_blasable2d` from `matmul.c.src`, verbatim. `BLAS_MAXSIZE` is
+/// `NPY_MAX_INT64 - 1` under ILP64, so the upper bound never bites here.
+fn is_blasable2d(
+    byte_stride1: isize,
+    byte_stride2: isize,
+    _d1: isize,
+    d2: isize,
+    itemsize: usize,
+) -> bool {
+    let isz = itemsize as isize;
+    if byte_stride2 != isz {
+        return false;
+    }
+    byte_stride1 % isz == 0 && byte_stride1 / isz >= d2
+}
+
+/// Does numpy reach `@TYPE@_dotc` for this call, or does it go through gemm?
+///
+/// `@TYPE@_vecdot` always calls `dotc` element by element. `@TYPE@_vecmat`
+/// prefers `@TYPE@_vecmat_via_gemm` (gemm, because gemv cannot conjugate) and
+/// only falls back to a per-column `dotc` when its `blasable` test fails --
+/// which it does for any `dn == 1` or `dm == 1`, the shape the special-value
+/// grid produces. `matmul`/`matvec` never conjugate, so they never get here.
+fn routes_through_dotc(kind: MatKind, a: &NdArray, b: &NdArray, p: &Plan, itemsize: usize) -> bool {
+    match kind {
+        MatKind::VecDot => true,
+        MatKind::VecMat => {
+            let nl = p.loop_shape.len();
+            let (dn, dm) = (p.inner, p.cols);
+            let is1_n = a.strides[nl + 1];
+            let (is2_n, is2_m) = (b.strides[nl], b.strides[nl + 1]);
+            let i1 = is_blasable2d(is1_n, itemsize as isize, dn, 1, itemsize);
+            let i2c = is_blasable2d(is2_n, is2_m, dn, dm, itemsize);
+            let i2f = is_blasable2d(is2_m, is2_n, dm, dn, itemsize);
+            !(i1 && (i2c || i2f) && dn > 1 && dm > 1)
+        }
+        MatKind::MatMul | MatKind::MatVec => false,
+    }
+}
+
+fn kernel<T: MatElem>(
+    a: &NdArray,
+    b: &NdArray,
+    out: &mut NdArray,
+    conj_a: bool,
+    dotc_route: bool,
+    p: &Plan,
+) {
     let (r, k, c) = (p.rows as usize, p.inner as usize, p.cols as usize);
     let nbatch = shape_size(&p.loop_shape);
     if nbatch == 0 || r == 0 || c == 0 {
@@ -732,6 +822,7 @@ fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool,
     let (sa_r, sa_k) = (a.strides[nl], a.strides[nl + 1]);
     let (sb_k, sb_c) = (b.strides[nl], b.strides[nl + 1]);
 
+    let isz = a.itemsize();
     let a_base = a.buffer.as_ptr();
     let b_base = b.buffer.as_ptr();
     // SAFETY: `out` was allocated by this module as a C-contiguous array of
@@ -771,6 +862,49 @@ fn kernel<T: MatElem>(a: &NdArray, b: &NdArray, out: &mut NdArray, conj_a: bool,
         let dst = &mut out_slice[bi * r * c..(bi + 1) * r * c];
 
         if conj_a {
+            // `@TYPE@_dotc` tries CBLAS first, and its test is on the
+            // *original* operand strides -- so it has to run against `a`/`b`
+            // themselves, not the packed `ap`/`bp` copies above. One call per
+            // output element, exactly as `@TYPE@_vecdot`/`@TYPE@_vecmat` issue
+            // them: `dotc(x_row_i, is1 = sa_k, y_col_j, is2 = sb_k, n = k)`.
+            if std::env::var_os("RNP_DBG_DOTC").is_some() { eprintln!("DBG conj_a route={} k={} sa_k={} sb_k={} isz={}", dotc_route, k, sa_k, sb_k, isz); }
+            if dotc_route && k > 0 {
+                if let (Some(incx), Some(incy)) = (
+                    crate::blas::blas_stride(sa_k, isz),
+                    crate::blas::blas_stride(sb_k, isz),
+                ) {
+                    let mut all = true;
+                    for i in 0..r {
+                        for j in 0..c {
+                            // SAFETY: `i < rows`, `j < cols`, and `ao`/`bo`
+                            // start this batch, so both runs of `k` elements
+                            // are in bounds with the strides just validated.
+                            let got = unsafe {
+                                T::dotc_cblas(
+                                    a_base.offset(ao + i as isize * sa_r),
+                                    incx,
+                                    b_base.offset(bo + j as isize * sb_c),
+                                    incy,
+                                    k,
+                                )
+                            };
+                            match got {
+                                Some(v) => dst[i * c + j] = v,
+                                None => {
+                                    all = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !all {
+                            break;
+                        }
+                    }
+                    if all {
+                        continue;
+                    }
+                }
+            }
             // `@TYPE@_dotc`: a different expression and, for complex64, a
             // wider accumulator (see the trait's comment).
             cacc.clear();
@@ -873,21 +1007,25 @@ pub fn matmul(
     let bv = crate::iter::broadcast_to(&b2, &b_target)?;
 
     let mut out = NdArray::empty_descr(p.out_shape.clone(), Descr::native(dt))?;
+    // Whether numpy's loop for this call reaches `@TYPE@_dotc` (and so may
+    // hand the operands to CBLAS) rather than driving gemm itself.
+    let dotc_route = kind.conjugates_first()
+        && routes_through_dotc(kind, &av, &bv, &p, dt.itemsize());
     match dt {
-        DType::Bool => kernel::<NpBool>(&av, &bv, &mut out, false, &p),
-        DType::I8 => kernel::<i8>(&av, &bv, &mut out, false, &p),
-        DType::I16 => kernel::<i16>(&av, &bv, &mut out, false, &p),
-        DType::I32 => kernel::<i32>(&av, &bv, &mut out, false, &p),
-        DType::I64 => kernel::<i64>(&av, &bv, &mut out, false, &p),
-        DType::U8 => kernel::<u8>(&av, &bv, &mut out, false, &p),
-        DType::U16 => kernel::<u16>(&av, &bv, &mut out, false, &p),
-        DType::U32 => kernel::<u32>(&av, &bv, &mut out, false, &p),
-        DType::U64 => kernel::<u64>(&av, &bv, &mut out, false, &p),
-        DType::F16 => kernel::<F16>(&av, &bv, &mut out, false, &p),
-        DType::F32 => kernel::<f32>(&av, &bv, &mut out, false, &p),
-        DType::F64 => kernel::<f64>(&av, &bv, &mut out, false, &p),
-        DType::C64 => kernel::<C32>(&av, &bv, &mut out, kind.conjugates_first(), &p),
-        DType::C128 => kernel::<C64v>(&av, &bv, &mut out, kind.conjugates_first(), &p),
+        DType::Bool => kernel::<NpBool>(&av, &bv, &mut out, false, false, &p),
+        DType::I8 => kernel::<i8>(&av, &bv, &mut out, false, false, &p),
+        DType::I16 => kernel::<i16>(&av, &bv, &mut out, false, false, &p),
+        DType::I32 => kernel::<i32>(&av, &bv, &mut out, false, false, &p),
+        DType::I64 => kernel::<i64>(&av, &bv, &mut out, false, false, &p),
+        DType::U8 => kernel::<u8>(&av, &bv, &mut out, false, false, &p),
+        DType::U16 => kernel::<u16>(&av, &bv, &mut out, false, false, &p),
+        DType::U32 => kernel::<u32>(&av, &bv, &mut out, false, false, &p),
+        DType::U64 => kernel::<u64>(&av, &bv, &mut out, false, false, &p),
+        DType::F16 => kernel::<F16>(&av, &bv, &mut out, false, false, &p),
+        DType::F32 => kernel::<f32>(&av, &bv, &mut out, false, false, &p),
+        DType::F64 => kernel::<f64>(&av, &bv, &mut out, false, false, &p),
+        DType::C64 => kernel::<C32>(&av, &bv, &mut out, kind.conjugates_first(), dotc_route, &p),
+        DType::C128 => kernel::<C64v>(&av, &bv, &mut out, kind.conjugates_first(), dotc_route, &p),
         _ => {
             return Err(ufunc_no_loop(
                 kind.name(),

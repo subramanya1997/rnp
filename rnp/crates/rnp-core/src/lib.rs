@@ -2,6 +2,7 @@
 //! dtype system and broadcasting rules. No Python dependency lives here.
 
 pub mod array;
+pub mod blas;
 pub mod buffer;
 pub mod casting;
 pub mod datetime;
