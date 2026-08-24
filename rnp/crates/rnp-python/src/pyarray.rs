@@ -2712,7 +2712,11 @@ impl PyNdArray {
                 let mut acc = want_all;
                 for o in rnp_core::iter::offsets(&self.arr.shape, &self.arr.strides,
                                                  self.arr.byte_offset) {
-                    let t = truthy(self.arr.read_at(o));
+                    let t = if self.arr.dtype().is_string() {
+                        crate::objects::read_string(py, &self.arr, o).is_truthy()?
+                    } else {
+                        truthy(self.arr.read_at(o))
+                    };
                     if want_all {
                         acc &= t;
                         if !acc {
@@ -2734,7 +2738,20 @@ impl PyNdArray {
                 npscalar_to_py(py, DType::Bool, Scalar::Bool(acc))
             }
             Some(ax) => {
-                let bools = self.arr.astype(DType::Bool);
+                let bools = if self.arr.dtype().is_string() {
+                    let mut out = NdArray::zeros(self.arr.shape.clone(), DType::Bool)
+                        .map_err(crate::err)?;
+                    let src = rnp_core::iter::offsets(
+                        &self.arr.shape, &self.arr.strides, self.arr.byte_offset);
+                    for (i, off) in src.enumerate() {
+                        let value = crate::objects::read_string(py, &self.arr, off)
+                            .is_truthy()?;
+                        out.set_flat(i, Scalar::Bool(value));
+                    }
+                    out
+                } else {
+                    self.arr.astype(DType::Bool)
+                };
                 let op = if want_all {
                     rnp_core::ReduceOp::Min
                 } else {

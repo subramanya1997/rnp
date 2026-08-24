@@ -84,6 +84,14 @@ fn string_params_equal(py: Python<'_>, a: u32, b: u32) -> PyResult<bool> {
     if ac != bc {
         return Ok(false);
     }
+    string_na_equal(py, an, bn)
+}
+
+fn string_na_equal(
+    py: Python<'_>,
+    an: Option<Py<PyAny>>,
+    bn: Option<Py<PyAny>>,
+) -> PyResult<bool> {
     match (an, bn) {
         (None, None) => Ok(true),
         (Some(a), Some(b)) => {
@@ -125,6 +133,47 @@ pub(crate) fn string_repr_for(py: Python<'_>, dt: DType) -> PyResult<String> {
     match dt {
         DType::String(id) => string_repr(py, id),
         _ => Err(PyTypeError::new_err("not a StringDType descriptor")),
+    }
+}
+
+pub(crate) fn promote_string_descr(
+    py: Python<'_>,
+    a: Descr,
+    b: Descr,
+) -> PyResult<Descr> {
+    match (a.dt, b.dt) {
+        (DType::String(ai), DType::String(bi)) => {
+            let (ac, an) = string_params(py, ai)
+                .ok_or_else(|| PyTypeError::new_err("invalid StringDType descriptor"))?;
+            let (bc, bn) = string_params(py, bi)
+                .ok_or_else(|| PyTypeError::new_err("invalid StringDType descriptor"))?;
+            let na = match (an, bn) {
+                (None, None) => None,
+                (Some(na), None) | (None, Some(na)) => Some(na),
+                (Some(an), Some(bn)) => {
+                    if !string_na_equal(
+                        py,
+                        Some(an.clone_ref(py)),
+                        Some(bn.clone_ref(py)),
+                    )? {
+                        return Err(PyTypeError::new_err(
+                            "StringDType instances with distinct na_object values cannot be promoted",
+                        ));
+                    }
+                    let _ = bn;
+                    Some(an)
+                }
+            };
+            Ok(new_string_dtype(py, ac && bc, na.as_ref().map(|o| o.bind(py))).d)
+        }
+        (DType::String(_), DType::Str(_)) => Ok(a),
+        (DType::Str(_), DType::String(_)) => Ok(b),
+        (DType::String(_), DType::Object) | (DType::Object, DType::String(_)) => {
+            Ok(Descr::native(DType::Object))
+        }
+        _ => Err(PyTypeError::new_err(
+            "The StringDType could not be promoted by the other DType",
+        )),
     }
 }
 

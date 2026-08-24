@@ -545,6 +545,9 @@ fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<Py<PyAn
 /// their field/subarray metadata here; reducing them to `DType::Void` loses
 /// the information `_promote_fields` needs.
 fn promote_descr(da: Descr, db: Descr) -> PyResult<Descr> {
+    if da.dt.is_string() || db.dt.is_string() {
+        return Python::attach(|py| pydtype::promote_string_descr(py, da, db));
+    }
     // Passing the very same native decorated dtype twice preserves it.  A
     // byte-swapped common instance is canonicalized below and normally loses
     // metadata (Unicode is NumPy's historical exception).
@@ -873,7 +876,7 @@ fn result_type(args: &Bound<'_, PyTuple>) -> PyResult<PyDType> {
     }
     if descriptors
         .iter()
-        .any(|d| d.is_struct() || d.subarray_def().is_some())
+        .any(|d| d.is_struct() || d.subarray_def().is_some() || d.dt.is_string())
     {
         let Some((&first, rest)) = descriptors.split_first() else {
             return Err(PyValueError::new_err(

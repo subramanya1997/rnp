@@ -33,6 +33,7 @@ _ORDERS = ("C", "F", "A", "K")
 
 _NAN = float("nan")
 _CNAN = complex(_NAN, _NAN)
+_UNSET = object()
 def _pkg():
     import sys
     return sys.modules[__name__.rsplit(".", 1)[0]]
@@ -208,6 +209,18 @@ def _dtype_of(x):
 def can_cast(from_, to, casting="safe"):
     """`np.can_cast`, with the object-dtype rules the engine does not model."""
     src, dst = _dtype_of(from_), _dtype_of(to)
+    if src is not None and dst is not None and "T" in (src.kind, dst.kind):
+        if src.kind == dst.kind == "T":
+            return casting in ("equiv", "safe", "same_kind", "unsafe") or src == dst
+        if dst.kind == "O":
+            return casting in ("safe", "same_kind", "unsafe")
+        if src.kind in "biufc" and dst.kind == "T":
+            return casting in ("safe", "same_kind", "unsafe")
+        if {src.kind, dst.kind} <= {"T", "S", "U"}:
+            return casting in ("same_kind", "unsafe")
+        if src.kind == "T" and dst.kind == "b":
+            return casting in ("same_kind", "unsafe")
+        return casting == "unsafe"
     if src is not None and dst is not None and (src.kind == "O") != (
             dst.kind == "O"):
         # Anything may be stored in an object array; nothing may come back
@@ -252,6 +265,62 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
             return _empty(self.shape, dt)
     if not copy and dt == src and _order_ok(self, order):
         return self
+    if src.kind == "T" or dt.kind == "T":
+        values = self.tolist()
+
+        def walk(value, convert):
+            if isinstance(value, list):
+                return [walk(item, convert) for item in value]
+            return convert(value)
+
+        def leaves(value):
+            if isinstance(value, list):
+                for item in value:
+                    yield from leaves(item)
+            else:
+                yield value
+
+        if src.kind == "T" and dt.kind == "T":
+            source_na = getattr(src, "na_object", _UNSET)
+            target_na = getattr(dt, "na_object", _UNSET)
+            if source_na is not _UNSET and target_na is not _UNSET:
+                values = walk(values,
+                              lambda value: target_na
+                              if value is source_na else value)
+            return _pkg().array(values, dtype=dt, copy=True)
+        if dt.kind == "T":
+            if src.kind == "O":
+                return _pkg().array(values, dtype=dt, copy=True)
+            if src.kind in "biufc":
+                from ._core import _strcast
+                rendered = _strcast.to_string_array(
+                    self, _dtype("U"), "U", None)
+                return rendered.astype(dt, copy=True)
+
+            def as_text(value):
+                if isinstance(value, (bytes, bytearray)):
+                    if src.kind == "V":
+                        value = value.rstrip(b"\0")
+                    try:
+                        return bytes(value).decode()
+                    except UnicodeDecodeError as exc:
+                        raise TypeError("Invalid UTF-8 in StringDType cast") from exc
+                return str(value)
+
+            return _pkg().array(walk(values, as_text), dtype=dt, copy=True)
+        if dt.kind == "V":
+            encoded = walk(values, lambda value: value.encode("utf-8"))
+
+            width = dt.itemsize or max((len(v) for v in leaves(encoded)), default=0)
+            return _pkg().array(encoded, dtype=f"S{width}").view(f"V{width}")
+        if dt.kind == "S":
+            encoded = walk(values, lambda value: value.encode("ascii"))
+            return _pkg().array(encoded, dtype=dt, copy=True)
+        source_na = getattr(src, "na_object", _UNSET)
+        if source_na is not _UNSET and dt.kind in "iu":
+            if _b.any(value is source_na for value in leaves(values)):
+                raise ValueError("cannot convert missing value to integer")
+        return _pkg().array(values, dtype=dt, copy=True)
     if src.kind == "O" and dt.kind in "mM":
         # The engine's datetime coercion handles every object form numpy
         # accepts (and rejects the rest with numpy's own ValueError), so the
