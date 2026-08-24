@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-24T08:21:36.471035+00:00",
+  "timestamp": "2026-08-24T14:13:24.588497+00:00",
   "overall_passed": 23,
   "overall_total": 363,
   "files": [
@@ -16,8 +16,8 @@
       "passed": 0,
       "failed": 0,
       "errors": 0,
-      "skipped": 0,
-      "total": 0
+      "skipped": 3,
+      "total": 3
     },
     {
       "file": "random/test_generator_mt19937.py",
@@ -37,16 +37,16 @@
     },
     {
       "file": "random/test_random.py",
-      "passed": 11,
-      "failed": 131,
+      "passed": 10,
+      "failed": 132,
       "errors": 0,
       "skipped": 0,
       "total": 142
     },
     {
       "file": "random/test_randomstate.py",
-      "passed": 9,
-      "failed": 166,
+      "passed": 10,
+      "failed": 165,
       "errors": 6,
       "skipped": 0,
       "total": 181

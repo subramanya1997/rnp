@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-08-24T12:32:28.816606+00:00",
-  "overall_passed": 28882,
-  "overall_total": 32336,
+  "timestamp": "2026-08-24T14:12:15.341227+00:00",
+  "overall_passed": 32643,
+  "overall_total": 35281,
   "files": [
     {
       "file": "test__exceptions.py",
@@ -173,11 +173,11 @@
     },
     {
       "file": "test_dtype.py",
-      "passed": 989,
-      "failed": 174,
+      "passed": 991,
+      "failed": 173,
       "errors": 0,
       "skipped": 4,
-      "total": 1167
+      "total": 1168
     },
     {
       "file": "test_einsum.py",
@@ -253,8 +253,8 @@
     },
     {
       "file": "test_indexing.py",
-      "passed": 75,
-      "failed": 31,
+      "passed": 76,
+      "failed": 30,
       "errors": 0,
       "skipped": 0,
       "total": 106
@@ -301,16 +301,16 @@
     },
     {
       "file": "test_memmap.py",
-      "passed": 21,
-      "failed": 3,
+      "passed": 22,
+      "failed": 2,
       "errors": 0,
       "skipped": 0,
       "total": 24
     },
     {
       "file": "test_multiarray.py",
-      "passed": 13223,
-      "failed": 1044,
+      "passed": 13392,
+      "failed": 875,
       "errors": 0,
       "skipped": 5,
       "total": 14272,
@@ -350,8 +350,8 @@
     },
     {
       "file": "test_numeric.py",
-      "passed": 1630,
-      "failed": 76,
+      "passed": 1635,
+      "failed": 71,
       "errors": 0,
       "skipped": 2,
       "total": 1708
@@ -398,8 +398,8 @@
     },
     {
       "file": "test_regression.py",
-      "passed": 319,
-      "failed": 100,
+      "passed": 326,
+      "failed": 93,
       "errors": 0,
       "skipped": 3,
       "total": 422
@@ -414,8 +414,8 @@
     },
     {
       "file": "test_scalar_methods.py",
-      "passed": 216,
-      "failed": 17,
+      "passed": 211,
+      "failed": 22,
       "errors": 0,
       "skipped": 0,
       "total": 233
@@ -478,32 +478,32 @@
     },
     {
       "file": "test_stringdtype.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 2903,
+      "failed": 41,
       "errors": 0,
-      "skipped": 0,
-      "total": 0
+      "skipped": 4,
+      "total": 2948
     },
     {
       "file": "test_strings.py",
-      "passed": 1346,
-      "failed": 669,
+      "passed": 2007,
+      "failed": 8,
       "errors": 0,
       "skipped": 51,
       "total": 2066
     },
     {
       "file": "test_ufunc.py",
-      "passed": 382,
-      "failed": 485,
+      "passed": 384,
+      "failed": 483,
       "errors": 0,
       "skipped": 8,
       "total": 875
     },
     {
       "file": "test_umath.py",
-      "passed": 5077,
-      "failed": 152,
+      "passed": 5092,
+      "failed": 137,
       "errors": 0,
       "skipped": 86,
       "total": 5315

@@ -105,6 +105,33 @@ Lanes (disjoint scopes):
   (+extbuild stub) which alone unblocks 4 files in random/top.
 Later in M6: dlpack, scalarbuffer, casting-FP-error warnings, StringDType.
 
+## M6 FINAL (2026-08-24 morning)
+
+All six lanes landed and verified (dev_check 36504/0 throughout; cargo green):
+nditer 125->852/930; __array_function__ 155/155 + core collection unblocked
+(test_ufunc 380/867, test_einsum 44/78, test_deprecations 21/75); dlpack 95/95,
+scalarbuffer 79/79, casting-FP-errors 210/210, dtype metadata (test_numeric
+365->1627/1706); StringDType 2901/2944 + test_strings 2007/2015; lib/ma shim
+clusters + the test_regression native-crash fix (iterator-too-large precheck);
+native cumsum/accumulate, multi-axis reductions, reduce(out=), frompyfunc,
+object sort, engine overflow guard. All implementation by Codex (gpt-5.6-sol)
+lanes spec'd/verified/merged by Fable.
+
+Scoreboard: core 32643/35281 (92.5%), lib 3413/4759, ma 4080/4352 (93.8%),
+polynomial 385/610, matrixlib 24/89, top 107/207, random 23/363, linalg 1/17,
+fft 0/8 — GRAND TOTAL 40676/45686 (89.0%). (M5-final was 32180/41304, 77.9%.)
+
+## M7: linalg + fft + random (the zero suites)
+
+- linalg: real numpy.linalg backed by Accelerate LAPACK (same ILP64 linkage
+  precedent as blas.rs) — solve/inv/det/eig/eigh/svd/qr/cholesky/lstsq/norm.
+  Bit-exactness vs the same LAPACK numpy uses; dev_check_linalg to be written.
+- fft: pocketfft port or Accelerate vDSP — numpy uses pocketfft; transcribe
+  it for bit-exactness (rfft/irfft/fft/ifft/fftn family + helper functions).
+- random: bit-exact MT19937 + PCG64/PCG64DXSM/Philox/SFC64 streams,
+  SeedSequence, Generator distributions (probe numpy's exact algorithms).
+- remainder sweeps: lib 1346 fails, ma 272, polynomial 225, matrixlib 65.
+
 ## Revised ladder after M5 (2026-08-23)
 
 The original M6 (sort/matmul) landed early — sort/argsort/searchsorted in M4,
