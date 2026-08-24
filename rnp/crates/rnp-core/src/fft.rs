@@ -991,6 +991,1001 @@ pub fn c2c(input: &[C64], forward: bool, scale: f64) -> Vec<C64> {
     data.into_iter().map(|z| C64::new(z.r, z.i)).collect()
 }
 
+#[inline]
+fn mulpm(c: f64, d: f64, e: f64, f: f64) -> (f64, f64) {
+    (c.mul_add(e, d * f), c.mul_add(f, -(d * e)))
+}
+
+fn radf2(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    let ci = |a, b, c| a + ido * (b + l1 * c);
+    let hi = |a, b, c| a + ido * (b + 2 * c);
+    for k in 0..l1 {
+        let (a, b) = (
+            cc[ci(0, k, 0)] + cc[ci(0, k, 1)],
+            cc[ci(0, k, 0)] - cc[ci(0, k, 1)],
+        );
+        ch[hi(0, 0, k)] = a;
+        ch[hi(ido - 1, 1, k)] = b;
+    }
+    if ido & 1 == 0 {
+        for k in 0..l1 {
+            ch[hi(0, 1, k)] = -cc[ci(ido - 1, k, 1)];
+            ch[hi(ido - 1, 0, k)] = cc[ci(ido - 1, k, 0)];
+        }
+    }
+    if ido <= 2 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let (tr2, ti2) = mulpm(wa[i - 2], wa[i - 1], cc[ci(i - 1, k, 1)], cc[ci(i, k, 1)]);
+            let (a, b) = (cc[ci(i - 1, k, 0)] + tr2, cc[ci(i - 1, k, 0)] - tr2);
+            ch[hi(i - 1, 0, k)] = a;
+            ch[hi(ic - 1, 1, k)] = b;
+            let (a, b) = (ti2 + cc[ci(i, k, 0)], ti2 - cc[ci(i, k, 0)]);
+            ch[hi(i, 0, k)] = a;
+            ch[hi(ic, 1, k)] = b;
+        }
+    }
+}
+
+#[inline]
+fn rearrange(rx: &mut f64, ix: &mut f64, ry: &mut f64, iy: &mut f64) {
+    let t1 = *rx + *ry;
+    let t2 = *ry - *rx;
+    let t3 = *ix + *iy;
+    let t4 = *ix - *iy;
+    *rx = t1;
+    *ix = t3;
+    *ry = t4;
+    *iy = t2;
+}
+
+fn radf3(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    const TAUR: f64 = -0.5;
+    const TAUI: f64 = 0.8660254037844386467637231707529362_f64;
+    let ci = |a, b, c| a + ido * (b + l1 * c);
+    let hi = |a, b, c| a + ido * (b + 3 * c);
+    for k in 0..l1 {
+        let cr2 = cc[ci(0, k, 1)] + cc[ci(0, k, 2)];
+        ch[hi(0, 0, k)] = cc[ci(0, k, 0)] + cr2;
+        ch[hi(0, 2, k)] = TAUI * (cc[ci(0, k, 2)] - cc[ci(0, k, 1)]);
+        ch[hi(ido - 1, 1, k)] = TAUR.mul_add(cr2, cc[ci(0, k, 0)]);
+    }
+    if ido == 1 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let (mut dr2, mut di2) =
+                mulpm(wa[i - 2], wa[i - 1], cc[ci(i - 1, k, 1)], cc[ci(i, k, 1)]);
+            let o = ido - 1;
+            let (mut dr3, mut di3) = mulpm(
+                wa[o + i - 2],
+                wa[o + i - 1],
+                cc[ci(i - 1, k, 2)],
+                cc[ci(i, k, 2)],
+            );
+            rearrange(&mut dr2, &mut di2, &mut dr3, &mut di3);
+            ch[hi(i - 1, 0, k)] = cc[ci(i - 1, k, 0)] + dr2;
+            ch[hi(i, 0, k)] = cc[ci(i, k, 0)] + di2;
+            let tr2 = TAUR.mul_add(dr2, cc[ci(i - 1, k, 0)]);
+            let ti2 = TAUR.mul_add(di2, cc[ci(i, k, 0)]);
+            let tr3 = TAUI * dr3;
+            let ti3 = TAUI * di3;
+            ch[hi(i - 1, 2, k)] = tr2 + tr3;
+            ch[hi(ic - 1, 1, k)] = tr2 - tr3;
+            ch[hi(i, 2, k)] = ti3 + ti2;
+            ch[hi(ic, 1, k)] = ti3 - ti2;
+        }
+    }
+}
+
+fn radf4(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    const H: f64 = 0.707106781186547524400844362104849_f64;
+    let ci = |a, b, c| a + ido * (b + l1 * c);
+    let hi = |a, b, c| a + ido * (b + 4 * c);
+    for k in 0..l1 {
+        let tr1 = cc[ci(0, k, 3)] + cc[ci(0, k, 1)];
+        ch[hi(0, 2, k)] = cc[ci(0, k, 3)] - cc[ci(0, k, 1)];
+        let tr2 = cc[ci(0, k, 0)] + cc[ci(0, k, 2)];
+        ch[hi(ido - 1, 1, k)] = cc[ci(0, k, 0)] - cc[ci(0, k, 2)];
+        ch[hi(0, 0, k)] = tr2 + tr1;
+        ch[hi(ido - 1, 3, k)] = tr2 - tr1;
+    }
+    if ido & 1 == 0 {
+        for k in 0..l1 {
+            let ti1 = -H * (cc[ci(ido - 1, k, 1)] + cc[ci(ido - 1, k, 3)]);
+            let tr1 = H * (cc[ci(ido - 1, k, 1)] - cc[ci(ido - 1, k, 3)]);
+            ch[hi(ido - 1, 0, k)] = cc[ci(ido - 1, k, 0)] + tr1;
+            ch[hi(ido - 1, 2, k)] = cc[ci(ido - 1, k, 0)] - tr1;
+            ch[hi(0, 3, k)] = ti1 + cc[ci(ido - 1, k, 2)];
+            ch[hi(0, 1, k)] = ti1 - cc[ci(ido - 1, k, 2)];
+        }
+    }
+    if ido <= 2 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let o = ido - 1;
+            let (cr2, ci2) = mulpm(wa[i - 2], wa[i - 1], cc[ci(i - 1, k, 1)], cc[ci(i, k, 1)]);
+            let (cr3, ci3) = mulpm(
+                wa[o + i - 2],
+                wa[o + i - 1],
+                cc[ci(i - 1, k, 2)],
+                cc[ci(i, k, 2)],
+            );
+            let (cr4, ci4) = mulpm(
+                wa[2 * o + i - 2],
+                wa[2 * o + i - 1],
+                cc[ci(i - 1, k, 3)],
+                cc[ci(i, k, 3)],
+            );
+            let tr1 = cr4 + cr2;
+            let tr4 = cr4 - cr2;
+            let ti1 = ci2 + ci4;
+            let ti4 = ci2 - ci4;
+            let tr2 = cc[ci(i - 1, k, 0)] + cr3;
+            let tr3 = cc[ci(i - 1, k, 0)] - cr3;
+            let ti2 = cc[ci(i, k, 0)] + ci3;
+            let ti3 = cc[ci(i, k, 0)] - ci3;
+            ch[hi(i - 1, 0, k)] = tr2 + tr1;
+            ch[hi(ic - 1, 3, k)] = tr2 - tr1;
+            ch[hi(i, 0, k)] = ti1 + ti2;
+            ch[hi(ic, 3, k)] = ti1 - ti2;
+            ch[hi(i - 1, 2, k)] = tr3 + ti4;
+            ch[hi(ic - 1, 1, k)] = tr3 - ti4;
+            ch[hi(i, 2, k)] = tr4 + ti3;
+            ch[hi(ic, 1, k)] = tr4 - ti3;
+        }
+    }
+}
+
+fn radf5(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    const R1: f64 = 0.3090169943749474241022934171828191_f64;
+    const I1: f64 = 0.9510565162951535721164393333793821_f64;
+    const R2: f64 = -0.8090169943749474241022934171828191_f64;
+    const I2: f64 = 0.5877852522924731291687059546390728_f64;
+    let ci = |a, b, c| a + ido * (b + l1 * c);
+    let hi = |a, b, c| a + ido * (b + 5 * c);
+    for k in 0..l1 {
+        let cr2 = cc[ci(0, k, 4)] + cc[ci(0, k, 1)];
+        let ci5 = cc[ci(0, k, 4)] - cc[ci(0, k, 1)];
+        let cr3 = cc[ci(0, k, 3)] + cc[ci(0, k, 2)];
+        let ci4 = cc[ci(0, k, 3)] - cc[ci(0, k, 2)];
+        ch[hi(0, 0, k)] = cc[ci(0, k, 0)] + cr2 + cr3;
+        ch[hi(ido - 1, 1, k)] = R2.mul_add(cr3, R1.mul_add(cr2, cc[ci(0, k, 0)]));
+        ch[hi(0, 2, k)] = I1.mul_add(ci5, I2 * ci4);
+        ch[hi(ido - 1, 3, k)] = R1.mul_add(cr3, R2.mul_add(cr2, cc[ci(0, k, 0)]));
+        ch[hi(0, 4, k)] = I2.mul_add(ci5, -(I1 * ci4));
+    }
+    if ido == 1 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let o = ido - 1;
+            let (mut dr2, mut di2) =
+                mulpm(wa[i - 2], wa[i - 1], cc[ci(i - 1, k, 1)], cc[ci(i, k, 1)]);
+            let (mut dr3, mut di3) = mulpm(
+                wa[o + i - 2],
+                wa[o + i - 1],
+                cc[ci(i - 1, k, 2)],
+                cc[ci(i, k, 2)],
+            );
+            let (mut dr4, mut di4) = mulpm(
+                wa[2 * o + i - 2],
+                wa[2 * o + i - 1],
+                cc[ci(i - 1, k, 3)],
+                cc[ci(i, k, 3)],
+            );
+            let (mut dr5, mut di5) = mulpm(
+                wa[3 * o + i - 2],
+                wa[3 * o + i - 1],
+                cc[ci(i - 1, k, 4)],
+                cc[ci(i, k, 4)],
+            );
+            rearrange(&mut dr2, &mut di2, &mut dr5, &mut di5);
+            rearrange(&mut dr3, &mut di3, &mut dr4, &mut di4);
+            ch[hi(i - 1, 0, k)] = cc[ci(i - 1, k, 0)] + dr2 + dr3;
+            ch[hi(i, 0, k)] = cc[ci(i, k, 0)] + di2 + di3;
+            let tr2 = R2.mul_add(dr3, R1.mul_add(dr2, cc[ci(i - 1, k, 0)]));
+            let ti2 = R2.mul_add(di3, R1.mul_add(di2, cc[ci(i, k, 0)]));
+            let tr3 = R1.mul_add(dr3, R2.mul_add(dr2, cc[ci(i - 1, k, 0)]));
+            let ti3 = R1.mul_add(di3, R2.mul_add(di2, cc[ci(i, k, 0)]));
+            let tr5 = I1.mul_add(dr5, I2 * dr4);
+            let ti5 = I1.mul_add(di5, I2 * di4);
+            let tr4 = I2.mul_add(dr5, -I1 * dr4);
+            let ti4 = I2.mul_add(di5, -I1 * di4);
+            ch[hi(i - 1, 2, k)] = tr2 + tr5;
+            ch[hi(ic - 1, 1, k)] = tr2 - tr5;
+            ch[hi(i, 2, k)] = ti5 + ti2;
+            ch[hi(ic, 1, k)] = ti5 - ti2;
+            ch[hi(i - 1, 4, k)] = tr3 + tr4;
+            ch[hi(ic - 1, 3, k)] = tr3 - tr4;
+            ch[hi(i, 4, k)] = ti4 + ti3;
+            ch[hi(ic, 3, k)] = ti4 - ti3;
+        }
+    }
+}
+
+fn radb2(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    let ci = |a, b, c| a + ido * (b + 2 * c);
+    let hi = |a, b, c| a + ido * (b + l1 * c);
+    for k in 0..l1 {
+        ch[hi(0, k, 0)] = cc[ci(0, 0, k)] + cc[ci(ido - 1, 1, k)];
+        ch[hi(0, k, 1)] = cc[ci(0, 0, k)] - cc[ci(ido - 1, 1, k)];
+    }
+    if ido & 1 == 0 {
+        for k in 0..l1 {
+            ch[hi(ido - 1, k, 0)] = 2.0 * cc[ci(ido - 1, 0, k)];
+            ch[hi(ido - 1, k, 1)] = -2.0 * cc[ci(0, 1, k)];
+        }
+    }
+    if ido <= 2 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            ch[hi(i - 1, k, 0)] = cc[ci(i - 1, 0, k)] + cc[ci(ic - 1, 1, k)];
+            let tr2 = cc[ci(i - 1, 0, k)] - cc[ci(ic - 1, 1, k)];
+            let ti2 = cc[ci(i, 0, k)] + cc[ci(ic, 1, k)];
+            ch[hi(i, k, 0)] = cc[ci(i, 0, k)] - cc[ci(ic, 1, k)];
+            let (a, b) = mulpm(wa[i - 2], wa[i - 1], ti2, tr2);
+            ch[hi(i, k, 1)] = a;
+            ch[hi(i - 1, k, 1)] = b;
+        }
+    }
+}
+
+fn radb3(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    const R: f64 = -0.5;
+    const I: f64 = 0.8660254037844386467637231707529362_f64;
+    let ci = |a, b, c| a + ido * (b + 3 * c);
+    let hi = |a, b, c| a + ido * (b + l1 * c);
+    for k in 0..l1 {
+        let tr2 = 2.0 * cc[ci(ido - 1, 1, k)];
+        let cr2 = R.mul_add(tr2, cc[ci(0, 0, k)]);
+        ch[hi(0, k, 0)] = cc[ci(0, 0, k)] + tr2;
+        let ci3 = 2.0 * I * cc[ci(0, 2, k)];
+        ch[hi(0, k, 2)] = cr2 + ci3;
+        ch[hi(0, k, 1)] = cr2 - ci3;
+    }
+    if ido == 1 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let tr2 = cc[ci(i - 1, 2, k)] + cc[ci(ic - 1, 1, k)];
+            let ti2 = cc[ci(i, 2, k)] - cc[ci(ic, 1, k)];
+            let cr2 = R.mul_add(tr2, cc[ci(i - 1, 0, k)]);
+            let ci2 = R.mul_add(ti2, cc[ci(i, 0, k)]);
+            ch[hi(i - 1, k, 0)] = cc[ci(i - 1, 0, k)] + tr2;
+            ch[hi(i, k, 0)] = cc[ci(i, 0, k)] + ti2;
+            let cr3 = I * (cc[ci(i - 1, 2, k)] - cc[ci(ic - 1, 1, k)]);
+            let ci3 = I * (cc[ci(i, 2, k)] + cc[ci(ic, 1, k)]);
+            let dr3 = cr2 + ci3;
+            let dr2 = cr2 - ci3;
+            let di2 = ci2 + cr3;
+            let di3 = ci2 - cr3;
+            let (a, b) = mulpm(wa[i - 2], wa[i - 1], di2, dr2);
+            ch[hi(i, k, 1)] = a;
+            ch[hi(i - 1, k, 1)] = b;
+            let o = ido - 1;
+            let (a, b) = mulpm(wa[o + i - 2], wa[o + i - 1], di3, dr3);
+            ch[hi(i, k, 2)] = a;
+            ch[hi(i - 1, k, 2)] = b;
+        }
+    }
+}
+
+fn radb4(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    const S: f64 = 1.414213562373095048801688724209698_f64;
+    let ci = |a, b, c| a + ido * (b + 4 * c);
+    let hi = |a, b, c| a + ido * (b + l1 * c);
+    for k in 0..l1 {
+        let tr2 = cc[ci(0, 0, k)] + cc[ci(ido - 1, 3, k)];
+        let tr1 = cc[ci(0, 0, k)] - cc[ci(ido - 1, 3, k)];
+        let tr3 = 2.0 * cc[ci(ido - 1, 1, k)];
+        let tr4 = 2.0 * cc[ci(0, 2, k)];
+        ch[hi(0, k, 0)] = tr2 + tr3;
+        ch[hi(0, k, 2)] = tr2 - tr3;
+        ch[hi(0, k, 3)] = tr1 + tr4;
+        ch[hi(0, k, 1)] = tr1 - tr4;
+    }
+    if ido & 1 == 0 {
+        for k in 0..l1 {
+            let ti1 = cc[ci(0, 3, k)] + cc[ci(0, 1, k)];
+            let ti2 = cc[ci(0, 3, k)] - cc[ci(0, 1, k)];
+            let tr2 = cc[ci(ido - 1, 0, k)] + cc[ci(ido - 1, 2, k)];
+            let tr1 = cc[ci(ido - 1, 0, k)] - cc[ci(ido - 1, 2, k)];
+            ch[hi(ido - 1, k, 0)] = tr2 + tr2;
+            ch[hi(ido - 1, k, 1)] = S * (tr1 - ti1);
+            ch[hi(ido - 1, k, 2)] = ti2 + ti2;
+            ch[hi(ido - 1, k, 3)] = -S * (tr1 + ti1);
+        }
+    }
+    if ido <= 2 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let tr2 = cc[ci(i - 1, 0, k)] + cc[ci(ic - 1, 3, k)];
+            let tr1 = cc[ci(i - 1, 0, k)] - cc[ci(ic - 1, 3, k)];
+            let ti1 = cc[ci(i, 0, k)] + cc[ci(ic, 3, k)];
+            let ti2 = cc[ci(i, 0, k)] - cc[ci(ic, 3, k)];
+            let tr4 = cc[ci(i, 2, k)] + cc[ci(ic, 1, k)];
+            let ti3 = cc[ci(i, 2, k)] - cc[ci(ic, 1, k)];
+            let tr3 = cc[ci(i - 1, 2, k)] + cc[ci(ic - 1, 1, k)];
+            let ti4 = cc[ci(i - 1, 2, k)] - cc[ci(ic - 1, 1, k)];
+            ch[hi(i - 1, k, 0)] = tr2 + tr3;
+            let cr3 = tr2 - tr3;
+            ch[hi(i, k, 0)] = ti2 + ti3;
+            let ci3 = ti2 - ti3;
+            let cr4 = tr1 + tr4;
+            let cr2 = tr1 - tr4;
+            let ci2 = ti1 + ti4;
+            let ci4 = ti1 - ti4;
+            let o = ido - 1;
+            for (q, (ciq, crq)) in [(0, (ci2, cr2)), (1, (ci3, cr3)), (2, (ci4, cr4))] {
+                let (a, b) = mulpm(wa[q * o + i - 2], wa[q * o + i - 1], ciq, crq);
+                ch[hi(i, k, q + 1)] = a;
+                ch[hi(i - 1, k, q + 1)] = b;
+            }
+        }
+    }
+}
+
+fn radb5(ido: usize, l1: usize, cc: &[f64], ch: &mut [f64], wa: &[f64]) {
+    const R1: f64 = 0.3090169943749474241022934171828191_f64;
+    const I1: f64 = 0.9510565162951535721164393333793821_f64;
+    const R2: f64 = -0.8090169943749474241022934171828191_f64;
+    const I2: f64 = 0.5877852522924731291687059546390728_f64;
+    let ci = |a, b, c| a + ido * (b + 5 * c);
+    let hi = |a, b, c| a + ido * (b + l1 * c);
+    for k in 0..l1 {
+        let ti5 = 2.0 * cc[ci(0, 2, k)];
+        let ti4 = 2.0 * cc[ci(0, 4, k)];
+        let tr2 = 2.0 * cc[ci(ido - 1, 1, k)];
+        let tr3 = 2.0 * cc[ci(ido - 1, 3, k)];
+        ch[hi(0, k, 0)] = cc[ci(0, 0, k)] + tr2 + tr3;
+        let cr2 = R2.mul_add(tr3, R1.mul_add(tr2, cc[ci(0, 0, k)]));
+        let cr3 = R1.mul_add(tr3, R2.mul_add(tr2, cc[ci(0, 0, k)]));
+        let (ci5, ci4) = mulpm(ti5, ti4, I1, I2);
+        ch[hi(0, k, 4)] = cr2 + ci5;
+        ch[hi(0, k, 1)] = cr2 - ci5;
+        ch[hi(0, k, 3)] = cr3 + ci4;
+        ch[hi(0, k, 2)] = cr3 - ci4;
+    }
+    if ido == 1 {
+        return;
+    }
+    for k in 0..l1 {
+        for i in (2..ido).step_by(2) {
+            let ic = ido - i;
+            let tr2 = cc[ci(i - 1, 2, k)] + cc[ci(ic - 1, 1, k)];
+            let tr5 = cc[ci(i - 1, 2, k)] - cc[ci(ic - 1, 1, k)];
+            let ti5 = cc[ci(i, 2, k)] + cc[ci(ic, 1, k)];
+            let ti2 = cc[ci(i, 2, k)] - cc[ci(ic, 1, k)];
+            let tr3 = cc[ci(i - 1, 4, k)] + cc[ci(ic - 1, 3, k)];
+            let tr4 = cc[ci(i - 1, 4, k)] - cc[ci(ic - 1, 3, k)];
+            let ti4 = cc[ci(i, 4, k)] + cc[ci(ic, 3, k)];
+            let ti3 = cc[ci(i, 4, k)] - cc[ci(ic, 3, k)];
+            ch[hi(i - 1, k, 0)] = cc[ci(i - 1, 0, k)] + tr2 + tr3;
+            ch[hi(i, k, 0)] = cc[ci(i, 0, k)] + ti2 + ti3;
+            let cr2 = R2.mul_add(tr3, R1.mul_add(tr2, cc[ci(i - 1, 0, k)]));
+            let ci2 = R2.mul_add(ti3, R1.mul_add(ti2, cc[ci(i, 0, k)]));
+            let cr3 = R1.mul_add(tr3, R2.mul_add(tr2, cc[ci(i - 1, 0, k)]));
+            let ci3 = R1.mul_add(ti3, R2.mul_add(ti2, cc[ci(i, 0, k)]));
+            let (cr5, cr4) = mulpm(tr5, tr4, I1, I2);
+            let (ci5, ci4) = mulpm(ti5, ti4, I1, I2);
+            let dr4 = cr3 + ci4;
+            let dr3 = cr3 - ci4;
+            let di3 = ci3 + cr4;
+            let di4 = ci3 - cr4;
+            let dr5 = cr2 + ci5;
+            let dr2 = cr2 - ci5;
+            let di2 = ci2 + cr5;
+            let di5 = ci2 - cr5;
+            let o = ido - 1;
+            for (q, (di, dr)) in [
+                (0, (di2, dr2)),
+                (1, (di3, dr3)),
+                (2, (di4, dr4)),
+                (3, (di5, dr5)),
+            ] {
+                let (a, b) = mulpm(wa[q * o + i - 2], wa[q * o + i - 1], di, dr);
+                ch[hi(i, k, q + 1)] = a;
+                ch[hi(i - 1, k, q + 1)] = b;
+            }
+        }
+    }
+}
+
+fn radfg(ido: usize, ip: usize, l1: usize, cc: &mut [f64], ch: &mut [f64], wa: &[f64], cs: &[f64]) {
+    let ipph = (ip + 1) / 2;
+    let idl1 = ido * l1;
+    let c1 = |a, b, c| a + ido * (b + l1 * c);
+    let cpack = |a, b, c| a + ido * (b + ip * c);
+    if ido > 1 {
+        for j in 1..ipph {
+            let jc = ip - j;
+            let is = (j - 1) * (ido - 1);
+            let is2 = (jc - 1) * (ido - 1);
+            for k in 0..l1 {
+                let mut q = is;
+                let mut q2 = is2;
+                for i in (1..=ido - 2).step_by(2) {
+                    let t1 = cc[c1(i, k, j)];
+                    let t2 = cc[c1(i + 1, k, j)];
+                    let t3 = cc[c1(i, k, jc)];
+                    let t4 = cc[c1(i + 1, k, jc)];
+                    let x1 = wa[q].mul_add(t1, wa[q + 1] * t2);
+                    let x2 = wa[q].mul_add(t2, -wa[q + 1] * t1);
+                    let x3 = wa[q2].mul_add(t3, wa[q2 + 1] * t4);
+                    let x4 = wa[q2].mul_add(t4, -wa[q2 + 1] * t3);
+                    cc[c1(i, k, j)] = x3 + x1;
+                    cc[c1(i + 1, k, jc)] = x3 - x1;
+                    cc[c1(i + 1, k, j)] = x2 + x4;
+                    cc[c1(i, k, jc)] = x2 - x4;
+                    q += 2;
+                    q2 += 2;
+                }
+            }
+        }
+    }
+    for j in 1..ipph {
+        let jc = ip - j;
+        for k in 0..l1 {
+            let a = c1(0, k, jc);
+            let b = c1(0, k, j);
+            let t = cc[a];
+            cc[a] -= cc[b];
+            cc[b] += t;
+        }
+    }
+    for l in 1..ipph {
+        let lc = ip - l;
+        for ik in 0..idl1 {
+            ch[ik + idl1 * l] =
+                cs[4 * l].mul_add(cc[ik + 2 * idl1], cs[2 * l].mul_add(cc[ik + idl1], cc[ik]));
+            ch[ik + idl1 * lc] = cs[2 * l + 1].mul_add(
+                cc[ik + idl1 * (ip - 1)],
+                cs[4 * l + 1] * cc[ik + idl1 * (ip - 2)],
+            );
+        }
+        let mut iang = 2 * l;
+        let mut j = 3usize;
+        let mut jc = ip - 3;
+        while j < ipph - 3 {
+            let mut ar = [0.; 4];
+            let mut ai = [0.; 4];
+            for q in 0..4 {
+                iang += l;
+                if iang >= ip {
+                    iang -= ip;
+                }
+                ar[q] = cs[2 * iang];
+                ai[q] = cs[2 * iang + 1];
+            }
+            for ik in 0..idl1 {
+                let rhs = ar[3].mul_add(
+                    cc[ik + idl1 * (j + 3)],
+                    ar[2].mul_add(
+                        cc[ik + idl1 * (j + 2)],
+                        ar[0].mul_add(cc[ik + idl1 * j], ar[1] * cc[ik + idl1 * (j + 1)]),
+                    ),
+                );
+                ch[ik + idl1 * l] += rhs;
+                let rhs = ai[3].mul_add(
+                    cc[ik + idl1 * (jc - 3)],
+                    ai[2].mul_add(
+                        cc[ik + idl1 * (jc - 2)],
+                        ai[0].mul_add(cc[ik + idl1 * jc], ai[1] * cc[ik + idl1 * (jc - 1)]),
+                    ),
+                );
+                ch[ik + idl1 * lc] += rhs;
+            }
+            j += 4;
+            jc -= 4;
+        }
+        while j < ipph - 1 {
+            iang += l;
+            if iang >= ip {
+                iang -= ip;
+            }
+            let ar1 = cs[2 * iang];
+            let ai1 = cs[2 * iang + 1];
+            iang += l;
+            if iang >= ip {
+                iang -= ip;
+            }
+            let ar2 = cs[2 * iang];
+            let ai2 = cs[2 * iang + 1];
+            for ik in 0..idl1 {
+                ch[ik + idl1 * l] += ar1.mul_add(cc[ik + idl1 * j], ar2 * cc[ik + idl1 * (j + 1)]);
+                ch[ik + idl1 * lc] +=
+                    ai1.mul_add(cc[ik + idl1 * jc], ai2 * cc[ik + idl1 * (jc - 1)]);
+            }
+            j += 2;
+            jc -= 2;
+        }
+        while j < ipph {
+            iang += l;
+            if iang >= ip {
+                iang -= ip;
+            }
+            let ar = cs[2 * iang];
+            let ai = cs[2 * iang + 1];
+            for ik in 0..idl1 {
+                ch[ik + idl1 * l] = ar.mul_add(cc[ik + idl1 * j], ch[ik + idl1 * l]);
+                ch[ik + idl1 * lc] = ai.mul_add(cc[ik + idl1 * jc], ch[ik + idl1 * lc]);
+            }
+            j += 1;
+            jc -= 1;
+        }
+    }
+    for ik in 0..idl1 {
+        ch[ik] = cc[ik];
+    }
+    for j in 1..ipph {
+        for ik in 0..idl1 {
+            ch[ik] += cc[ik + idl1 * j];
+        }
+    }
+    for k in 0..l1 {
+        for i in 0..ido {
+            cc[cpack(i, 0, k)] = ch[c1(i, k, 0)];
+        }
+    }
+    for j in 1..ipph {
+        let jc = ip - j;
+        let j2 = 2 * j - 1;
+        for k in 0..l1 {
+            cc[cpack(ido - 1, j2, k)] = ch[c1(0, k, j)];
+            cc[cpack(0, j2 + 1, k)] = ch[c1(0, k, jc)];
+        }
+    }
+    if ido == 1 {
+        return;
+    }
+    for j in 1..ipph {
+        let jc = ip - j;
+        let j2 = 2 * j - 1;
+        for k in 0..l1 {
+            let mut i = 1usize;
+            let mut ic = ido - i - 2;
+            while i <= ido - 2 {
+                cc[cpack(i, j2 + 1, k)] = ch[c1(i, k, j)] + ch[c1(i, k, jc)];
+                cc[cpack(ic, j2, k)] = ch[c1(i, k, j)] - ch[c1(i, k, jc)];
+                cc[cpack(i + 1, j2 + 1, k)] = ch[c1(i + 1, k, j)] + ch[c1(i + 1, k, jc)];
+                cc[cpack(ic + 1, j2, k)] = ch[c1(i + 1, k, jc)] - ch[c1(i + 1, k, j)];
+                i += 2;
+                if ic >= 2 {
+                    ic -= 2;
+                }
+            }
+        }
+    }
+}
+
+fn radbg(ido: usize, ip: usize, l1: usize, cc: &mut [f64], ch: &mut [f64], wa: &[f64], cs: &[f64]) {
+    let ipph = (ip + 1) / 2;
+    let idl1 = ido * l1;
+    let cp = |a, b, c| a + ido * (b + ip * c);
+    let c1 = |a, b, c| a + ido * (b + l1 * c);
+    for k in 0..l1 {
+        for i in 0..ido {
+            ch[c1(i, k, 0)] = cc[cp(i, 0, k)];
+        }
+    }
+    for j in 1..ipph {
+        let jc = ip - j;
+        let j2 = 2 * j - 1;
+        for k in 0..l1 {
+            ch[c1(0, k, j)] = 2.0 * cc[cp(ido - 1, j2, k)];
+            ch[c1(0, k, jc)] = 2.0 * cc[cp(0, j2 + 1, k)];
+        }
+    }
+    if ido != 1 {
+        for j in 1..ipph {
+            let jc = ip - j;
+            let j2 = 2 * j - 1;
+            for k in 0..l1 {
+                let mut i = 1usize;
+                let mut ic = ido - i - 2;
+                while i <= ido - 2 {
+                    ch[c1(i, k, j)] = cc[cp(i, j2 + 1, k)] + cc[cp(ic, j2, k)];
+                    ch[c1(i, k, jc)] = cc[cp(i, j2 + 1, k)] - cc[cp(ic, j2, k)];
+                    ch[c1(i + 1, k, j)] = cc[cp(i + 1, j2 + 1, k)] - cc[cp(ic + 1, j2, k)];
+                    ch[c1(i + 1, k, jc)] = cc[cp(i + 1, j2 + 1, k)] + cc[cp(ic + 1, j2, k)];
+                    i += 2;
+                    if ic >= 2 {
+                        ic -= 2;
+                    }
+                }
+            }
+        }
+    }
+    for l in 1..ipph {
+        let lc = ip - l;
+        for ik in 0..idl1 {
+            cc[ik + idl1 * l] =
+                cs[4 * l].mul_add(ch[ik + 2 * idl1], cs[2 * l].mul_add(ch[ik + idl1], ch[ik]));
+            cc[ik + idl1 * lc] = cs[2 * l + 1].mul_add(
+                ch[ik + idl1 * (ip - 1)],
+                cs[4 * l + 1] * ch[ik + idl1 * (ip - 2)],
+            );
+        }
+        let mut iang = 2 * l;
+        let mut j = 3usize;
+        let mut jc = ip - 3;
+        while j < ipph - 3 {
+            let mut ar = [0.; 4];
+            let mut ai = [0.; 4];
+            for q in 0..4 {
+                iang += l;
+                if iang > ip {
+                    iang -= ip;
+                }
+                ar[q] = cs[2 * iang];
+                ai[q] = cs[2 * iang + 1];
+            }
+            for ik in 0..idl1 {
+                cc[ik + idl1 * l] += ar[3].mul_add(
+                    ch[ik + idl1 * (j + 3)],
+                    ar[2].mul_add(
+                        ch[ik + idl1 * (j + 2)],
+                        ar[0].mul_add(ch[ik + idl1 * j], ar[1] * ch[ik + idl1 * (j + 1)]),
+                    ),
+                );
+                cc[ik + idl1 * lc] += ai[3].mul_add(
+                    ch[ik + idl1 * (jc - 3)],
+                    ai[2].mul_add(
+                        ch[ik + idl1 * (jc - 2)],
+                        ai[0].mul_add(ch[ik + idl1 * jc], ai[1] * ch[ik + idl1 * (jc - 1)]),
+                    ),
+                );
+            }
+            j += 4;
+            jc -= 4;
+        }
+        while j < ipph - 1 {
+            iang += l;
+            if iang > ip {
+                iang -= ip;
+            }
+            let ar1 = cs[2 * iang];
+            let ai1 = cs[2 * iang + 1];
+            iang += l;
+            if iang > ip {
+                iang -= ip;
+            }
+            let ar2 = cs[2 * iang];
+            let ai2 = cs[2 * iang + 1];
+            for ik in 0..idl1 {
+                cc[ik + idl1 * l] += ar1.mul_add(ch[ik + idl1 * j], ar2 * ch[ik + idl1 * (j + 1)]);
+                cc[ik + idl1 * lc] +=
+                    ai1.mul_add(ch[ik + idl1 * jc], ai2 * ch[ik + idl1 * (jc - 1)]);
+            }
+            j += 2;
+            jc -= 2;
+        }
+        while j < ipph {
+            iang += l;
+            if iang > ip {
+                iang -= ip;
+            }
+            let ar = cs[2 * iang];
+            let ai = cs[2 * iang + 1];
+            for ik in 0..idl1 {
+                cc[ik + idl1 * l] = ar.mul_add(ch[ik + idl1 * j], cc[ik + idl1 * l]);
+                cc[ik + idl1 * lc] = ai.mul_add(ch[ik + idl1 * jc], cc[ik + idl1 * lc]);
+            }
+            j += 1;
+            jc -= 1;
+        }
+    }
+    for j in 1..ipph {
+        for ik in 0..idl1 {
+            ch[ik] += ch[ik + idl1 * j];
+        }
+    }
+    for j in 1..ipph {
+        let jc = ip - j;
+        for k in 0..l1 {
+            ch[c1(0, k, jc)] = cc[c1(0, k, j)] + cc[c1(0, k, jc)];
+            ch[c1(0, k, j)] = cc[c1(0, k, j)] - cc[c1(0, k, jc)];
+        }
+    }
+    if ido == 1 {
+        return;
+    }
+    for j in 1..ipph {
+        let jc = ip - j;
+        for k in 0..l1 {
+            for i in (1..=ido - 2).step_by(2) {
+                ch[c1(i, k, j)] = cc[c1(i, k, j)] - cc[c1(i + 1, k, jc)];
+                ch[c1(i, k, jc)] = cc[c1(i, k, j)] + cc[c1(i + 1, k, jc)];
+                ch[c1(i + 1, k, j)] = cc[c1(i + 1, k, j)] + cc[c1(i, k, jc)];
+                ch[c1(i + 1, k, jc)] = cc[c1(i + 1, k, j)] - cc[c1(i, k, jc)];
+            }
+        }
+    }
+    for j in 1..ip {
+        let is = (j - 1) * (ido - 1);
+        for k in 0..l1 {
+            let mut q = is;
+            for i in (1..=ido - 2).step_by(2) {
+                let t1 = ch[c1(i, k, j)];
+                let t2 = ch[c1(i + 1, k, j)];
+                ch[c1(i, k, j)] = wa[q].mul_add(t1, -wa[q + 1] * t2);
+                ch[c1(i + 1, k, j)] = wa[q].mul_add(t2, wa[q + 1] * t1);
+                q += 2;
+            }
+        }
+    }
+}
+
+struct RealFactor {
+    fct: usize,
+    tw: Vec<f64>,
+    tws: Vec<f64>,
+}
+struct RealPack {
+    length: usize,
+    factors: Vec<RealFactor>,
+}
+
+impl RealPack {
+    fn new(length: usize) -> Self {
+        if length == 1 {
+            return Self {
+                length,
+                factors: Vec::new(),
+            };
+        }
+        let mut raw = Vec::new();
+        let mut len = length;
+        while len % 4 == 0 {
+            raw.push(4);
+            len >>= 2;
+        }
+        if len % 2 == 0 {
+            len >>= 1;
+            raw.push(2);
+            let q = raw.len() - 1;
+            raw.swap(0, q);
+        }
+        let mut d = 3;
+        while d * d <= len {
+            while len % d == 0 {
+                raw.push(d);
+                len /= d;
+            }
+            d += 2;
+        }
+        if len > 1 {
+            raw.push(len);
+        }
+        let roots = Twiddles::new(length);
+        let nf = raw.len();
+        let mut l1 = 1;
+        let mut factors = Vec::with_capacity(nf);
+        for (k, ip) in raw.into_iter().enumerate() {
+            let ido = length / (l1 * ip);
+            let mut tw = vec![0.; (ip - 1) * (ido.saturating_sub(1))];
+            if k < nf - 1 {
+                for j in 1..ip {
+                    for i in 1..=(ido - 1) / 2 {
+                        let z = roots.get(j * l1 * i);
+                        let q = (j - 1) * (ido - 1) + 2 * i - 2;
+                        tw[q] = z.r;
+                        tw[q + 1] = z.i;
+                    }
+                }
+            }
+            let mut tws = Vec::new();
+            if ip > 5 {
+                tws = vec![0.; 2 * ip];
+                tws[0] = 1.;
+                for i in (2..=2 * ip - 2).step_by(2) {
+                    let ic = 2 * ip - i;
+                    let z = roots.get((i / 2) * (length / ip));
+                    tws[i] = z.r;
+                    tws[i + 1] = z.i;
+                    tws[ic] = z.r;
+                    tws[ic + 1] = -z.i;
+                }
+            }
+            factors.push(RealFactor { fct: ip, tw, tws });
+            l1 *= ip;
+        }
+        Self { length, factors }
+    }
+    fn exec(&self, c: &mut [f64], fct: f64, forward: bool) {
+        if self.length == 1 {
+            c[0] *= fct;
+            return;
+        }
+        let mut ch = vec![0.; self.length];
+        let mut primary = true;
+        if forward {
+            let mut l1 = self.length;
+            for factor in self.factors.iter().rev() {
+                let ip = factor.fct;
+                let ido = self.length / l1;
+                l1 /= ip;
+                if ip > 5 {
+                    if primary {
+                        radfg(ido, ip, l1, c, &mut ch, &factor.tw, &factor.tws)
+                    } else {
+                        radfg(ido, ip, l1, &mut ch, c, &factor.tw, &factor.tws)
+                    }
+                } else {
+                    let run = |src: &[f64], dst: &mut [f64]| match ip {
+                        2 => radf2(ido, l1, src, dst, &factor.tw),
+                        3 => radf3(ido, l1, src, dst, &factor.tw),
+                        4 => radf4(ido, l1, src, dst, &factor.tw),
+                        5 => radf5(ido, l1, src, dst, &factor.tw),
+                        _ => unreachable!(),
+                    };
+                    if primary {
+                        run(c, &mut ch)
+                    } else {
+                        run(&ch, c)
+                    }
+                    primary = !primary;
+                }
+            }
+        } else {
+            let mut l1 = 1;
+            for factor in &self.factors {
+                let ip = factor.fct;
+                let ido = self.length / (ip * l1);
+                if ip > 5 {
+                    if primary {
+                        radbg(ido, ip, l1, c, &mut ch, &factor.tw, &factor.tws)
+                    } else {
+                        radbg(ido, ip, l1, &mut ch, c, &factor.tw, &factor.tws)
+                    }
+                } else {
+                    let run = |src: &[f64], dst: &mut [f64]| match ip {
+                        2 => radb2(ido, l1, src, dst, &factor.tw),
+                        3 => radb3(ido, l1, src, dst, &factor.tw),
+                        4 => radb4(ido, l1, src, dst, &factor.tw),
+                        5 => radb5(ido, l1, src, dst, &factor.tw),
+                        _ => unreachable!(),
+                    };
+                    if primary {
+                        run(c, &mut ch)
+                    } else {
+                        run(&ch, c)
+                    }
+                }
+                primary = !primary;
+                l1 *= ip;
+            }
+        }
+        if !primary {
+            if fct != 1. {
+                for i in 0..self.length {
+                    c[i] = fct * ch[i];
+                }
+            } else {
+                c.copy_from_slice(&ch);
+            }
+        } else if fct != 1. {
+            for x in c {
+                *x *= fct;
+            }
+        }
+    }
+}
+
+impl FftBlue {
+    fn exec_real(&self, c: &mut [f64], fct: f64, forward: bool) {
+        let mut tmp = vec![C::default(); self.n];
+        if forward {
+            for m in 0..self.n {
+                tmp[m] = C::new(c[m], 0.0 * c[0]);
+            }
+            self.exec(&mut tmp, fct, true);
+            c[0] = tmp[0].r;
+            for p in 1..self.n {
+                let m = (p + 1) / 2;
+                c[p] = if p & 1 == 1 { tmp[m].r } else { tmp[m].i };
+            }
+        } else {
+            tmp[0] = C::new(c[0], 0.0 * c[0]);
+            for p in 1..self.n {
+                let m = (p + 1) / 2;
+                if p & 1 == 1 {
+                    tmp[m].r = c[p];
+                } else {
+                    tmp[m].i = c[p];
+                }
+            }
+            if self.n & 1 == 0 {
+                tmp[self.n / 2].i = 0.0 * c[0];
+            }
+            for m in 1..(self.n + 1) / 2 {
+                tmp[self.n - m] = C::new(tmp[m].r, -tmp[m].i);
+            }
+            self.exec(&mut tmp, fct, false);
+            for m in 0..self.n {
+                c[m] = tmp[m].r;
+            }
+        }
+    }
+}
+
+enum RealPlan {
+    Pack(RealPack),
+    Blue(Box<FftBlue>),
+}
+impl RealPlan {
+    fn new(n: usize) -> Self {
+        let tmp = if n < 50 { 0 } else { largest_prime_factor(n) };
+        if tmp * tmp <= n {
+            return Self::Pack(RealPack::new(n));
+        }
+        let c1 = 0.5 * cost_guess(n);
+        let c2 = 2.0 * cost_guess(good_size_cmplx(2 * n - 1)) * 1.5;
+        if c2 < c1 {
+            Self::Blue(Box::new(FftBlue::new(n)))
+        } else {
+            Self::Pack(RealPack::new(n))
+        }
+    }
+    fn exec(&self, c: &mut [f64], fct: f64, forward: bool) {
+        match self {
+            Self::Pack(p) => p.exec(c, fct, forward),
+            Self::Blue(p) => p.exec_real(c, fct, forward),
+        }
+    }
+}
+
+pub fn r2c(input: &[f64], scale: f64) -> Vec<C64> {
+    let n = input.len();
+    let mut data = input.to_vec();
+    RealPlan::new(n).exec(&mut data, scale, true);
+    let mut out = vec![C64::new(0., 0.); n / 2 + 1];
+    out[0] = C64::new(data[0], 0.);
+    for (k, z) in out.iter_mut().enumerate().skip(1) {
+        z.re = data[2 * k - 1];
+        if 2 * k < n {
+            z.im = data[2 * k];
+        }
+    }
+    out
+}
+pub fn c2r(input: &[C64], n: usize, scale: f64) -> Vec<f64> {
+    let mut data = vec![0.; n];
+    if let Some(z) = input.first() {
+        data[0] = z.re;
+    }
+    for (k, z) in input.iter().enumerate().skip(1).take(n / 2) {
+        data[2 * k - 1] = z.re;
+        if 2 * k < n {
+            data[2 * k] = z.im;
+        }
+    }
+    if n & 1 == 0 && n / 2 < input.len() {
+        data[n - 1] = input[n / 2].re;
+    }
+    RealPlan::new(n).exec(&mut data, scale, false);
+    data
+}
+
 fn decode_batch(mut flat: usize, shape: &[isize], axis: usize, index: &mut [isize]) {
     for ax in (0..shape.len()).rev() {
         if ax == axis {
@@ -1053,6 +2048,79 @@ pub fn c2c_axis(
     Ok(output)
 }
 
+pub fn r2c_axis(
+    input: &NdArray,
+    n: usize,
+    axis: usize,
+    scale: f64,
+    out_dtype: DType,
+) -> Result<NdArray> {
+    let mut shape = input.shape.clone();
+    shape[axis] = (n / 2 + 1) as isize;
+    let output = NdArray::zeros(shape.clone(), out_dtype)?;
+    let batches = shape
+        .iter()
+        .enumerate()
+        .filter(|(a, _)| *a != axis)
+        .map(|(_, d)| *d as usize)
+        .product();
+    let take = n.min(input.shape[axis] as usize);
+    let mut si = vec![0isize; input.ndim()];
+    let mut di = si.clone();
+    for batch in 0..batches {
+        decode_batch(batch, &shape, axis, &mut si);
+        di.copy_from_slice(&si);
+        let mut line = vec![0.; n];
+        for j in 0..take {
+            si[axis] = j as isize;
+            line[j] = input.read_at(input.byte_index(&si)).as_f64();
+        }
+        for (j, z) in r2c(&line, scale).into_iter().enumerate() {
+            di[axis] = j as isize;
+            output.write_at(output.byte_index(&di), Scalar::Complex(z));
+        }
+    }
+    Ok(output)
+}
+
+pub fn c2r_axis(
+    input: &NdArray,
+    n: usize,
+    axis: usize,
+    scale: f64,
+    out_dtype: DType,
+) -> Result<NdArray> {
+    let mut shape = input.shape.clone();
+    shape[axis] = n as isize;
+    let output = NdArray::zeros(shape.clone(), out_dtype)?;
+    let batches = shape
+        .iter()
+        .enumerate()
+        .filter(|(a, _)| *a != axis)
+        .map(|(_, d)| *d as usize)
+        .product();
+    let take = (n / 2 + 1).min(input.shape[axis] as usize);
+    let mut si = vec![0isize; input.ndim()];
+    let mut di = si.clone();
+    for batch in 0..batches {
+        decode_batch(batch, &shape, axis, &mut si);
+        di.copy_from_slice(&si);
+        let mut line = vec![C64::new(0., 0.); take];
+        for (j, z) in line.iter_mut().enumerate() {
+            si[axis] = j as isize;
+            *z = match input.read_at(input.byte_index(&si)) {
+                Scalar::Complex(v) => v,
+                v => C64::new(v.as_f64(), 0.),
+            };
+        }
+        for (j, x) in c2r(&line, n, scale).into_iter().enumerate() {
+            di[axis] = j as isize;
+            output.write_at(output.byte_index(&di), Scalar::Float(x));
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,5 +2141,13 @@ mod tests {
         for (a, b) in back.iter().zip(input) {
             assert!((a - b).norm() < 1e-14);
         }
+    }
+
+    #[test]
+    fn real_forward_and_inverse() {
+        let input = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let spectrum = r2c(&input, 1.0);
+        let back = c2r(&spectrum, input.len(), 1.0 / input.len() as f64);
+        assert_eq!(back, input);
     }
 }

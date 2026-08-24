@@ -15,6 +15,13 @@ fn output_dtype(input: DType) -> DType {
     }
 }
 
+fn real_output_dtype(input: DType) -> DType {
+    match input {
+        DType::F32 | DType::C64 => DType::F32,
+        _ => DType::F64,
+    }
+}
+
 fn validate_out(out: Option<&Bound<'_, PyAny>>, shape: &[isize], dtype: DType) -> PyResult<()> {
     let Some(out) = out.filter(|o| !o.is_none()) else {
         return Ok(());
@@ -61,7 +68,59 @@ fn _fft_c2c<'py>(
     store_or_wrap(py, result, out)
 }
 
+#[pyfunction]
+#[pyo3(signature = (a, n, axis, scale, out = None))]
+fn _fft_r2c<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    n: usize,
+    axis: isize,
+    scale: f64,
+    out: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let input = array_from_any(a, None, false)?;
+    let ndim = input.ndim() as isize;
+    let axis = if axis < 0 { axis + ndim } else { axis };
+    if axis < 0 || axis >= ndim {
+        return Err(PyIndexError::new_err("tuple index out of range"));
+    }
+    let dtype = output_dtype(input.dtype());
+    let mut shape = input.shape.clone();
+    shape[axis as usize] = (n / 2 + 1) as isize;
+    validate_out(out, &shape, dtype)?;
+    let result =
+        rnp_core::fft::r2c_axis(&input, n, axis as usize, scale, dtype).map_err(crate::err)?;
+    store_or_wrap(py, result, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, n, axis, scale, out = None))]
+fn _fft_c2r<'py>(
+    py: Python<'py>,
+    a: &Bound<'py, PyAny>,
+    n: usize,
+    axis: isize,
+    scale: f64,
+    out: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let input = array_from_any(a, None, false)?;
+    let ndim = input.ndim() as isize;
+    let axis = if axis < 0 { axis + ndim } else { axis };
+    if axis < 0 || axis >= ndim {
+        return Err(PyIndexError::new_err("tuple index out of range"));
+    }
+    let dtype = real_output_dtype(input.dtype());
+    let mut shape = input.shape.clone();
+    shape[axis as usize] = n as isize;
+    validate_out(out, &shape, dtype)?;
+    let result =
+        rnp_core::fft::c2r_axis(&input, n, axis as usize, scale, dtype).map_err(crate::err)?;
+    store_or_wrap(py, result, out)
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_fft_c2c, module)?)?;
+    module.add_function(wrap_pyfunction!(_fft_r2c, module)?)?;
+    module.add_function(wrap_pyfunction!(_fft_c2r, module)?)?;
     Ok(())
 }
