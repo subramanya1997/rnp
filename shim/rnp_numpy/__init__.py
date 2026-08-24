@@ -695,13 +695,13 @@ def clip(a, a_min=_builtins.Ellipsis, a_max=_builtins.Ellipsis, out=None, **kwar
 def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
         where=None, mean=None, correction=None):
     return _asarr(a).var(axis, dtype, out, ddof, keepdims,
-                         where_=where, mean=mean, correction=correction)
+                         where=where, mean=mean, correction=correction)
 
 
 def std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *,
         where=None, mean=None, correction=None):
     return _asarr(a).std(axis, dtype, out, ddof, keepdims,
-                         where_=where, mean=mean, correction=correction)
+                         where=where, mean=mean, correction=correction)
 
 
 _rnp_mean = mean
@@ -710,7 +710,7 @@ _rnp_mean = mean
 def mean(a, axis=None, dtype=None, out=None, keepdims=False, *, where=None):
     if where is None:
         return _rnp_mean(a, axis, dtype, out, keepdims)
-    return _asarr(a).mean(axis, dtype, out, keepdims, where_=where)
+    return _asarr(a).mean(axis, dtype, out, keepdims, where=where)
 
 
 def conjugate(a, out=None):
@@ -766,6 +766,30 @@ def load(file, mmap_mode=None, allow_pickle=False, fix_imports=True,
         fh = _builtins.open(name + ".npy", "rb")
     with fh:
         return _pickle.load(fh)
+
+
+def frombuffer(buffer, dtype=float, count=-1, offset=0, *, like=None):
+    """`np.frombuffer` — reinterpret a bytes-like object's memory as an array.
+
+    The port copies rather than sharing the buffer's memory, so the result is
+    writeable and owns its data; numpy shares and marks the result read-only
+    for an immutable source.
+    """
+    data = _builtins.bytes(buffer)[offset:]
+    dt = _rnp.dtype(dtype)
+    isz = dt.itemsize
+    if isz == 0:
+        raise ValueError("cannot create an array from a zero-sized dtype")
+    if count < 0:
+        if len(data) % isz != 0:
+            raise ValueError(
+                "buffer size must be a multiple of element size")
+        count = len(data) // isz
+    elif count * isz > len(data):
+        raise ValueError("buffer is smaller than requested size")
+    out = empty((count,), dt)
+    out.__setstate__((1, (count,), dt, False, data[:count * isz]))
+    return out
 
 
 class _CClass:
@@ -1251,7 +1275,7 @@ for _name in (
     "isclose", "allclose", "array_equiv", "moveaxis", "rollaxis", "expand_dims",
     "split", "array_split", "dsplit", "hsplit", "vsplit", "dstack", "column_stack",
     "append", "insert", "delete", "trim_zeros", "fromfunction",
-    "frombuffer", "fromfile", "fromiter", "fromstring", "loadtxt", "savetxt",
+    "fromfile", "fromiter", "fromstring", "loadtxt", "savetxt",
     "matmul", "vecdot", "packbits", "unpackbits", "digitize",
     "select", "piecewise", "extract", "place", "copyto", "shares_memory",
     "may_share_memory", "apply_along_axis", "asanyarray", "ascontiguousarray",

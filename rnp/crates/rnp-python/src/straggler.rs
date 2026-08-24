@@ -821,12 +821,7 @@ pub fn mean_impl<'py>(
         count = drop_axis(&count, ax.unwrap());
     }
     if any_nonpositive(&count) {
-        PyErr::warn(
-            py,
-            &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
-            std::ffi::CString::new("Mean of empty slice.").unwrap().as_c_str(),
-            1,
-        )?;
+        warn_empty_mean(py)?;
     }
     let mut res = divide_by(&total, &count, acc);
     if out_dt != acc {
@@ -904,6 +899,18 @@ fn keepdims_view(out: &NdArray, arr: &NdArray, axis: Option<usize>) -> NdArray {
         }
     }
     v
+}
+
+/// numpy's `_methods._mean` warning for a reduction over nothing.
+pub fn warn_empty_mean(py: Python<'_>) -> PyResult<()> {
+    PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+        std::ffi::CString::new("Mean of empty slice.")
+            .unwrap()
+            .as_c_str(),
+        1,
+    )
 }
 
 /// True when any reduction slice would divide by zero (or fewer) elements.

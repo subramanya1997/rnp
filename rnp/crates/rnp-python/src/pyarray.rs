@@ -1143,6 +1143,19 @@ impl PyNdArray {
         self.copy(py)
     }
 
+    /// `sys.getsizeof(a)` — numpy reports the array header (which grows with
+    /// `ndim`, since the shape and stride vectors live in it) plus the data
+    /// buffer, but only when the array actually owns that buffer.
+    fn __sizeof__(&self) -> usize {
+        const HEADER: usize = 96;
+        let header = HEADER + 2 * std::mem::size_of::<isize>() * self.arr.ndim();
+        if self.base.is_some() {
+            header
+        } else {
+            header + self.arr.nbytes()
+        }
+    }
+
     // ---- straggler cluster (see `straggler.rs` for the contracts) -------
 
     #[pyo3(signature = (order = None))]
@@ -1222,7 +1235,7 @@ impl PyNdArray {
     }
 
     #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
-                        where_ = None, mean = None, correction = None))]
+                        r#where = None, mean = None, correction = None))]
     #[allow(clippy::too_many_arguments)]
     fn var<'py>(
         &self,
@@ -1232,17 +1245,17 @@ impl PyNdArray {
         out: Option<&Bound<'py, PyAny>>,
         ddof: f64,
         keepdims: bool,
-        where_: Option<&Bound<'py, PyAny>>,
+        r#where: Option<&Bound<'py, PyAny>>,
         mean: Option<&Bound<'py, PyAny>>,
         correction: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let _ = mean;
         let dd = correction.unwrap_or(ddof);
-        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, where_, false)
+        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, false)
     }
 
     #[pyo3(signature = (axis = None, dtype = None, out = None, ddof = 0.0, keepdims = false, *,
-                        where_ = None, mean = None, correction = None))]
+                        r#where = None, mean = None, correction = None))]
     #[allow(clippy::too_many_arguments)]
     fn std<'py>(
         &self,
@@ -1252,13 +1265,13 @@ impl PyNdArray {
         out: Option<&Bound<'py, PyAny>>,
         ddof: f64,
         keepdims: bool,
-        where_: Option<&Bound<'py, PyAny>>,
+        r#where: Option<&Bound<'py, PyAny>>,
         mean: Option<&Bound<'py, PyAny>>,
         correction: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let _ = mean;
         let dd = correction.unwrap_or(ddof);
-        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, where_, true)
+        crate::straggler::var_impl(py, &self.arr, axis, dtype, out, dd, keepdims, r#where, true)
     }
 
     #[pyo3(signature = (dtype, offset = 0))]
@@ -1780,7 +1793,7 @@ impl PyNdArray {
     /// accumulator's own type* (so a complex mean goes through numpy's
     /// complex divide, not a component-wise one).
     #[pyo3(signature = (axis = None, dtype = None, out = None, keepdims = false, *,
-                        where_ = None))]
+                        r#where = None))]
     fn mean<'py>(
         &self,
         py: Python<'py>,
@@ -1788,13 +1801,13 @@ impl PyNdArray {
         dtype: Option<&Bound<'py, PyAny>>,
         out: Option<&Bound<'py, PyAny>>,
         keepdims: bool,
-        where_: Option<&Bound<'py, PyAny>>,
+        r#where: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // `out=` and `where=` route through the generic accumulator in
         // `straggler.rs`; the path below keeps numpy's exact complex64
         // division for the plain case.
-        if out.is_some_and(|o| !o.is_none()) || where_.is_some_and(|w| !w.is_none()) {
-            return crate::straggler::mean_impl(py, &self.arr, axis, dtype, out, keepdims, where_);
+        if out.is_some_and(|o| !o.is_none()) || r#where.is_some_and(|w| !w.is_none()) {
+            return crate::straggler::mean_impl(py, &self.arr, axis, dtype, out, keepdims, r#where);
         }
         // numpy raises `AxisError`, not a bare `ValueError`, for a bad axis.
         crate::straggler::check_axis(&self.arr, axis)?;
@@ -1811,6 +1824,10 @@ impl PyNdArray {
             Some(a) => self.arr.shape[a].max(0) as usize,
         };
         let out_dt = if is_half { DType::F16 } else { acc_dt };
+        if n == 0 {
+            // numpy's `_methods._mean` emits this before returning NaN.
+            crate::straggler::warn_empty_mean(py)?;
+        }
         let divide = |total: Scalar| -> Scalar {
             if n == 0 {
                 // numpy warns and yields NaN (NaN+NaNj for complex).
