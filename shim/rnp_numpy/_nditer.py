@@ -163,7 +163,8 @@ class nditer:
             arr = asarray(value)
             if "readonly" not in mode and not arr.flags.writeable:
                 raise ValueError("operand array with iterator write flag set is read-only")
-            if arr.dtype.hasobject and "refs_ok" not in self._flags:
+            if (arr.dtype.hasobject or arr.dtype.kind == "O") \
+                    and "refs_ok" not in self._flags:
                 raise TypeError(
                     "Iterator operand or requested dtype holds references, "
                     "but the REFS_OK flag was not enabled"
@@ -171,6 +172,20 @@ class nditer:
             arrays.append(arr)
             scalar.append(is_scalar)
         self._scalar_operands = tuple(scalar)
+        self._validate_writemasked(arrays)
+
+        if "common_dtype" in self._flags:
+            common_inputs = [
+                requested if requested is not None else arr.dtype
+                for arr, requested in zip(arrays, self._requested_dtypes)
+                if arr is not None
+            ]
+            if common_inputs:
+                common = result_type(*common_inputs)
+                self._requested_dtypes = [
+                    common if arr is not None or requested is None else requested
+                    for arr, requested in zip(arrays, self._requested_dtypes)
+                ]
 
         if op_axes is not None:
             arrays, logical_shape = self._apply_op_axes(arrays, op_axes, itershape)
@@ -192,7 +207,12 @@ class nditer:
                     )
 
         inputs = [a for a in arrays if a is not None]
-        inferred_dtype = result_type(*inputs) if inputs else None
+        promotion_inputs = [
+            a for a, mode in zip(arrays, self._op_flags)
+            if a is not None and "writeonly" not in mode
+        ]
+        inferred_dtype = (result_type(*promotion_inputs)
+                          if promotion_inputs else None)
         allocation_order = self._allocation_order(inputs)
         for i, (arr, mode, requested) in enumerate(
                 zip(arrays, self._op_flags, self._requested_dtypes)):
@@ -240,13 +260,90 @@ class nditer:
             return "F"
         return "C"
 
+    def _validate_writemasked(self, arrays):
+        masks = [i for i, mode in enumerate(self._op_flags)
+                 if "arraymask" in mode]
+        writers = [i for i, mode in enumerate(self._op_flags)
+                   if "writemasked" in mode]
+        if not masks and not writers:
+            return
+        if len(masks) != 1 or not writers:
+            raise ValueError("WRITEMASKED requires exactly one ARRAYMASK operand")
+        mask_index = masks[0]
+        mask_mode = self._op_flags[mask_index]
+        if "writemasked" in mask_mode or "readonly" not in mask_mode:
+            raise ValueError("ARRAYMASK must be a separate readonly operand")
+        mask = arrays[mask_index]
+        if mask is None:
+            raise ValueError("ARRAYMASK cannot be an allocated operand")
+        if not (mask.dtype.kind == "b"
+                or (mask.dtype.kind == "u" and mask.dtype.itemsize == 1)):
+            raise TypeError("ARRAYMASK must have boolean or uint8 dtype")
+        for writer_index in writers:
+            mode = self._op_flags[writer_index]
+            writer = arrays[writer_index]
+            if "readonly" in mode:
+                raise ValueError("a WRITEMASKED operand must be writeable")
+            if writer is None or mask.ndim > writer.ndim:
+                raise ValueError("ARRAYMASK shape must match the WRITEMASKED operand")
+            padded = (1,) * (writer.ndim - mask.ndim) + tuple(mask.shape)
+            if any(mdim not in (1, wdim)
+                   for mdim, wdim in zip(padded, writer.shape)):
+                raise ValueError("ARRAYMASK shape must match the WRITEMASKED operand")
+        # Large masked buffering is not yet emulated.  Fail promptly instead
+        # of performing an unmasked write over millions of scalar iterations.
+        if max((int(a.size) for a in arrays if a is not None), default=0) > 1000:
+            raise ValueError("large WRITEMASKED buffering is not implemented")
+
     def _apply_op_axes(self, arrays, op_axes, itershape):
         raise NotImplementedError("op_axes requires the extended axis-remapping lane")
 
     def _prepare_temporary_operands(self, arrays, can_cast):
-        # Level 3 installs dtype conversion here.  Same-dtype operands retain
-        # identity, which is the required Level 2 copy/update-if-copy behavior.
-        return arrays
+        prepared = []
+        for arr, mode, requested, was_scalar in zip(
+                arrays, self._op_flags, self._requested_dtypes,
+                self._scalar_operands):
+            target = requested
+            if target is None and "nbo" in mode:
+                target = arr.dtype.newbyteorder("=")
+            if target is None or target == arr.dtype:
+                prepared.append(arr)
+                continue
+            if (target.hasobject or target.kind == "O") \
+                    and "refs_ok" not in self._flags:
+                raise TypeError(
+                    "Iterator requested dtype holds references, but the "
+                    "REFS_OK flag was not enabled"
+                )
+
+            reading = "readonly" in mode or "readwrite" in mode
+            writing = "writeonly" in mode or "readwrite" in mode
+            if reading and not can_cast(arr.dtype, target, self._casting):
+                raise TypeError(
+                    f"Iterator operand required copying from {arr.dtype!r} to "
+                    f"{target!r} according to the rule {self._casting!r}"
+                )
+            if writing and not can_cast(target, arr.dtype, self._casting):
+                raise TypeError(
+                    f"Iterator requested dtype could not be cast back from "
+                    f"{target!r} to {arr.dtype!r} according to the rule "
+                    f"{self._casting!r}"
+                )
+            allows_temporary = (
+                "buffered" in self._flags or "copy" in mode
+                or "updateifcopy" in mode or "writebackifcopy" in mode
+                or (was_scalar and "readonly" in mode)
+            )
+            if not allows_temporary:
+                raise TypeError("Iterator operand required copying or buffering")
+
+            temporary = arr.astype(target, order="K", casting="unsafe")
+            prepared.append(temporary)
+            if writing:
+                self._writebacks.append((arr, temporary))
+                if "updateifcopy" in mode or "writebackifcopy" in mode:
+                    arr.flags.writeable = False
+        return prepared
 
     def _mapped_stride(self, arr, axis):
         shift = len(self._logical_shape) - arr.ndim
@@ -663,11 +760,11 @@ class nditer:
             return
         self._flush_external()
         for original, temporary in self._writebacks:
-            original[...] = temporary
             try:
                 original.flags.writeable = True
             except Exception:
                 pass
+            original[...] = temporary
         self._closed = True
 
     def __enter__(self):
