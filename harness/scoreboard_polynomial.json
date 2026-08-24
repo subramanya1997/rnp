@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T17:21:37.319810+00:00",
-  "overall_passed": 422,
+  "timestamp": "2026-08-24T19:39:28.268634+00:00",
+  "overall_passed": 486,
   "overall_total": 610,
   "files": [
     {
@@ -69,8 +69,8 @@
     },
     {
       "file": "polynomial/test_printing.py",
-      "passed": 11,
-      "failed": 67,
+      "passed": 75,
+      "failed": 3,
       "errors": 0,
       "skipped": 0,
       "total": 78

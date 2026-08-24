@@ -31,6 +31,18 @@ from .. import (  # noqa: F401
 from _rnp import _dlpack_registry_replace, _register_dlpack_dtype  # noqa: F401
 from .._stubs import not_implemented
 
+
+def dragon4_positional(*args, **kwargs):
+    # Lazy because arrayprint imports top-level reduction names that are not
+    # bound yet while ``numpy._core.multiarray`` is initialising.
+    from .arrayprint import dragon4_positional as implementation
+    return implementation(*args, **kwargs)
+
+
+def dragon4_scientific(*args, **kwargs):
+    from .arrayprint import dragon4_scientific as implementation
+    return implementation(*args, **kwargs)
+
 # numpy exposes the ABI/API version numbers of the C extension here. The port
 # has no C ABI, so it reports the versions of the numpy it targets (2.5.2).
 _ARRAY_API_VERSION = 0x00000012

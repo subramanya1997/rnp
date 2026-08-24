@@ -39,6 +39,12 @@ from .shape_base import (  # noqa: F401
 )
 
 
+def printoptions(*args, **kwargs):
+    """Late-bound context manager, kept ahead of the printoptions submodule."""
+    import rnp_numpy
+    return rnp_numpy.printoptions(*args, **kwargs)
+
+
 def __getattr__(name):
     """Expose late-bound top-level core names without an import cycle."""
     import rnp_numpy

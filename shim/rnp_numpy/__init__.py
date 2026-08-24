@@ -1426,6 +1426,11 @@ def _alias_core_modules():
 
 from . import _core as _core  # noqa: E402
 
+# Importing ``_core.printoptions`` as arrayprint's state holder installs that
+# submodule on the package object.  NumPy's private namespace exposes the
+# context-manager function at the same spelling, so restore it after startup.
+_core.printoptions = printoptions
+
 _alias_core_modules()
 
 
