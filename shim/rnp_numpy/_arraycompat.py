@@ -964,8 +964,11 @@ def _string_extreme_method(self, take_max, axis=None, out=None,
     if (self.dtype.kind != "T" or self.ndim != 1
             or axis not in (None, -1, 0) or where is not True):
         original = _orig_max if take_max else _orig_min
-        return original(self, axis=axis, out=out, keepdims=keepdims,
-                        initial=initial, where=where)
+        if initial is not None or where is not True:
+            raise TypeError(
+                f"ndarray.{'max' if take_max else 'min'}() does not support "
+                "initial or where")
+        return original(self, axis=axis, out=out, keepdims=keepdims)
     ordered = _string_sort_values(self)
     if not ordered and initial is None:
         name = "maximum" if take_max else "minimum"

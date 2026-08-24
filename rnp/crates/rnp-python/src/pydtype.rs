@@ -851,7 +851,10 @@ impl PyDType {
     }
 
     fn __str__(&self, py: Python<'_>) -> PyResult<String> {
-        self.__repr__(py)
+        match self.d.dt {
+            DType::String(id) => string_repr(py, id),
+            _ => Ok(self.d.str_string()),
+        }
     }
 
     fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
