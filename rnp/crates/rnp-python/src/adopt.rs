@@ -553,6 +553,18 @@ pub fn call_array_protocol<'py>(
     )?;
     match hook.call((), Some(&kwargs)) {
         Ok(v) => Ok(Some(v)),
+        // An object that merely *declares* the hook without honouring it --
+        // the shim's stand-ins for dtypes this port has not grown yet do
+        // exactly that -- is treated as having no `__array__` at all, so the
+        // caller falls through to its normal conversion and reports its
+        // normal error. This is the same rule `_arraycompat.array_from_protocol`
+        // already applies on the Python side.
+        Err(e)
+            if e.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py)
+                || e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) =>
+        {
+            Ok(None)
+        }
         Err(e) if e.is_instance_of::<PyTypeError>(py) => {
             // Legacy `__array__(self, dtype=None)`. numpy retries without the
             // keyword, warning only when a copy was explicitly refused.
