@@ -120,6 +120,18 @@ pub fn npscalar_to_py<'py>(
         };
         return Ok(crate::objects::resolve(py, h));
     }
+    if dt.is_datetime_like() {
+        if let Some(r) = crate::pydtype::datetime_scalar(
+            py,
+            dt,
+            match s {
+                Scalar::Int(i) => i,
+                other => other.as_f64() as i64,
+            },
+        ) {
+            return r;
+        }
+    }
     if let Some(w) = crate::pydtype::scalar_wrap(py, dt) {
         return w.call1((scalar_to_py(py, s)?,));
     }
@@ -156,6 +168,14 @@ fn is_sequence(obj: &Bound<'_, PyAny>) -> bool {
 fn discover_shape(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) -> PyResult<()> {
     if !is_sequence(obj) {
         return Ok(());
+    }
+    // numpy's `NPY_MAXDIMS`. A co-recursive list (gh-11154) is unbounded, and
+    // numpy answers with this ValueError rather than overflowing the stack.
+    if shape.len() >= 64 {
+        return Err(PyValueError::new_err(format!(
+            "maximum supported dimension for an ndarray is 64, found {}",
+            shape.len() + 1
+        )));
     }
     let seq = obj.cast::<PySequence>()?;
     let n = seq.len()?;
@@ -422,6 +442,11 @@ pub fn array_from_any(
     if dtype == Some(DType::Object) {
         return crate::objects::array_from_objects(obj);
     }
+    // datetime64 / timedelta64 elements can be strings, `datetime` objects
+    // or plain ints, and the unit is metadata, so they need their own path.
+    if let Some(d) = dtype.filter(|d| d.is_datetime_like()) {
+        return array_from_datetime(obj, d);
+    }
     // A numpy scalar is a strong 0-d operand.
     if let Some((sd, sv)) = np_scalar_descr(obj)? {
         let d = dtype.unwrap_or(sd.dt);
@@ -647,4 +672,215 @@ pub fn operand_for(
         return Ok(Some(array_from_any(obj, None, false)?));
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// datetime64 / timedelta64 coercion
+// ---------------------------------------------------------------------------
+
+use rnp_core::datetime as dtm;
+
+/// numpy's warning when an ISO string carries a timezone. It is a plain
+/// `UserWarning`, emitted once per parsed string.
+fn warn_timezone(py: Python<'_>) -> PyResult<()> {
+    pyo3::PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        std::ffi::CString::new(
+            "no explicit representation of timezones available for np.datetime64",
+        )
+        .unwrap()
+        .as_c_str(),
+        1,
+    )
+}
+
+/// One datetime-like element, plus the unit the source suggests (numpy's
+/// `out_bestunit`), which unit discovery for a generic `M8`/`m8` uses.
+fn datetime_element(
+    obj: &Bound<'_, PyAny>,
+    meta: dtm::DtMeta,
+    is_td: bool,
+) -> PyResult<(i64, Option<u8>)> {
+    let py = obj.py();
+    if obj.is_none() {
+        return Ok((dtm::NAT, None));
+    }
+    // One of our own datetime scalars, or a 0-d datetime array.
+    if let Some((d, s)) = np_scalar_descr(obj)? {
+        if d.dt.is_datetime_like() {
+            let raw = match s {
+                Scalar::Int(i) => i,
+                other => other.as_f64() as i64,
+            };
+            let src = dtm::meta_of(d.dt).unwrap();
+            let v = if src.is_generic() || meta.is_generic() {
+                raw
+            } else {
+                dtm::cast_value(d.dt, rnp_core::datetime::with_meta(d.dt, meta), raw)
+                    .map_err(crate::err)?
+            };
+            return Ok((v, Some(src.base)));
+        }
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        let text = s.to_str()?;
+        return parse_datetime_text(py, text, meta, is_td);
+    }
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        let text = String::from_utf8_lossy(b.as_bytes()).into_owned();
+        return parse_datetime_text(py, &text, meta, is_td);
+    }
+    // datetime.timedelta / datetime.date / datetime.datetime, recognised by
+    // attribute so that duck types work as they do in numpy.
+    if is_td && obj.hasattr(pyo3::intern!(py, "total_seconds"))? {
+        let days: i64 = obj.getattr(pyo3::intern!(py, "days"))?.extract()?;
+        let secs: i64 = obj.getattr(pyo3::intern!(py, "seconds"))?.extract()?;
+        let us: i64 = obj.getattr(pyo3::intern!(py, "microseconds"))?.extract()?;
+        let total_us = ((days * 86400 + secs) as i128) * 1_000_000 + us as i128;
+        let src = dtm::DtMeta::unit(dtm::UNIT_US);
+        let raw = total_us as i64;
+        let v = if meta.is_generic() {
+            raw
+        } else {
+            dtm::cast_timedelta(src, meta, raw).map_err(crate::err)?
+        };
+        return Ok((v, Some(dtm::UNIT_US)));
+    }
+    if !is_td && obj.hasattr(pyo3::intern!(py, "year"))? {
+        let mut dts = dtm::Dts::epoch();
+        dts.year = obj.getattr(pyo3::intern!(py, "year"))?.extract()?;
+        dts.month = obj.getattr(pyo3::intern!(py, "month"))?.extract()?;
+        dts.day = obj.getattr(pyo3::intern!(py, "day"))?.extract()?;
+        let mut best = dtm::UNIT_D;
+        if obj.hasattr(pyo3::intern!(py, "hour"))? {
+            dts.hour = obj.getattr(pyo3::intern!(py, "hour"))?.extract()?;
+            dts.min = obj.getattr(pyo3::intern!(py, "minute"))?.extract()?;
+            dts.sec = obj.getattr(pyo3::intern!(py, "second"))?.extract()?;
+            dts.us = obj.getattr(pyo3::intern!(py, "microsecond"))?.extract()?;
+            best = dtm::UNIT_US;
+        }
+        if meta.is_generic() {
+            // Unit discovery pass: the caller re-runs with the resolved unit.
+            return Ok((dtm::NAT, Some(best)));
+        }
+        let v = dtm::dts_to_dt64(meta, &dts).map_err(crate::err)?;
+        return Ok((v, Some(best)));
+    }
+    // A plain integer (or bool) is the raw count in the target's own unit.
+    if let Some(s) = scalar_from_py(obj) {
+        return Ok((
+            match s {
+                Scalar::Int(i) => i,
+                Scalar::Uint(u) => u as i64,
+                Scalar::Bool(b) => b as i64,
+                Scalar::Float(f) => {
+                    if f.is_finite() {
+                        f as i64
+                    } else {
+                        dtm::NAT
+                    }
+                }
+                Scalar::Complex(c) => c.re as i64,
+            },
+            None,
+        ));
+    }
+    Err(PyValueError::new_err(if is_td {
+        "Could not convert object to NumPy timedelta"
+    } else {
+        "Could not convert object to NumPy datetime"
+    }))
+}
+
+fn parse_datetime_text(
+    py: Python<'_>,
+    text: &str,
+    meta: dtm::DtMeta,
+    is_td: bool,
+) -> PyResult<(i64, Option<u8>)> {
+    if is_td {
+        if text.is_empty() || text.eq_ignore_ascii_case("nat") {
+            return Ok((dtm::NAT, None));
+        }
+        let v: i64 = text.trim().parse().map_err(|_| {
+            PyValueError::new_err("Could not convert object to NumPy timedelta")
+        })?;
+        return Ok((v, None));
+    }
+    let (dts, best, special, tz) = special_or_parse(py, text)?;
+    if tz {
+        warn_timezone(py)?;
+    }
+    if dts.is_nat() {
+        return Ok((dtm::NAT, Some(dtm::UNIT_GENERIC)));
+    }
+    if meta.is_generic() {
+        // Unit discovery pass: the caller re-runs with the resolved unit.
+        return Ok((dtm::NAT, Some(best)));
+    }
+    let _ = special;
+    let v = dtm::dts_to_dt64(meta, &dts).map_err(crate::err)?;
+    Ok((v, Some(best)))
+}
+
+/// `parse_iso8601` plus the two clock-reading special strings numpy accepts.
+pub fn special_or_parse(
+    py: Python<'_>,
+    text: &str,
+) -> PyResult<(dtm::Dts, u8, bool, bool)> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("today") || t.eq_ignore_ascii_case("now") {
+        let time = py.import("time")?;
+        let secs: f64 = time.call_method0("time")?.extract()?;
+        if t.eq_ignore_ascii_case("today") {
+            // numpy takes *local* midnight for 'today'.
+            let lt = time.call_method1("localtime", (secs,))?;
+            let mut dts = dtm::Dts::epoch();
+            dts.year = lt.getattr("tm_year")?.extract()?;
+            dts.month = lt.getattr("tm_mon")?.extract()?;
+            dts.day = lt.getattr("tm_mday")?.extract()?;
+            return Ok((dts, dtm::UNIT_D, true, false));
+        }
+        let dts = dtm::dt64_to_dts(dtm::DtMeta::unit(dtm::UNIT_S), secs as i64)
+            .map_err(crate::err)?;
+        return Ok((dts, dtm::UNIT_S, true, false));
+    }
+    let p = dtm::parse_iso8601(text).map_err(crate::err)?;
+    Ok((p.dts, p.bestunit, p.special, p.had_timezone))
+}
+
+/// Build a datetime64 / timedelta64 array from nested Python sequences.
+fn array_from_datetime(obj: &Bound<'_, PyAny>, dt: DType) -> PyResult<NdArray> {
+    let mut shape = Vec::new();
+    discover_shape(obj, &mut shape)?;
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::new();
+    if shape.is_empty() {
+        items.push(obj.clone());
+    } else {
+        collect_objects(obj, 0, &shape, &mut items)?;
+    }
+    let is_td = dt.is_timedelta();
+    let mut meta = dtm::meta_of(dt).unwrap();
+    if meta.is_generic() {
+        // numpy's unit discovery: the finest unit any element needs.
+        let mut best: Option<u8> = None;
+        for it in &items {
+            if let (_, Some(b)) = datetime_element(it, meta, is_td)? {
+                if b != dtm::UNIT_GENERIC {
+                    best = Some(best.map_or(b, |x| x.max(b)));
+                }
+            }
+        }
+        if let Some(b) = best {
+            meta = dtm::DtMeta::unit(b);
+        }
+    }
+    let out_dt = rnp_core::datetime::with_meta(dt, meta);
+    let mut vals = Vec::with_capacity(items.len());
+    for it in &items {
+        vals.push(Scalar::Int(datetime_element(it, meta, is_td)?.0));
+    }
+    let flat = NdArray::from_scalars(&vals, out_dt).map_err(crate::err)?;
+    flat.reshape(&shape).map_err(crate::err)
 }

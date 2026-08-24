@@ -24,6 +24,17 @@ pub enum Error {
         /// registered a richer factory.
         message: String,
     },
+    /// numpy's `_UFuncBinaryResolutionError` (also a `UFuncTypeError`),
+    /// raised by the datetime type resolvers when no loop combination fits:
+    /// `ufunc 'add' cannot use operands with types dtype('<M8[s]') and ...`.
+    UFuncBinaryResolution {
+        ufunc: String,
+        /// The two operand dtypes, as `dtype.str`-style strings.
+        dtypes: Vec<String>,
+        message: String,
+    },
+    OverflowError(String),
+    RuntimeError(String),
     NotImplemented(String),
 }
 
@@ -37,8 +48,11 @@ impl Error {
             | Error::IndexError(m)
             | Error::AxisError(m)
             | Error::DTypePromotionError(m)
+            | Error::OverflowError(m)
+            | Error::RuntimeError(m)
             | Error::NotImplemented(m) => m,
             Error::UFuncNoLoop { message, .. } => message,
+            Error::UFuncBinaryResolution { message, .. } => message,
         }
     }
 }
@@ -97,3 +111,15 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Build numpy's `_UFuncBinaryResolutionError` message for `ufunc` over two
+/// operand dtypes, spelled the way `repr(np.dtype(...))` spells them.
+pub fn ufunc_binary_resolution(ufunc: &str, a: &str, b: &str) -> Error {
+    Error::UFuncBinaryResolution {
+        ufunc: ufunc.to_string(),
+        dtypes: vec![a.to_string(), b.to_string()],
+        message: format!(
+            "ufunc {ufunc:?} cannot use operands with types dtype('{a}') and dtype('{b}')"
+        ),
+    }
+}

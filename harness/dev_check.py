@@ -14,6 +14,7 @@ Usage: .venv/bin/python harness/dev_check.py [--seed N]
 import argparse
 import itertools
 import math
+import operator
 import os
 import random
 import sys
@@ -1509,6 +1510,274 @@ def check_byteorder():
     eq("byteorder byteswap inplace bytes", w.tobytes(), _tobytes(g))
 
 
+
+# ---------------------------------------------------------------------------
+# M5: datetime64 / timedelta64
+# ---------------------------------------------------------------------------
+#
+# The port and real numpy are fed byte-identical operands and every result is
+# compared as (dtype, shape, bytes) -- or, when either side raises, as the
+# exception class name. That makes the "numpy refuses this unit pair" cases
+# (years/months against anything finer, and pairs whose conversion factor
+# overflows int64) part of the check rather than a hole in it.
+
+#: numpy's 13 real datetime units, coarse to fine.
+DT_UNITS = ["Y", "M", "W", "D", "h", "m", "s", "ms", "us", "ns", "ps", "fs",
+            "as"]
+
+_I64_MIN, _I64_MAX = -(2 ** 63), 2 ** 63 - 1
+
+#: Values that exercise NaT (`_I64_MIN`), both signs, and the ends of the
+#: int64 range where numpy's loops raise OverflowError.
+DT_EDGE_VALUES = [0, 1, -1, 2, -2, 7, -7, 1000, -1000,
+                  _I64_MIN, _I64_MIN + 1, _I64_MAX, _I64_MAX - 1,
+                  2 ** 31, -(2 ** 31), 2 ** 40, -(2 ** 40)]
+
+
+def _dt_arrays(spec, values):
+    """The same datetime-like array in both libraries."""
+    return np.array(values, spec), rnp.array(values, spec)
+
+
+def _outcome(fn, *args):
+    """`("ok", raw(value))` or `("exc", ExceptionClassName)`."""
+    try:
+        return ("ok", raw(fn(*args)))
+    except Exception as exc:  # noqa: BLE001
+        return ("exc", type(exc).__name__)
+
+
+def _agree(name, fn, np_args, rnp_args):
+    """One differential comparison of `fn(*np_args)` against `fn(*rnp_args)`."""
+    global CHECKS
+    CHECKS += 1
+    want = _outcome(fn, *np_args)
+    got = _outcome(fn, *rnp_args)
+    if want != got:
+        FAILURES.append((name, f"port {got!r} != numpy {want!r}"))
+
+
+#: The binary operators every datetime combination is checked under.
+_DT_OPS = [
+    ("+", operator.add), ("-", operator.sub), ("*", operator.mul),
+    ("/", operator.truediv), ("//", operator.floordiv), ("%", operator.mod),
+    ("==", operator.eq), ("!=", operator.ne), ("<", operator.lt),
+    ("<=", operator.le), (">", operator.gt), (">=", operator.ge),
+]
+
+
+def check_datetime_arith(rng, n_pairs=60):
+    """Binary arithmetic and comparisons over random datetime operands."""
+    picks = [(rng.choice(DT_UNITS), rng.choice(DT_UNITS))
+             for _ in range(n_pairs)]
+    # Plus every same-unit pair and the cross-group ones numpy refuses.
+    picks += [(u, u) for u in DT_UNITS]
+    picks += [("Y", "D"), ("M", "D"), ("Y", "M"), ("W", "D"), ("D", "ps"),
+              ("as", "s"), ("W", "ns"), ("ms", "as"), ("Y", "W")]
+
+    for ka, kb in itertools.product(["M8", "m8"], ["M8", "m8"]):
+        for ua, ub in picks:
+            va = [rng.choice(DT_EDGE_VALUES) for _ in range(4)]
+            vb = [rng.choice(DT_EDGE_VALUES) for _ in range(4)]
+            na, pa = _dt_arrays(f"{ka}[{ua}]", va)
+            nb, pb = _dt_arrays(f"{kb}[{ub}]", vb)
+            for label, fn in _DT_OPS:
+                _agree(f"datetime {ka}[{ua}] {label} {kb}[{ub}]",
+                       fn, (na, nb), (pa, pb))
+            _agree(f"datetime {ka}[{ua}] divmod-q {kb}[{ub}]",
+                   lambda x, y: divmod(x, y)[0], (na, nb), (pa, pb))
+            _agree(f"datetime {ka}[{ua}] divmod-r {kb}[{ub}]",
+                   lambda x, y: divmod(x, y)[1], (na, nb), (pa, pb))
+
+    # Mixed operands: datetime-likes against plain numbers.
+    for u in DT_UNITS:
+        vals = [rng.choice(DT_EDGE_VALUES) for _ in range(4)]
+        for kind in ("M8", "m8"):
+            n, p = _dt_arrays(f"{kind}[{u}]", vals)
+            for other in (3, -3, 0, True, 2.5, -0.5, 0.0):
+                for label, fn in _DT_OPS:
+                    _agree(f"datetime {kind}[{u}] {label} {other!r}",
+                           fn, (n, other), (p, other))
+                    _agree(f"datetime {other!r} {label} {kind}[{u}]",
+                           fn, (other, n), (other, p))
+
+
+def check_datetime_unary(rng):
+    """isnat, negative/absolute/sign, sort/argsort and the reductions."""
+    unary = [
+        ("isnat", lambda m, a: m.isnat(a)),
+        ("negative", lambda m, a: m.negative(a)),
+        ("absolute", lambda m, a: m.absolute(a)),
+        ("sign", lambda m, a: m.sign(a)),
+        ("sort", lambda m, a: m.sort(a)),
+        ("argsort", lambda m, a: m.argsort(a)),
+        ("min", lambda m, a: a.min()),
+        ("max", lambda m, a: a.max()),
+        ("sum", lambda m, a: a.sum()),
+        ("argmin", lambda m, a: a.argmin()),
+        ("argmax", lambda m, a: a.argmax()),
+        ("min axis0", lambda m, a: a.reshape(3, 2).min(axis=0)),
+        ("max axis1", lambda m, a: a.reshape(3, 2).max(axis=1)),
+        ("sum axis0", lambda m, a: a.reshape(3, 2).sum(axis=0)),
+    ]
+    for u in DT_UNITS:
+        for trial in range(3):
+            vals = [rng.choice(DT_EDGE_VALUES) for _ in range(6)]
+            for kind in ("M8", "m8"):
+                n, p = _dt_arrays(f"{kind}[{u}]", vals)
+                for label, fn in unary:
+                    _agree(f"datetime {kind}[{u}] {label} #{trial}",
+                           fn, (np, n), (rnp, p))
+                eq(f"datetime {kind}[{u}] repr #{trial}", repr(n), repr(p))
+                eq(f"datetime {kind}[{u}] str #{trial}", str(n), str(p))
+                eq(f"datetime {kind}[{u}] item #{trial}",
+                   [x for x in n.tolist()], [x for x in p.tolist()])
+
+
+def check_datetime_casts(rng):
+    """astype between every unit pair, plus the numeric, text and can_cast."""
+    for kind in ("M8", "m8"):
+        for ua, ub in itertools.product(DT_UNITS, DT_UNITS):
+            vals = [rng.choice(DT_EDGE_VALUES) for _ in range(4)]
+            n, p = _dt_arrays(f"{kind}[{ua}]", vals)
+            src, tgt = f"{kind}[{ua}]", f"{kind}[{ub}]"
+            _agree(f"datetime astype {src} -> {tgt}",
+                   lambda a, t: a.astype(t), (n, tgt), (p, tgt))
+            for casting in ("safe", "same_kind", "unsafe"):
+                eq(f"datetime can_cast {src} -> {tgt} {casting}",
+                   bool(np.can_cast(src, tgt, casting)),
+                   bool(rnp.can_cast(src, tgt, casting)))
+            _agree(f"datetime promote_types {src} {tgt}",
+                   lambda m, x, y: str(m.promote_types(x, y)),
+                   (np, src, tgt), (rnp, src, tgt))
+
+        for u in DT_UNITS:
+            vals = [rng.choice(DT_EDGE_VALUES) for _ in range(4)]
+            n, p = _dt_arrays(f"{kind}[{u}]", vals)
+            for tgt in ("int64", "int32", "float64", "bool"):
+                _agree(f"datetime astype {kind}[{u}] -> {tgt}",
+                       lambda a, t: a.astype(t), (n, tgt), (p, tgt))
+            _agree(f"datetime astype int64 -> {kind}[{u}]",
+                   lambda a, t: a.astype(t),
+                   (np.array(vals, "int64"), f"{kind}[{u}]"),
+                   (rnp.array(vals, "int64"), f"{kind}[{u}]"))
+            eq(f"datetime astype {kind}[{u}] -> U",
+               n.astype("U").tolist(), p.astype("U").tolist())
+            eq(f"datetime astype {kind}[{u}] -> U dtype",
+               str(n.astype("U").dtype), str(p.astype("U").dtype))
+            eq(f"datetime astype {kind}[{u}] -> object",
+               n.astype(object).tolist(), p.astype(object).tolist())
+            eq(f"datetime datetime_data {kind}[{u}]",
+               np.datetime_data(np.dtype(f"{kind}[{u}]")),
+               rnp.datetime_data(rnp.dtype(f"{kind}[{u}]")))
+
+        # Unit multipliers are part of the metadata, not of the value.
+        base = "s" if kind == "m8" else "D"
+        for num in (1, 2, 7, 1000, 2 ** 31 - 1):
+            spec = f"{kind}[{num}{base}]"
+            eq(f"datetime dtype repr {spec}",
+               repr(np.dtype(spec)), repr(rnp.dtype(spec)))
+            eq(f"datetime dtype str {spec}",
+               np.dtype(spec).str, rnp.dtype(spec).str)
+            eq(f"datetime dtype name {spec}",
+               np.dtype(spec).name, rnp.dtype(spec).name)
+            eq(f"datetime datetime_data {spec}",
+               np.datetime_data(np.dtype(spec)),
+               rnp.datetime_data(rnp.dtype(spec)))
+            for other in (f"{kind}[{base}]", f"{kind}[3{base}]"):
+                _agree(f"datetime promote {spec} {other}",
+                       lambda m, x, y: str(m.promote_types(x, y)),
+                       (np, spec, other), (rnp, spec, other))
+            na, pa = _dt_arrays(spec, [1, -1, 0, _I64_MIN])
+            _agree(f"datetime astype {spec} -> {kind}[{base}]",
+                   lambda a, t: a.astype(t),
+                   (na, f"{kind}[{base}]"), (pa, f"{kind}[{base}]"))
+            eq(f"datetime repr array {spec}", repr(na), repr(pa))
+        # A multiplier numpy rejects (above INT_MAX).
+        _agree(f"datetime dtype {kind}[3000000000ps]",
+               lambda m: str(m.dtype(f"{kind}[3000000000ps]")), (np,), (rnp,))
+
+
+def check_datetime_strings(rng):
+    """ISO parsing, scalar repr/str, and `datetime_as_string`."""
+    texts = [
+        "2020", "2020-01", "2020-01-02", "2020-01-02T03",
+        "2020-01-02T03:04", "2020-01-02T03:04:05",
+        "2020-01-02T03:04:05.1", "2020-01-02T03:04:05.123456",
+        "2020-01-02T03:04:05.123456789", "2020-01-02 03:04:05",
+        "1970-01-01", "1969-12-31", "0001-01-01", "9999-12-31",
+        "-0001-01-01", "NaT", "nat", "", "2020-13-01", "2020-02-30",
+        "not a date", "2020-01-02T25", "2020-01-02T03:04:60",
+    ]
+    for t in texts:
+        _agree(f"datetime64({t!r}) dtype",
+               lambda m, s: str(m.datetime64(s).dtype), (np, t), (rnp, t))
+        _agree(f"datetime64({t!r}) repr",
+               lambda m, s: repr(m.datetime64(s)), (np, t), (rnp, t))
+        _agree(f"datetime64({t!r}) str",
+               lambda m, s: str(m.datetime64(s)), (np, t), (rnp, t))
+        for u in DT_UNITS:
+            _agree(f"datetime64({t!r}, {u!r})",
+                   lambda m, s, uu: raw(m.datetime64(s, uu)),
+                   (np, t, u), (rnp, t, u))
+            _agree(f"datetime64({t!r}, {u!r}) repr",
+                   lambda m, s, uu: repr(m.datetime64(s, uu)),
+                   (np, t, u), (rnp, t, u))
+            _agree(f"array([{t!r}], M8[{u}])",
+                   lambda m, s, uu: m.array([s], f"M8[{uu}]"),
+                   (np, t, u), (rnp, t, u))
+
+    for u in DT_UNITS:
+        arr_texts = ["2020-01-02", "NaT", "1970-01-01"]
+        n = np.array(arr_texts, f"M8[{u}]")
+        p = rnp.array(arr_texts, f"M8[{u}]")
+        for unit in (None, "s", "D", "auto"):
+            for tz in ("naive", "UTC"):
+                _agree(f"datetime_as_string M8[{u}] unit={unit} tz={tz}",
+                       lambda m, a: m.datetime_as_string(
+                           a, unit=unit, timezone=tz).tolist(),
+                       (np, n), (rnp, p))
+
+    for u in DT_UNITS:
+        for v in (0, 1, -3, 10 ** 9, _I64_MIN):
+            _agree(f"timedelta64({v}, {u!r}) repr",
+                   lambda m, x, uu: repr(m.timedelta64(x, uu)),
+                   (np, v, u), (rnp, v, u))
+            _agree(f"timedelta64({v}, {u!r}) str",
+                   lambda m, x, uu: str(m.timedelta64(x, uu)),
+                   (np, v, u), (rnp, v, u))
+            _agree(f"datetime64({v}, {u!r}) repr",
+                   lambda m, x, uu: repr(m.datetime64(x, uu)),
+                   (np, v, u), (rnp, v, u))
+        _agree(f"timedelta64('NaT', {u!r}) repr",
+               lambda m, uu: repr(m.timedelta64("NaT", uu)), (np, u), (rnp, u))
+        # A unit multiplier in the tuple form.
+        _agree(f"timedelta64(2, ({u!r}, 7)) repr",
+               lambda m, uu: repr(m.timedelta64(2, (uu, 7))), (np, u), (rnp, u))
+
+    # datetime.date / datetime.datetime / datetime.timedelta sources.
+    import datetime as _pydt
+    for src in (_pydt.date(2020, 1, 2), _pydt.datetime(2020, 1, 2, 3, 4, 5),
+                _pydt.datetime(1969, 7, 20, 20, 17, 40)):
+        for u in ("D", "s", "us", "ns", "Y"):
+            _agree(f"datetime64({src!r}, {u!r})",
+                   lambda m, s, uu: raw(m.datetime64(s, uu)),
+                   (np, src, u), (rnp, src, u))
+    for td in (_pydt.timedelta(days=3), _pydt.timedelta(seconds=-5),
+               _pydt.timedelta(microseconds=7)):
+        for u in ("s", "us", "ns", "D"):
+            _agree(f"timedelta64({td!r}, {u!r})",
+                   lambda m, s, uu: raw(m.timedelta64(s, uu)),
+                   (np, td, u), (rnp, td, u))
+
+
+def check_datetime(rng):
+    check_datetime_arith(rng)
+    check_datetime_unary(rng)
+    check_datetime_casts(rng)
+    check_datetime_strings(rng)
+
+
 def run_m3_sections():
     """All the M3 sections, each isolated so one crash cannot hide the rest."""
     if not load_shim():
@@ -1523,6 +1792,7 @@ def run_m3_sections():
         ("errstate", check_errstate),
         ("ulp", check_ulp),
         ("byte order", check_byteorder),
+        ("datetime64", lambda: check_datetime(random.Random(20260816))),
     ]
     for name, fn in sections:
         try:

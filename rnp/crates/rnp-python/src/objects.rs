@@ -74,9 +74,28 @@ fn is_seq(obj: &Bound<'_, PyAny>) -> bool {
 }
 
 fn discover(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) {
-    if !is_seq(obj) {
+    // The ragged check re-descends every sibling, so the walk is exponential
+    // in the nesting depth. Real inputs are a handful of levels deep; a
+    // co-recursive list (gh-11154) is infinitely deep, so the walk also
+    // carries a hard budget on the number of nodes it will visit.
+    let mut budget: u32 = 1_000_000;
+    discover_depth(obj, shape, 0, &mut budget)
+}
+
+/// numpy's `NPY_MAXDIMS` is a hard recursion bound: a co-recursive list
+/// (gh-11154) is infinitely deep, and without the cap the ragged check --
+/// which restarts `discover` with a fresh vector at every level -- runs the
+/// C stack out.
+fn discover_depth(
+    obj: &Bound<'_, PyAny>,
+    shape: &mut Vec<isize>,
+    depth: usize,
+    budget: &mut u32,
+) {
+    if !is_seq(obj) || depth >= 64 || *budget == 0 {
         return;
     }
+    *budget -= 1;
     let seq = match obj.cast::<pyo3::types::PySequence>() {
         Ok(s) => s,
         Err(_) => return,
@@ -90,8 +109,8 @@ fn discover(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) {
         if let Ok(first) = seq.get_item(0) {
             // Ragged input stops the shape here, as numpy's does.
             let mut sub = Vec::new();
-            discover(&first, &mut sub);
-            if !sub.is_empty() && ragged(&seq, n, &sub) {
+            discover_depth(&first, &mut sub, depth + 1, budget);
+            if !sub.is_empty() && ragged(&seq, n, &sub, depth + 1, budget) {
                 return;
             }
             shape.extend(sub);
@@ -99,14 +118,20 @@ fn discover(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) {
     }
 }
 
-fn ragged(seq: &Bound<'_, pyo3::types::PySequence>, n: usize, sub: &[isize]) -> bool {
+fn ragged(
+    seq: &Bound<'_, pyo3::types::PySequence>,
+    n: usize,
+    sub: &[isize],
+    depth: usize,
+    budget: &mut u32,
+) -> bool {
     for i in 0..n {
         let item = match seq.get_item(i) {
             Ok(x) => x,
             Err(_) => return true,
         };
         let mut s = Vec::new();
-        discover(&item, &mut s);
+        discover_depth(&item, &mut s, depth, budget);
         if s != sub {
             return true;
         }

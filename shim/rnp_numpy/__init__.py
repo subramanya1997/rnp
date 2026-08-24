@@ -860,6 +860,13 @@ from ._core import _exceptions as _core_exceptions  # noqa: E402,F401
 from ._core.records import record  # noqa: E402,F401
 
 from . import __config__, lib, ma, random  # noqa: E402,F401
+from ._datetime import (  # noqa: E402,F401
+    busday_count, busday_offset, busdaycalendar, datetime_as_string,
+    datetime_data, is_busday, isnat,
+)
+# `arange` gains datetime64/timedelta64 ranges; the numeric path is unchanged
+# (the wrapper delegates straight to the engine when no operand is time-like).
+from ._datetime import arange  # noqa: E402,F401
 from ._core import multiarray  # noqa: E402,F401
 from . import dtypes  # noqa: E402,F401
 from ._stubs import inert_class as _inert_class  # noqa: E402
@@ -1143,13 +1150,11 @@ for _name in (
     "may_share_memory", "apply_along_axis", "asanyarray", "ascontiguousarray",
     "asfortranarray", "require", "nan_to_num",  "angle",
     "asmatrix", "bmat", "poly1d", "recarray", "chararray",
-    "vectorize", "frompyfunc", "busday_count", "busday_offset", "is_busday",
-    "datetime_data", "base_repr", "binary_repr", "info", "who",
-    "busdaycalendar",
+    "vectorize", "frompyfunc",
+    "base_repr", "binary_repr", "info", "who",
     "from_dlpack",
     "nested_iters",
     "lexsort", "bincount", "ravel_multi_index", "unravel_index",
-    "datetime_as_string",
     "setdiff1d", "union1d", "intersect1d", "in1d", "isin", "genfromtxt",
     "memmap", "nditer", "broadcast", "errstate_unavailable",
 ):

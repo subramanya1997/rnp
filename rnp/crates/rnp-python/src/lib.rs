@@ -2,7 +2,7 @@
 
 use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use rnp_core::casting::{Casting, TypeArg, WeakKind};
 use rnp_core::reduce::ReduceOp;
@@ -70,7 +70,31 @@ pub(crate) fn err(e: rnp_core::Error) -> PyErr {
         rnp_core::Error::AxisError(m) => PyValueError::new_err(m),
         rnp_core::Error::DTypePromotionError(m) => PyValueError::new_err(m),
         rnp_core::Error::NotImplemented(m) => PyNotImplementedError::new_err(m),
+        rnp_core::Error::OverflowError(m) => pyo3::exceptions::PyOverflowError::new_err(m),
+        rnp_core::Error::RuntimeError(m) => pyo3::exceptions::PyRuntimeError::new_err(m),
+        rnp_core::Error::UFuncBinaryResolution {
+            ufunc,
+            dtypes,
+            message,
+        } => binary_resolution_err(ufunc, dtypes, message),
     }
+}
+
+/// numpy's `_UFuncBinaryResolutionError`, built through the shim's factory so
+/// that the exception really is a `UFuncTypeError` subclass.
+fn binary_resolution_err(ufunc: String, dtypes: Vec<String>, fallback: String) -> PyErr {
+    Python::attach(|py| {
+        let Some(d) = ERROR_FACTORIES.get() else {
+            return PyTypeError::new_err(fallback);
+        };
+        match d.bind(py).get_item("ufunc_binary_resolution") {
+            Ok(Some(f)) => match f.call1((ufunc, dtypes)) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(e) => e,
+            },
+            _ => PyTypeError::new_err(fallback),
+        }
+    })
 }
 
 fn wrap(py: Python<'_>, a: NdArray) -> PyResult<Py<PyNdArray>> {
@@ -370,7 +394,59 @@ fn promote_types(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDType
         })?;
         return Ok(PyDType::from_descr(Descr::native(p)));
     }
+    if da.dt.is_datetime_like() || db.dt.is_datetime_like() {
+        // Datetime promotion has its own failure modes (nonlinear units,
+        // multiplier overflow) with numpy's own exception types.
+        if da.dt.is_datetime_like() && db.dt.is_datetime_like() {
+            let p = rnp_core::datetime::promote_meta(da.dt, db.dt).map_err(err)?;
+            return Ok(PyDType::from_descr(Descr::native(p)));
+        }
+        let p = rnp_core::dtype::promote_datetime(da.dt, db.dt).ok_or_else(|| {
+            promotion_error(da.dt, db.dt)
+        })?;
+        return Ok(PyDType::from_descr(Descr::native(p)));
+    }
     Ok(PyDType::new(rnp_core::promote(da.dt, db.dt)))
+}
+
+/// numpy's `DTypePromotionError` text for two DTypes with no common type.
+fn promotion_error(a: rnp_core::dtype::DType, b: rnp_core::dtype::DType) -> PyErr {
+    err(rnp_core::Error::DTypePromotionError(format!(
+        "The DTypes <class 'numpy.dtypes.{}'> and <class 'numpy.dtypes.{}'> do \
+         not have a common DType. For example they cannot be stored in a \
+         single array unless the dtype is `object`.",
+        dtype_class_name(a),
+        dtype_class_name(b)
+    )))
+}
+
+fn dtype_class_name(d: rnp_core::dtype::DType) -> String {
+    use rnp_core::dtype::DType;
+    match d {
+        DType::DateTime(_) => "DateTime64DType".into(),
+        DType::TimeDelta(_) => "TimeDelta64DType".into(),
+        DType::Bool => "BoolDType".into(),
+        DType::Object => "ObjectDType".into(),
+        DType::Bytes(_) => "BytesDType".into(),
+        DType::Str(_) => "StrDType".into(),
+        DType::Void(_) | DType::Struct(_) | DType::SubArray(_) => "VoidDType".into(),
+        other => {
+            let n = other.name();
+            let mut s = String::new();
+            if n.starts_with("uint") {
+                s.push_str("UInt");
+                s.push_str(&n[4..]);
+            } else {
+                let mut c = n.chars();
+                if let Some(f) = c.next() {
+                    s.extend(f.to_uppercase());
+                }
+                s.extend(c);
+            }
+            s.push_str("DType");
+            s
+        }
+    }
 }
 
 /// Classify one `result_type` argument under NEP 50.
@@ -621,6 +697,206 @@ fn mean<'py>(
     arr.bind(py).call_method("mean", (), Some(&kwargs))
 }
 
+// ---------------------------------------------------------------------------
+// datetime64 / timedelta64 support
+// ---------------------------------------------------------------------------
+
+/// `np.datetime_data(dtype)`: the `(unit, count)` pair.
+#[pyfunction]
+fn datetime_data(dtype: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
+    let d = descr_from_any(dtype)?;
+    let m = rnp_core::datetime::meta_of(d.dt).ok_or_else(|| {
+        PyTypeError::new_err(format!("cannot get datetime metadata from non-datetime {d:?}"))
+    })?;
+    Ok((
+        rnp_core::datetime::UNIT_NAMES[m.base as usize].to_string(),
+        m.num,
+    ))
+}
+
+/// `np.isnat`.
+#[pyfunction]
+fn isnat(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyNdArray>> {
+    let arr = array_from_any(a, None, false)?;
+    wrap(py, rnp_core::datetime_ops::isnat(&arr).map_err(err)?)
+}
+
+/// Every element of a datetime-like array as its numpy `str()` rendering.
+///
+/// This is the engine half of `datetime_as_string`, of `astype('U')` and of
+/// `str(np.datetime64(...))`; `unit` of `None` means "the array's own unit",
+/// and `"auto"` is numpy's shortest-lossless choice.
+#[pyfunction]
+#[pyo3(signature = (a, unit = None, timezone = "naive", casting = "same_kind"))]
+fn _datetime_strings(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+    unit: Option<&str>,
+    timezone: &str,
+    casting: &str,
+) -> PyResult<Py<PyAny>> {
+    use rnp_core::datetime as dtm;
+    let arr = array_from_any(a, None, false)?;
+    let dt = arr.dtype();
+    let meta = dtm::meta_of(dt).ok_or_else(|| {
+        PyTypeError::new_err("cannot render a non-datetime array as datetime strings")
+    })?;
+    let cast = rnp_core::casting::Casting::from_str(casting)
+        .ok_or_else(|| PyValueError::new_err(format!("casting must be one of ... got {casting}")))?;
+    let utc = match timezone {
+        "naive" => false,
+        "UTC" => true,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "Unsupported timezone input {other:?}: only 'naive' and 'UTC' are supported"
+            )))
+        }
+    };
+    let base = match unit {
+        None => Some(meta.base),
+        Some("auto") => None,
+        Some(u) => Some(dtm::parse_unit(u).ok_or_else(|| {
+            PyValueError::new_err(format!("Invalid datetime unit {u:?} in metadata"))
+        })?),
+    };
+    let n = arr.to_native();
+    let out = PyList::empty(py);
+    for off in rnp_core::iter::offsets(&n.shape, &n.strides, n.byte_offset) {
+        let v = match n.read_at(off) {
+            rnp_core::Scalar::Int(i) => i,
+            s => s.as_f64() as i64,
+        };
+        let text = if dt.is_timedelta() {
+            dtm::timedelta_str(meta, v)
+        } else if v == dtm::NAT {
+            "NaT".to_string()
+        } else {
+            let dts = dtm::dt64_to_dts(meta, v).map_err(err)?;
+            dtm::make_iso8601(&dts, base, utc, cast).map_err(err)?
+        };
+        out.append(text)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+/// The `S`/`U` width numpy gives `arr.astype('U')` for a datetime-like array.
+#[pyfunction]
+fn _datetime_string_len(dtype: &Bound<'_, PyAny>) -> PyResult<usize> {
+    let d = descr_from_any(dtype)?;
+    Ok(rnp_core::datetime::string_cast_len(d.dt))
+}
+
+/// `arr.astype(object)` for a datetime-like array: python `date`/`datetime`
+/// objects for datetime64, `timedelta` for the units it can express, plain
+/// ints for the rest, and `None` for NaT — exactly what numpy hands back.
+#[pyfunction]
+fn _datetime_objects(py: Python<'_>, a: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    use rnp_core::datetime as dtm;
+    let arr = array_from_any(a, None, false)?;
+    let dt = arr.dtype();
+    let meta = dtm::meta_of(dt)
+        .ok_or_else(|| PyTypeError::new_err("not a datetime array"))?;
+    let dtmod = py.import("datetime")?;
+    let n = arr.to_native();
+    let out = PyList::empty(py);
+    for off in rnp_core::iter::offsets(&n.shape, &n.strides, n.byte_offset) {
+        let v = match n.read_at(off) {
+            rnp_core::Scalar::Int(i) => i,
+            s => s.as_f64() as i64,
+        };
+        if v == dtm::NAT {
+            out.append(py.None())?;
+            continue;
+        }
+        if dt.is_timedelta() {
+            match dtm::timedelta_parts(meta, v) {
+                Some((days, secs, us)) => {
+                    let td = dtmod.getattr("timedelta")?.call1((days, secs, us))?;
+                    out.append(td)?;
+                }
+                // Y/M and the sub-microsecond units have no `timedelta`
+                // representation, so numpy hands back the raw integer.
+                None => out.append(v)?,
+            }
+            continue;
+        }
+        // Years and months are out of `datetime`'s range as *offsets*, and
+        // anything finer than microseconds cannot be represented, so numpy
+        // returns the raw integer for those.
+        if meta.base < dtm::UNIT_D || meta.base > dtm::UNIT_US {
+            out.append(v)?;
+            continue;
+        }
+        let dts = dtm::dt64_to_dts(meta, v).map_err(err)?;
+        if dts.year < 1 || dts.year > 9999 {
+            out.append(v)?;
+            continue;
+        }
+        let obj = if meta.base <= dtm::UNIT_D {
+            dtmod
+                .getattr("date")?
+                .call1((dts.year, dts.month, dts.day))?
+        } else {
+            dtmod.getattr("datetime")?.call1((
+                dts.year, dts.month, dts.day, dts.hour, dts.min, dts.sec, dts.us,
+            ))?
+        };
+        out.append(obj)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+/// The broken-down calendar fields of one datetime-like value.
+///
+/// For `M8` this is numpy's `npy_datetimestruct`
+/// `(year, month, day, hour, min, sec, us, ps, as)`; for `m8` it is
+/// `npy_timedeltastruct` padded into the same shape
+/// `(0, 0, day, 0, 0, sec, us, ps, as)`. `None` for NaT, and for a
+/// timedelta whose unit has no struct form.
+#[pyfunction]
+fn _datetime_struct(
+    py: Python<'_>,
+    a: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    use rnp_core::datetime as dtm;
+    let arr = array_from_any(a, None, false)?;
+    let dt = arr.dtype();
+    let meta =
+        dtm::meta_of(dt).ok_or_else(|| PyTypeError::new_err("not a datetime array"))?;
+    let n = arr.to_native();
+    let out = PyList::empty(py);
+    for off in rnp_core::iter::offsets(&n.shape, &n.strides, n.byte_offset) {
+        let v = match n.read_at(off) {
+            rnp_core::Scalar::Int(i) => i,
+            s => s.as_f64() as i64,
+        };
+        if v == rnp_core::datetime::NAT {
+            out.append(py.None())?;
+            continue;
+        }
+        if dt.is_timedelta() {
+            match dtm::timedelta_struct(meta, v) {
+                Some((d, s, u, p, a_)) => {
+                    out.append((0i64, 0i32, d, 0i32, 0i32, s, u, p, a_))?
+                }
+                None => out.append(py.None())?,
+            }
+            continue;
+        }
+        let s = dtm::dt64_to_dts(meta, v).map_err(err)?;
+        out.append((
+            s.year, s.month, s.day, s.hour, s.min, s.sec, s.us, s.ps, s.as_,
+        ))?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+/// Install the shim's `datetime64`/`timedelta64` scalar builder.
+#[pyfunction]
+fn _register_datetime_factory(f: Py<PyAny>) {
+    pydtype::register_datetime_factory(f);
+}
+
 /// Install the shim's per-dtype `_wrap` callables for the scalar fast path.
 #[pyfunction]
 fn _register_scalar_wraps(wraps: Vec<Py<PyAny>>) {
@@ -687,6 +963,12 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(greater_equal, m)?)?;
 
     m.add_function(wrap_pyfunction!(promote_types, m)?)?;
+    m.add_function(wrap_pyfunction!(datetime_data, m)?)?;
+    m.add_function(wrap_pyfunction!(isnat, m)?)?;
+    m.add_function(wrap_pyfunction!(_datetime_strings, m)?)?;
+    m.add_function(wrap_pyfunction!(_datetime_string_len, m)?)?;
+    m.add_function(wrap_pyfunction!(_datetime_objects, m)?)?;
+    m.add_function(wrap_pyfunction!(_datetime_struct, m)?)?;
     m.add_function(wrap_pyfunction!(can_cast, m)?)?;
     m.add_function(wrap_pyfunction!(min_scalar_type, m)?)?;
     m.add_function(wrap_pyfunction!(common_type, m)?)?;
@@ -703,6 +985,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_dtype_table, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_types, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_wraps, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_datetime_factory, m)?)?;
     ufuncs::register(m)?;
     linalgops::register(m)?;
 

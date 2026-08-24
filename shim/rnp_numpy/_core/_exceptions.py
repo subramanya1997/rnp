@@ -190,6 +190,18 @@ def _no_loop_error(ufunc_name, dtype_names):
     return _UFuncNoLoopError(ufunc, classes + (None,) * ufunc.nout)
 
 
+def _binary_resolution_error(ufunc_name, dtype_strs):
+    """Build `_UFuncBinaryResolutionError` from the engine's dtype strings.
+
+    This is what the datetime type resolvers raise when no loop combination
+    fits, e.g. ``np.datetime64(1, 's') + np.datetime64(1, 's')``.
+    """
+    from .. import dtype as _dtype
+    from .._ufunc import ALL as _UFUNCS
+    ufunc = _UFUNCS[ufunc_name]
+    return _UFuncBinaryResolutionError(ufunc, tuple(_dtype(s) for s in dtype_strs))
+
+
 def _install_error_factories():
     # The engine-side hook is optional: an older/mid-rebuild `_rnp` may not
     # export it yet.  Registering is a pure enhancement (it upgrades the
@@ -198,7 +210,8 @@ def _install_error_factories():
     setter = getattr(_rnp, "_set_error_factories", None)
     if setter is None:
         return
-    setter({"ufunc_no_loop": _no_loop_error})
+    setter({"ufunc_no_loop": _no_loop_error,
+            "ufunc_binary_resolution": _binary_resolution_error})
 
 
 _install_error_factories()

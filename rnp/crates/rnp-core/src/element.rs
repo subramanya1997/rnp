@@ -471,6 +471,15 @@ macro_rules! dispatch_dtype {
                 type $T = $crate::element::C64v;
                 $body
             }
+            // datetime64 / timedelta64 are stored as int64; the *unit* is
+            // metadata, so every generic loop (copy, indexing, sort, buffer
+            // access) can treat them as i64. The operations where the unit
+            // matters -- casting and arithmetic -- intercept before they get
+            // here, in `crate::datetime` and `crate::ops`.
+            $crate::dtype::DType::DateTime(_) | $crate::dtype::DType::TimeDelta(_) => {
+                type $T = i64;
+                $body
+            }
             // Unreachable: every caller guards on `DType::is_numeric` first,
             // because flexible dtypes have no scalar element type.
             other => panic!("dispatch_dtype: {other:?} is not a numeric dtype"),

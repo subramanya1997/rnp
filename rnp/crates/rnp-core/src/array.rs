@@ -757,6 +757,12 @@ impl NdArray {
         if dtype == self.dtype() {
             return self.copy();
         }
+        if self.dtype().is_datetime_like() || dtype.is_datetime_like() {
+            // The *unit* is metadata, so a datetime cast is a scale, not a
+            // reinterpretation; `dispatch_dtype!` would treat both sides as
+            // plain i64 and silently keep the wrong number.
+            return self.astype_datetime(dtype);
+        }
         let mut out = NdArray::new_uninit(self.shape.clone(), dtype).expect("astype alloc");
         let n = self.size();
         if self.flags.c_contiguous {
@@ -788,6 +794,72 @@ impl NdArray {
         }
         out.update_flags();
         out
+    }
+
+    /// `astype`, surfacing the errors only the datetime casts can raise
+    /// (`OverflowError` when a unit conversion leaves the int64 range).
+    pub fn try_astype(&self, dtype: DType) -> Result<NdArray> {
+        if !(self.dtype().is_datetime_like() || dtype.is_datetime_like()) || dtype == self.dtype() {
+            return Ok(self.astype(dtype));
+        }
+        let src = self.to_native();
+        let mut out = src.astype_datetime_res(dtype)?;
+        out.update_flags();
+        Ok(out)
+    }
+
+    /// The infallible wrapper `astype` needs: an element that cannot be
+    /// converted becomes NaT, which is what numpy's value is when its own
+    /// conversion fails (it raises, and the buffer keeps the sentinel).
+    fn astype_datetime(&self, dtype: DType) -> NdArray {
+        match self.astype_datetime_res(dtype) {
+            Ok(a) => a,
+            Err(_) => {
+                let mut out =
+                    NdArray::new_uninit(self.shape.clone(), dtype).expect("astype alloc");
+                let isz = dtype.itemsize() as isize;
+                for k in 0..self.size() as isize {
+                    out.write_at(k * isz, Scalar::Int(crate::datetime::NAT));
+                }
+                out.update_flags();
+                out
+            }
+        }
+    }
+
+    fn astype_datetime_res(&self, dtype: DType) -> Result<NdArray> {
+        use crate::datetime as dtm;
+        let src_dt = self.dtype();
+        let mut out = NdArray::new_uninit(self.shape.clone(), dtype)?;
+        let isz = dtype.itemsize() as isize;
+        let mut k = 0isize;
+        let src_is_dt = src_dt.is_datetime_like();
+        let dst_is_dt = dtype.is_datetime_like();
+        for off in crate::iter::offsets(&self.shape, &self.strides, self.byte_offset) {
+            let v = match (src_is_dt, dst_is_dt) {
+                (true, true) => {
+                    let raw = match self.read_at(off) {
+                        Scalar::Int(i) => i,
+                        s => s.as_f64() as i64,
+                    };
+                    Scalar::Int(dtm::cast_value(src_dt, dtype, raw)?)
+                }
+                // datetime-like -> numeric: the raw int64 goes through the
+                // ordinary numeric cast.
+                (true, false) => self.read_at(off),
+                // numeric -> datetime-like: numpy's float loop lands on NaT
+                // for a non-finite value rather than on 0.
+                (false, true) => match self.read_at(off) {
+                    Scalar::Float(f) if !f.is_finite() => Scalar::Int(dtm::NAT),
+                    s => s,
+                },
+                (false, false) => unreachable!(),
+            };
+            out.write_at(k * isz, v);
+            k += 1;
+        }
+        out.update_flags();
+        Ok(out)
     }
 
     /// `astype` to a full descriptor: cast the values through the native

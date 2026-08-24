@@ -57,6 +57,8 @@ pub enum UnOp {
     IsNan,
     IsInf,
     IsFinite,
+    /// `np.isnat`: defined only for datetime64/timedelta64.
+    IsNat,
     Signbit,
     Spacing,
     BitwiseCount,
@@ -107,6 +109,7 @@ impl UnOp {
             IsNan => "isnan",
             IsInf => "isinf",
             IsFinite => "isfinite",
+            IsNat => "isnat",
             Signbit => "signbit",
             Spacing => "spacing",
             BitwiseCount => "bitwise_count",
@@ -157,6 +160,7 @@ impl UnOp {
             "isnan" => IsNan,
             "isinf" => IsInf,
             "isfinite" => IsFinite,
+            "isnat" => IsNat,
             "signbit" => Signbit,
             "spacing" => Spacing,
             "bitwise_count" => BitwiseCount,
@@ -169,7 +173,12 @@ impl UnOp {
     fn returns_bool(self) -> bool {
         matches!(
             self,
-            UnOp::IsNan | UnOp::IsInf | UnOp::IsFinite | UnOp::Signbit | UnOp::LogicalNot
+            UnOp::IsNan
+                | UnOp::IsInf
+                | UnOp::IsFinite
+                | UnOp::IsNat
+                | UnOp::Signbit
+                | UnOp::LogicalNot
         )
     }
 
@@ -922,6 +931,17 @@ fn unary_swapped(a: &NdArray, op: UnOp) -> Result<NdArray> {
 }
 
 fn unary_native(a: &NdArray, op: UnOp) -> Result<NdArray> {
+    if a.dtype().is_datetime_like() {
+        // Only `negative`/`positive`/`absolute`/`sign`/`isfinite` have
+        // datetime loops, and only for timedelta64.
+        return crate::datetime_ops::unary(a, op.name());
+    }
+    if op == UnOp::IsNat {
+        // numpy's `isnat` resolver rejects everything else by name.
+        return Err(Error::TypeError(
+            "ufunc 'isnat' is only defined for np.datetime64 and np.timedelta64.".into(),
+        ));
+    }
     if a.dtype().is_flexible() || a.dtype().is_object() {
         return Err(unsupported(op));
     }

@@ -802,6 +802,17 @@ def _as_array_arg(cls, value, extra, kw):
 
 def _cast(cls, value, *extra, **kw):
     """numpy's scalar constructor coercion."""
+    if cls.dtype.kind == "c" and not kw:
+        # `complexfloating` takes an optional imaginary part, exactly as
+        # Python's `complex` does: `np.complex64(1, np.nan)`.
+        if len(extra) == 1:
+            re = _cast(cls, value)
+            im = _cast(cls, extra[0])
+            return complex(_builtins.complex(re).real,
+                           _builtins.complex(im).real)
+        if len(extra) > 1:
+            raise TypeError(
+                f"function takes at most 2 arguments ({1 + len(extra)} given)")
     if extra or kw:
         raise TypeError(
             f"{cls.__name__}() takes at most 1 argument "
@@ -1426,46 +1437,331 @@ class object_(generic, metaclass=_ScalarMeta):
         return value
 
 
-class datetime64(generic, metaclass=_FlexMeta, char="M8"):
-    """Descriptor-level only: `np.dtype('M8[ns]')` constructs, but the port
-    has no datetime storage, so instances carry their argument unchanged."""
+#: numpy's `_datetime_verbose_strings`, used by `str(np.timedelta64(...))`.
+_TD_VERBOSE = {
+    "Y": "years", "M": "months", "W": "weeks", "D": "days", "h": "hours",
+    "m": "minutes", "s": "seconds", "ms": "milliseconds",
+    "us": "microseconds", "ns": "nanoseconds", "ps": "picoseconds",
+    "fs": "femtoseconds", "as": "attoseconds",
+    "generic": "generic time units",
+}
 
-    __module__ = "numpy"
-    __slots__ = ("_v", "_unit")
+_NAT = -(2 ** 63)
+
+#: numpy's two spellings of the generic-unit deprecation. The first is what a
+#: no-argument constructor gets; everything else that lands on a generic unit
+#: gets the second.
+_GENERIC_DEPR = (
+    "The 'generic' unit for NumPy timedelta is deprecated, and will raise an "
+    "error in the future. Please use a specific unit instead.")
+_GENERIC_DEPR_INT = (
+    "The 'generic' unit for NumPy timedelta is deprecated, and will raise an "
+    "error in the future. This includes implicit conversion of bare integers "
+    "(e.g. `+ 1`).Please use a specific unit instead.")
+
+
+def _warn_generic(msg=_GENERIC_DEPR_INT, stacklevel=4):
+    _warnings.warn(msg, DeprecationWarning, stacklevel=stacklevel)
+
+
+def _unit_spec(unit):
+    """Normalise numpy's `unit=` argument into a dtype-string suffix.
+
+    numpy accepts a bare unit (`'s'`), a `(unit, count)` tuple, and `None`
+    (which means "deduce it").
+    """
+    if unit is None:
+        return None
+    if isinstance(unit, tuple):
+        if len(unit) != 2:
+            raise TypeError("Datetime metadata tuple must have length 2")
+        base, num = unit
+        return f"{int(num)}{base}"
+    if isinstance(unit, dtype):
+        return _rnp.datetime_data(unit)[0]
+    return str(unit)
+
+
+class _TimeScalar(generic):
+    """Shared implementation of `np.datetime64` and `np.timedelta64`.
+
+    The payload is the raw int64 (`_v`, which is also what the engine reads
+    when one of these is used as an array element) plus the full dtype, since
+    the unit lives in the dtype rather than in the value.
+    """
+
+    __slots__ = ("_v", "_dtype")
+    _char = "M8"
 
     def __new__(cls, value=None, unit=None):
+        suffix = _unit_spec(unit)
+        target = cls._char if suffix is None else f"{cls._char}[{suffix}]"
+        no_arg = value is None
+        if no_arg:
+            value = "NaT"
+        elif cls._char == "M8" and suffix is None and isinstance(
+                value, (int, _builtins.bool)) and not isinstance(value, generic):
+            # numpy refuses to guess a unit for a bare integer datetime.
+            raise ValueError("Converting an integer to a NumPy datetime "
+                             "requires a specified unit")
+        arr = _rnp.array(value, dtype=dtype(target))
+        if _rnp.datetime_data(arr.dtype)[0] == "generic":
+            _warn_generic(_GENERIC_DEPR if no_arg else _GENERIC_DEPR_INT)
+        return cls._from_parts(int(arr.astype("int64")[()]), arr.dtype)
+
+    @classmethod
+    def _from_parts(cls, raw, dt):
         self = object.__new__(cls)
-        self._v = value
-        self._unit = unit
+        self._v = raw
+        self._dtype = dt
         return self
 
     @property
     def dtype(self):
-        return dtype("M8" if self._unit is None else f"M8[{self._unit}]")
-
-    def __repr__(self):
-        return f"numpy.datetime64({self._v!r})"
-
-    def __repr__(self):
-        return f"numpy.datetime64({self._v!r})"
-
-
-class timedelta64(signedinteger, metaclass=_FlexMeta, char="m8"):
-    __module__ = "numpy"
-    __slots__ = ("_v", "_unit")
-
-    def __new__(cls, value=None, unit=None):
-        self = object.__new__(cls)
-        self._v = value
-        self._unit = unit
-        return self
+        return self._dtype
 
     @property
-    def dtype(self):
-        return dtype("m8" if self._unit is None else f"m8[{self._unit}]")
+    def _unit(self):
+        return _rnp.datetime_data(self._dtype)[0]
+
+    def __array__(self, dt=None, copy=None):
+        a = _rnp.array(self._v, dtype=self._dtype)
+        return a if dt is None else a.astype(dt)
+
+    def astype(self, dt, *a, **k):
+        r = self.__array__().astype(dtype(dt))
+        return r[()]
+
+    def item(self, *args):
+        if args and args != (0,) and args != ((),):
+            raise ValueError("can only convert an array of size 1 to a "
+                             "Python scalar")
+        return _rnp._datetime_objects(self.__array__())[0]
+
+    def tolist(self):
+        return self.item()
+
+    def __hash__(self):
+        # numpy hashes the *value*, not the (value, unit) pair, so that the
+        # same instant in two units hashes alike; see `datetime_hash` /
+        # `timedelta_hash` in numpy's datetime.c. NaT is not hashed at all --
+        # every NaT is a distinct object, and numpy's identity hash makes
+        # `hash(nat1) != hash(nat2)` true.
+        if self._v == _NAT:
+            return object.__hash__(self)
+        return self._hash_value()
+
+    def __bool__(self):
+        return self._v != 0
+
+    def __reduce__(self):
+        return (type(self), (self._v, self._unit))
+
+    def __format__(self, spec):
+        if spec == "":
+            return str(self)
+        return format(str(self), spec)
+
+    # -- arithmetic --------------------------------------------------------
+    #
+    # The scalar fast path in the engine is indexed by numeric dtype code, so
+    # the datetime scalars route through 0-d arrays instead; that reuses the
+    # same loops (and the same type resolution) an array would.
+
+    def _op(self, other, name, reflected=False):
+        if isinstance(other, ndarray):
+            return NotImplemented
+        try:
+            a = self.__array__()
+            b = _as_time_operand(other)
+        except Exception:
+            return NotImplemented
+        if b is None:
+            return NotImplemented
+        if reflected:
+            a, b = b, a
+        r = _time_ufunc(name, a, b)
+        if r is NotImplemented:
+            return r
+        return r[()] if getattr(r, "ndim", 1) == 0 else r
+
+    def __neg__(self):
+        from . import negative
+        return negative(self.__array__())[()]
+
+    def __pos__(self):
+        from . import positive
+        return positive(self.__array__())[()]
+
+    def __abs__(self):
+        from . import absolute
+        return absolute(self.__array__())[()]
+
+
+def _as_time_operand(other):
+    """Coerce the right-hand side of a datetime scalar operator."""
+    if isinstance(other, generic):
+        return other.__array__()
+    if isinstance(other, (int, _builtins.float, _builtins.bool)):
+        return _rnp.array(other)
+    if isinstance(other, ndarray):
+        return other
+    import datetime as _dtmod
+    if isinstance(other, _dtmod.timedelta):
+        return _rnp.array(other, dtype=dtype("m8"))
+    if isinstance(other, (_dtmod.date, _dtmod.datetime)):
+        return _rnp.array(other, dtype=dtype("M8"))
+    if isinstance(other, str):
+        return None
+    return None
+
+
+def _time_ufunc(name, a, b):
+    from . import _ufunc
+    return _ufunc.ALL[name](a, b)
+
+
+def _install_time_operators(cls):
+    for op, name in (("add", "add"), ("sub", "subtract"),
+                     ("mul", "multiply"), ("truediv", "divide"),
+                     ("floordiv", "floor_divide"), ("mod", "remainder"),
+                     ("lt", "less"), ("le", "less_equal"),
+                     ("gt", "greater"), ("ge", "greater_equal"),
+                     ("eq", "equal"), ("ne", "not_equal")):
+        def fwd(self, other, _n=name):
+            return self._op(other, _n)
+
+        def rev(self, other, _n=name):
+            return self._op(other, _n, reflected=True)
+
+        fwd.__name__ = f"__{op}__"
+        rev.__name__ = f"__r{op}__"
+        setattr(cls, f"__{op}__", fwd)
+        if op not in ("lt", "le", "gt", "ge", "eq", "ne"):
+            setattr(cls, f"__r{op}__", rev)
+
+    def _divmod(self, other):
+        from . import divmod as _dm
+        b = _as_time_operand(other)
+        if b is None:
+            return NotImplemented
+        q, r = _dm(self.__array__(), b)
+        return (q[()], r[()])
+
+    cls.__divmod__ = _divmod
+    return cls
+
+
+class datetime64(_TimeScalar, metaclass=_FlexMeta, char="M8"):
+    __module__ = "numpy"
+    __slots__ = ()
+    _char = "M8"
+
+    def _hash_value(self):
+        import datetime as _pydt
+        unit, _num = _rnp.datetime_data(self._dtype)
+        if unit == "generic":
+            return hash(self._v)
+        y, mo, d, h, mi, sec, us, ps, at = _rnp._datetime_struct(
+            self.__array__())[0]
+        if 1 <= y <= 9999 and ps == 0 and at == 0:
+            return hash(_pydt.datetime(y, mo, d, h, mi, sec, us))
+        # Out of `datetime`'s range: numpy hashes the raw struct bytes, which
+        # is the same thing as hashing the broken-down fields -- equal instants
+        # in different units still agree, which is all the hash promises.
+        return hash((y, mo, d, h, mi, sec, us, ps, at))
 
     def __repr__(self):
-        return f"numpy.timedelta64({self._v!r})"
+        meta = _rnp.datetime_data(self._dtype)
+        unit, num = meta
+        iso = _rnp._datetime_strings(self.__array__(), casting="safe")[0]
+        # numpy prints the unit only when the string does not imply it: a
+        # multiplier, an hour unit, or NaT (whose string carries nothing).
+        if (num == 1 and unit != "h") or unit == "generic":
+            if self._v == _NAT:
+                return f"np.datetime64('NaT','{_meta_str(meta)}')"
+            return f"np.datetime64('{iso}')"
+        return f"np.datetime64('{iso}','{_meta_str(meta)}')"
+
+    def __str__(self):
+        return _rnp._datetime_strings(self.__array__(), casting="safe")[0]
+
+    def __int__(self):
+        raise TypeError(
+            "int() argument must be a string, a bytes-like object or a real "
+            "number, not 'datetime.date'")
+
+
+class timedelta64(signedinteger, _TimeScalar, metaclass=_FlexMeta, char="m8"):
+    __module__ = "numpy"
+    __slots__ = ()
+    _char = "m8"
+
+    def _hash_value(self):
+        import datetime as _pydt
+        unit, num = _rnp.datetime_data(self._dtype)
+        if unit == "generic":
+            # A generic timedelta compares equal to every other base, so no
+            # single hash can be consistent; numpy refuses outright.
+            raise ValueError("Can't hash generic timedelta64")
+        # Years and months convert to each other but to nothing else.
+        if unit == "Y":
+            return hash(self._v * num * 12)
+        if unit == "M":
+            return hash(self._v * num)
+        parts = _rnp._datetime_struct(self.__array__())[0]
+        _, _, day, _, _, sec, us, ps, at = parts
+        if -999999999 <= day <= 999999999 and ps == 0 and at == 0:
+            return hash(_pydt.timedelta(day, sec, us))
+        return hash((day, sec, us, ps, at))
+
+    def __repr__(self):
+        unit, num = _rnp.datetime_data(self._dtype)
+        val = "'NaT'" if self._v == _NAT else str(self._v)
+        if unit == "generic":
+            return f"np.timedelta64({val})"
+        return f"np.timedelta64({val},'{_meta_str((unit, num))}')"
+
+    def __str__(self):
+        unit, num = _rnp.datetime_data(self._dtype)
+        if self._v == _NAT:
+            return "NaT"
+        return f"{self._v * num} {_TD_VERBOSE.get(unit, 'invalid')}"
+
+    def __int__(self):
+        if self._v == _NAT:
+            raise ValueError("Cannot convert NaT to integer")
+        return self._v
+
+    def __index__(self):
+        return self.__int__()
+
+    def __float__(self):
+        return _builtins.float(self._v)
+
+
+def _meta_str(meta):
+    """numpy's `metastr_to_unicode(meta, skip_brackets=1)`."""
+    unit, num = meta
+    return unit if num == 1 else f"{num}{unit}"
+
+
+_install_time_operators(datetime64)
+_install_time_operators(timedelta64)
+
+
+def _datetime_scalar_factory(raw, dt):
+    """Build the right time scalar for a raw int64 and a dtype.
+
+    Installed into the engine so that `arr[i]`, reductions and the ufunc
+    machinery hand back `np.datetime64` / `np.timedelta64` rather than a bare
+    Python int.
+    """
+    cls = datetime64 if dt.kind == "M" else timedelta64
+    return cls._from_parts(raw, dt)
+
+
+_rnp._register_datetime_factory(_datetime_scalar_factory)
 
 
 _SCALAR_BY_NAME.update({

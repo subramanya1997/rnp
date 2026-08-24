@@ -903,6 +903,9 @@ fn reduce_all_swapped(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Resu
 
 fn reduce_all_native(arr: &NdArray, op: ReduceOp, opts: ReduceOpts<'_>) -> Result<Scalar> {
     let ReduceOpts { mask, seed } = opts;
+    if arr.dtype().is_datetime_like() {
+        return crate::datetime_ops::reduce_all(arr, op, seed);
+    }
     check_numeric(arr, op)?;
     let n = arr.size();
     if n == 0 {
@@ -1069,6 +1072,9 @@ fn reduce_axis_native(
     opts: ReduceOpts<'_>,
 ) -> Result<NdArray> {
     let ReduceOpts { mask, seed } = opts;
+    if arr.dtype().is_datetime_like() {
+        return crate::datetime_ops::reduce_axis(arr, axis, op, keepdims, seed);
+    }
     check_numeric(arr, op)?;
     if axis >= arr.ndim() {
         return Err(Error::AxisError(format!(

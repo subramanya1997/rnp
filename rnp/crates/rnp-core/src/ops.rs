@@ -1605,6 +1605,9 @@ fn binary_multi_native(
     {
         return Ok((compare_mixed_64(a, b, op)?, None));
     }
+    if crate::datetime_ops::handles(a.dtype(), b.dtype()) {
+        return crate::datetime_ops::binary(a, b, op);
+    }
     if a.dtype().is_flexible() || b.dtype().is_flexible() {
         return Ok((binary_flexible(a, b, op)?, None));
     }
@@ -1681,6 +1684,9 @@ fn compare_mixed_64(a: &NdArray, b: &NdArray, op: BinOp) -> Result<NdArray> {
 
 /// `np.divmod`: both outputs in one pass.
 pub fn divmod(a: &NdArray, b: &NdArray) -> Result<(NdArray, NdArray)> {
+    if crate::datetime_ops::handles(a.dtype(), b.dtype()) {
+        return crate::datetime_ops::divmod(a, b);
+    }
     let (compute, _) = result_dtypes(a.dtype(), b.dtype(), BinOp::Mod)?;
     let out_shape = broadcast_shapes(&a.shape, &b.shape)?;
     let ac = a.astype(compute);
