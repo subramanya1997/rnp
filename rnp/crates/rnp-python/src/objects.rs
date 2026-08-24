@@ -28,6 +28,14 @@ pub fn intern(obj: &Bound<'_, PyAny>) -> u64 {
     slab.len() as u64
 }
 
+/// Intern even `None` as a nonzero handle. StringDType needs this because its
+/// all-zero cell is the empty string while `None` may be an explicit NA.
+fn intern_nonzero(obj: &Bound<'_, PyAny>) -> u64 {
+    let mut slab = SLAB.lock().unwrap();
+    slab.push(obj.clone().unbind());
+    slab.len() as u64
+}
+
 /// Resolve a handle back to its Python object.
 pub fn resolve<'py>(py: Python<'py>, handle: u64) -> Bound<'py, PyAny> {
     if handle == 0 {
@@ -48,9 +56,24 @@ pub fn read<'py>(py: Python<'py>, arr: &NdArray, off: isize) -> Bound<'py, PyAny
     }
 }
 
+/// The object stored in a StringDType cell. A zeroed descriptor is the empty
+/// string (not None), matching both `np.empty(..., dtype="T")` and zeros.
+pub fn read_string<'py>(py: Python<'py>, arr: &NdArray, off: isize) -> Bound<'py, PyAny> {
+    match arr.read_at(off) {
+        Scalar::Uint(0) => pyo3::types::PyString::new(py, "").into_any(),
+        Scalar::Uint(h) => resolve(py, h),
+        _ => pyo3::types::PyString::new(py, "").into_any(),
+    }
+}
+
 /// Store one Python object at a byte offset of an `object` array.
 pub fn write(arr: &NdArray, off: isize, obj: &Bound<'_, PyAny>) {
     arr.write_at(off, Scalar::Uint(intern(obj)));
+}
+
+
+pub fn write_string(arr: &NdArray, off: isize, obj: &Bound<'_, PyAny>) {
+    arr.write_at(off, Scalar::Uint(intern_nonzero(obj)));
 }
 
 /// Build an `object` array from nested Python sequences of arbitrary values.

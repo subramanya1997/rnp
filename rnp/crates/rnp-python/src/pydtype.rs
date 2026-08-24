@@ -51,6 +51,16 @@ fn string_params(py: Python<'_>, id: u32) -> Option<(bool, Option<Py<PyAny>>)> {
         .map(|p| (p.coerce, p.na_object.as_ref().map(|o| o.clone_ref(py))))
 }
 
+pub(crate) fn string_config(
+    py: Python<'_>,
+    dt: DType,
+) -> Option<(bool, Option<Py<PyAny>>)> {
+    match dt {
+        DType::String(id) => string_params(py, id),
+        _ => None,
+    }
+}
+
 pub fn new_string_dtype(
     py: Python<'_>,
     coerce: bool,
@@ -109,6 +119,13 @@ fn string_repr(py: Python<'_>, id: u32) -> PyResult<String> {
         args.push("coerce=False".to_string());
     }
     Ok(format!("StringDType({})", args.join(", ")))
+}
+
+pub(crate) fn string_repr_for(py: Python<'_>, dt: DType) -> PyResult<String> {
+    match dt {
+        DType::String(id) => string_repr(py, id),
+        _ => Err(PyTypeError::new_err("not a StringDType descriptor")),
+    }
 }
 
 fn metadata_store() -> &'static RwLock<Vec<Py<PyDict>>> {

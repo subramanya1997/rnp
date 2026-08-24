@@ -186,6 +186,15 @@ fn ones(
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
     let d = descr_or_default(dtype, DType::F64)?;
+    if d.dt.is_string() {
+        let one = pyo3::types::PyString::new(py, "1");
+        let scalar = array_from_any(one.as_any(), Some(d.dt), false)?;
+        let filled = rnp_core::iter::broadcast_to(&scalar, &shape_from_any(shape)?)
+            .map_err(err)?
+            .copy()
+            .into_descr(d);
+        return wrap(py, filled);
+    }
     wrap(py, NdArray::ones_descr(shape_from_any(shape)?, d).map_err(err)?)
 }
 
@@ -208,6 +217,17 @@ fn full(
     fill_value: &Bound<'_, PyAny>,
     dtype: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyNdArray>> {
+    if let Some(requested) = dtype.filter(|o| !o.is_none()) {
+        let d = descr_from_any(requested)?;
+        if d.dt.is_string() {
+            let scalar = array_from_any(fill_value, Some(d.dt), false)?;
+            let filled = rnp_core::iter::broadcast_to(&scalar, &shape_from_any(shape)?)
+                .map_err(err)?
+                .copy()
+                .into_descr(d);
+            return wrap(py, filled);
+        }
+    }
     // A Python int too wide for any integer dtype cannot fill an integer
     // array at all: probed, `np.full((2,), 2**100, dtype=np.uint8)` is
     // `OverflowError: Python int too large to convert to C long`.
