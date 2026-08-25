@@ -786,6 +786,11 @@ class ufunc:
 
     def reduce(self, array, axis=0, dtype=None, out=None, keepdims=False,
                initial=None, where=True):
+        return self._reduce_impl(
+            array, axis, dtype, out, keepdims, initial, where, "reduce")
+
+    def _reduce_impl(self, array, axis, dtype, out, keepdims, initial, where,
+                     error_context):
         if self._pyfunc is not None:
             return self._reduce_pyfunc(
                 array, axis, dtype, out, keepdims, initial, where)
@@ -805,7 +810,7 @@ class ufunc:
         res = _rnp._ufunc_reduce(self.__name__, array, axis=axis, dtype=dtype,
                                  out=out, keepdims=keepdims, initial=initial,
                                  where_=where)
-        _errstate.drain(self.__name__)
+        _errstate.drain(error_context)
         return _maybe_scalar(res, out is None)
 
     def _reduce_pyfunc(self, array, axis, dtype, out, keepdims,
@@ -935,7 +940,7 @@ class ufunc:
                 return res
         res = _rnp._ufunc_accumulate(self.__name__, array, axis=axis,
                                      dtype=dtype, out=out)
-        _errstate.drain(self.__name__)
+        _errstate.drain("accumulate")
         return res
 
     def reduceat(self, array, indices, axis=0, dtype=None, out=None):
@@ -976,11 +981,14 @@ class ufunc:
                 # already right. For `add` they disagree from segment length
                 # 3 upwards.
                 sl[axis] = slice(start, start + 1)
-                head = _rnp.asarray(self.reduce(a[tuple(sl)], axis=axis,
-                                                dtype=dtype))
+                head = _rnp.asarray(self._reduce_impl(
+                    a[tuple(sl)], axis, dtype, None, False, None, True,
+                    "reduceat"))
                 if stop - start > 1:
                     sl[axis] = slice(start + 1, stop)
-                    tail = self.reduce(a[tuple(sl)], axis=axis, dtype=dtype)
+                    tail = self._reduce_impl(
+                        a[tuple(sl)], axis, dtype, None, False, None, True,
+                        "reduceat")
                     red = self(head, _rnp.asarray(tail))
                 else:
                     red = head
@@ -992,6 +1000,7 @@ class ufunc:
                     self.__name__, a[tuple(sl)], axis=axis, dtype=dtype,
                     out=None, keepdims=False, initial=None, where_=True)
             pieces.append(_rnp.asarray(red))
+        _errstate.drain("reduceat")
         if a.dtype.kind == "O":
             # `stack` goes through `array(..., dtype=object)`, whose element
             # discovery does not descend into arrays -- each segment would
