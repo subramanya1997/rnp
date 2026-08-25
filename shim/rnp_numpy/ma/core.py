@@ -74,6 +74,13 @@ from rnp_numpy.lib import _rnp_compat as mu
 from rnp_numpy.lib._rnp_compat import normalize_axis_tuple
 from rnp_numpy.lib._rnp_compat import set_module
 
+# The Rust ndarray type is subclassable, but unlike NumPy's ndarray it does
+# not provide the no-op base hook that cooperative Python subclasses call.
+# Installing it here keeps masked-array subclass finalizers compatible without
+# changing the shared ndarray shim.
+if not hasattr(ndarray, '__array_finalize__'):
+    ndarray.__array_finalize__ = lambda self, obj: None
+
 __all__ = [
     'MAError', 'MaskError', 'MaskType', 'MaskedArray', 'abs', 'absolute',
     'add', 'all', 'allclose', 'allequal', 'alltrue', 'amax', 'amin',
@@ -263,7 +270,12 @@ def _recursive_fill_value(dtype, f):
                     val = np.array(val)
             else:
                 val = np.array(val)
-            vals.append(val)
+            if getattr(val, 'shape', None) == ():
+                vals.append(val.item())
+            elif hasattr(val, 'tolist'):
+                vals.append(val.tolist())
+            else:
+                vals.append(val)
         return np.array(tuple(vals), dtype=dtype)[()]  # decay to void scalar from 0d
     elif dtype.subdtype:
         subtype, shape = dtype.subdtype
@@ -798,6 +810,91 @@ def getdata(a, subok=True):
 get_data = getdata
 
 
+def _python_array_compare(left, right, compare):
+    """Compare non-numeric arrays without entering Rust numeric dispatch."""
+    left = np.asarray(left)
+    right = np.asarray(right)
+    shape = np.broadcast(left, right).shape
+    left = np.broadcast_to(left, shape)
+    right = np.broadcast_to(right, shape)
+
+    if shape == ():
+        return bool(compare(left.tolist(), right.tolist()))
+
+    lvalues = left.reshape(-1).tolist()
+    rvalues = right.reshape(-1).tolist()
+    result = np.array(
+        [bool(compare(a, b)) for a, b in zip(lvalues, rvalues)],
+        dtype=np.bool,
+    )
+    return result.reshape(shape)
+
+
+def _structured_array_compare(left, right, left_mask, right_mask, compare):
+    """Compare records while ignoring fields masked by either operand."""
+    shape = np.broadcast(left, right).shape
+    left = np.broadcast_to(left, shape)
+    right = np.broadcast_to(right, shape)
+    left_mask = np.broadcast_to(left_mask, shape)
+    right_mask = np.broadcast_to(right_mask, shape)
+
+    def field_equal(a, b, ma, mb):
+        if a.dtype.names is not None:
+            result = np.ones(shape, dtype=np.bool)
+            for name in a.dtype.names:
+                ma_field = ma[name] if ma.dtype.names is not None else ma
+                mb_field = mb[name] if mb.dtype.names is not None else mb
+                result = np.logical_and(
+                    result, field_equal(a[name], b[name], ma_field, mb_field))
+            return result
+
+        equal = _python_array_compare(a, b, operator.eq)
+        ignored = np.logical_or(ma, mb)
+        return np.where(ignored, True, equal)
+
+    equality = field_equal(left, right, left_mask, right_mask)
+    return equality if compare is operator.eq else np.logical_not(equality)
+
+
+def _structured_mask_all(mask):
+    """Collapse a structured boolean mask to one boolean per record."""
+    if mask.dtype.names is None:
+        return np.asarray(mask, dtype=np.bool)
+    result = np.ones(mask.shape, dtype=np.bool)
+    for name in mask.dtype.names:
+        result = np.logical_and(result, _structured_mask_all(mask[name]))
+    return result
+
+
+def _install_nonnumeric_comparisons():
+    """Keep raw string/structured comparisons out of numeric Rust ufuncs."""
+    comparisons = {
+        '__eq__': operator.eq,
+        '__ne__': operator.ne,
+        '__lt__': operator.lt,
+        '__le__': operator.le,
+        '__gt__': operator.gt,
+        '__ge__': operator.ge,
+    }
+    for name, compare in comparisons.items():
+        original = getattr(ndarray, name)
+
+        def wrapped(self, other, _original=original, _compare=compare):
+            kinds = {
+                getattr(getattr(self, 'dtype', None), 'kind', None),
+                getattr(getattr(other, 'dtype', None), 'kind', None),
+            }
+            if (getattr(getattr(self, 'dtype', None), 'names', None) is not None
+                    or kinds & set('OSUTV')):
+                return _python_array_compare(self, other, _compare)
+            return _original(self, other)
+
+        setattr(ndarray, name, wrapped)
+
+
+_install_nonnumeric_comparisons()
+
+
 def fix_invalid(a, mask=nomask, copy=True, fill_value=None):
     """
     Return input with invalid data masked and replaced by a fill value.
@@ -1096,6 +1193,9 @@ class _MaskedBinaryOperation(_MaskedUFunc):
         with np.errstate():
             np.seterr(divide='ignore', invalid='ignore')
             result = self.f(da, db, *args, **kwargs)
+        if (not isinstance(result, ndarray) and
+                getattr(type(result), '__array_ufunc__', None) is not None):
+            return result
         # Get the mask for the result
         (ma, mb) = (getmask(a), getmask(b))
         if ma is nomask:
@@ -1246,11 +1346,12 @@ class _DomainedBinaryOperation(_MaskedUFunc):
         if domain is not None:
             m |= domain(da, db)
         # Take care of the scalar case first
-        if not m.ndim:
+        if not result.ndim:
             if m:
                 return masked
             else:
                 return result
+        m = _shrink_mask(m)
         # When the mask is True, put back da if possible
         # any errors, just abort; impossible to guarantee masked values
         try:
@@ -2745,7 +2846,14 @@ class MaskedIterator:
         return self
 
     def __getitem__(self, indx):
-        result = self.dataiter.__getitem__(indx).view(type(self.ma))
+        data = self.dataiter.__getitem__(indx)
+        if (isinstance(data, ndarray)
+                and getattr(self.ma._baseclass, '__name__', None) == 'matrix'):
+            data = data.reshape((1, -1))
+            data = np._ndarray_view_base(data, self.ma._baseclass)
+        result = data.view(type(self.ma))
+        if isinstance(result, MaskedArray):
+            result._baseclass = self.ma._baseclass
         if self.maskiter is not None:
             _mask = self.maskiter.__getitem__(indx)
             if isinstance(_mask, ndarray):
@@ -2918,9 +3026,12 @@ class MaskedArray(ndarray):
         """
         # Process data.
         copy = None if not copy else True
+        original_baseclass = (type(data) if isinstance(data, ndarray)
+                              else None)
         _data = np.array(data, dtype=dtype, copy=copy,
                          order=order, subok=True, ndmin=ndmin)
-        _baseclass = getattr(data, '_baseclass', type(_data))
+        _baseclass = getattr(
+            data, '_baseclass', original_baseclass or type(_data))
         # Check that we're not erasing the mask.
         if isinstance(data, MaskedArray) and (data.shape != _data.shape):
             copy = True
@@ -2932,6 +3043,9 @@ class MaskedArray(ndarray):
             _data = ndarray.view(_data, type(data))
         else:
             _data = ndarray.view(_data, cls)
+
+        if original_baseclass is not None and not isinstance(data, MaskedConstant):
+            _data._update_from(data)
 
         # Handle the case where data is not a subclass of ndarray, but
         # still has the _mask attribute like MaskedArrays
@@ -2953,18 +3067,26 @@ class MaskedArray(ndarray):
                     _data._mask = np.zeros(_data.shape, dtype=mdtype)
             # Check whether we missed something
             elif isinstance(data, (tuple, list)):
-                try:
-                    # If data is a sequence of masked array
-                    mask = np.array(
-                        [getmaskarray(np.asanyarray(m, dtype=_data.dtype))
-                         for m in data], dtype=mdtype)
-                except (ValueError, TypeError):
-                    # If data is nested
+                if not builtins.any(hasattr(m, '_mask') for m in data):
                     mask = nomask
+                else:
+                    try:
+                        # If data is a sequence of masked array
+                        mask = np.array(
+                            [getmaskarray(np.asanyarray(m, dtype=_data.dtype))
+                             for m in data], dtype=mdtype)
+                    except (ValueError, TypeError):
+                        # If data is nested
+                        mask = nomask
                 # Force shrinking of the mask if needed (and possible)
                 if (mdtype == MaskType) and mask.any():
                     _data._mask = mask
                     _data._sharedmask = False
+            elif isinstance(data, MaskedArray):
+                inherited_mask = getmask(data)
+                if inherited_mask is not nomask:
+                    _data._mask = inherited_mask.reshape(_data.shape)
+                    _data._sharedmask = not copy
             else:
                 _data._sharedmask = not copy
                 if copy:
@@ -2994,7 +3116,12 @@ class MaskedArray(ndarray):
             else:
                 # Read the mask with the current mdtype
                 try:
-                    mask = np.array(mask, copy=copy, dtype=mdtype)
+                    mask_input = mask
+                    if (mdtype.names is not None and
+                            isinstance(mask, ndarray) and
+                            mask.dtype.names is None):
+                        mask_input = mask.tolist()
+                    mask = np.array(mask_input, copy=copy, dtype=mdtype)
                 # Or assume it's a sequence of bool/int
                 except TypeError:
                     mask = np.array([tuple([m] * len(mdtype)) for m in mask],
@@ -3072,6 +3199,40 @@ class MaskedArray(ndarray):
                      '_basedict': _optinfo}
         self.__dict__.update(_dict)
         self.__dict__.update(_optinfo)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        """Route direct NumPy ufunc calls through the mask-aware wrappers."""
+        for operand in inputs:
+            if operand is self or isinstance(operand, MaskedArray):
+                continue
+            override = getattr(type(operand), '__array_ufunc__', None)
+            if (override is not None and
+                    getattr(operand, '__array_priority__', -1)
+                    > self.__array_priority__):
+                return NotImplemented
+
+        operation = globals().get(getattr(ufunc, '__name__', ''))
+        if not isinstance(operation, _MaskedUFunc):
+            return NotImplemented
+
+        outputs = kwargs.pop('out', None)
+        if method == '__call__':
+            result = operation(*inputs, **kwargs)
+        else:
+            implementation = getattr(operation, method, None)
+            if implementation is None:
+                return NotImplemented
+            result = implementation(*inputs, **kwargs)
+
+        if outputs is None:
+            return result
+
+        outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+        results = result if isinstance(result, tuple) else (result,)
+        for output, value in zip(outputs, results):
+            if output is not None:
+                output[...] = value
+        return outputs[0] if len(outputs) == 1 else outputs
 
     def __array_finalize__(self, obj):
         """
@@ -3549,7 +3710,10 @@ class MaskedArray(ndarray):
 
     @shape.setter
     def shape(self, shape):
-        super(MaskedArray, type(self)).shape.__set__(self, shape)
+        warnings.warn(
+            "Setting the 'shape' attribute is deprecated. Use reshape() "
+            "instead.", DeprecationWarning, stacklevel=2)
+        ndarray.resize(self, shape, refcheck=False)
         # Cannot use self._mask, since it may not (yet) exist when a
         # masked matrix sets the shape.
         if getmask(self) is not nomask:
@@ -3603,7 +3767,11 @@ class MaskedArray(ndarray):
                 # Make sure the new mask is an ndarray with the proper dtype
                 try:
                     copy = None if not copy else True
-                    mask = np.array(mask, copy=copy, dtype=mdtype)
+                    mask_input = mask
+                    if (isinstance(mask, ndarray) and
+                            mask.dtype.names is None):
+                        mask_input = mask.tolist()
+                    mask = np.array(mask_input, copy=copy, dtype=mdtype)
                 # Or assume it's a sequence of bool/int
                 except TypeError:
                     mask = np.array([tuple([m] * len(mdtype)) for m in mask],
@@ -3821,6 +3989,8 @@ class MaskedArray(ndarray):
         The type of the data can be accessed through the :attr:`baseclass`
         attribute.
         """
+        if getattr(self._baseclass, '__name__', None) == 'matrix':
+            return np._ndarray_view_base(self, self._baseclass)
         return ndarray.view(self, self._baseclass)
 
     _data = property(fget=_get_data)
@@ -4013,7 +4183,10 @@ class MaskedArray(ndarray):
         array([2, 3])
 
         """
-        data = ndarray.ravel(self._data)
+        if getattr(self._baseclass, '__name__', None) == 'matrix':
+            data = self._data.ravel()
+        else:
+            data = ndarray.ravel(self._data)
         if self._mask is not nomask:
             data = data.compress(np.logical_not(ndarray.ravel(self._mask)))
         return data
@@ -4235,7 +4408,10 @@ class MaskedArray(ndarray):
         else:
             # If array_ufunc is not None, it will be called inside the ufunc;
             # None explicitly tells us to not call the ufunc, i.e., defer.
-            return array_ufunc is None
+            if array_ufunc is None:
+                return True
+            other_priority = getattr(other, "__array_priority__", -1000000)
+            return self.__array_priority__ < other_priority
 
     def _comparison(self, other, compare):
         """Compare self with other using operator.eq or operator.ne.
@@ -4258,18 +4434,12 @@ class MaskedArray(ndarray):
             # so give up early for all other comparisons:
             if compare not in (operator.eq, operator.ne):
                 return NotImplemented
-            # For possibly masked structured arrays we need to be careful,
-            # since the standard structured array comparison will use all
-            # fields, masked or not. To avoid masked fields influencing the
-            # outcome, we set all masked fields in self to other, so they'll
-            # count as equal.  To prepare, we ensure we have the right shape.
-            broadcast_shape = np.broadcast(self, odata).shape
-            sbroadcast = np.broadcast_to(self, broadcast_shape, subok=True)
-            sbroadcast._mask = mask
-            sdata = sbroadcast.filled(odata)
+            sdata = self.data
+            check = _structured_array_compare(
+                sdata, odata, smask, omask, compare)
             # Now take care of the mask; the merged mask should have an item
             # masked if all fields were masked (in one and/or other).
-            mask = (mask == np.ones((), mask.dtype))
+            mask = _structured_mask_all(mask)
             # Ensure we can compare masks below if other was not masked.
             if omask is np.False_:
                 omask = np.zeros((), smask.dtype)
@@ -4277,8 +4447,19 @@ class MaskedArray(ndarray):
         else:
             # For regular arrays, just use the data as they come.
             sdata = self.data
+            check = None
 
-        check = compare(sdata, odata)
+        data_kinds = {
+            getattr(getattr(sdata, 'dtype', None), 'kind', None),
+            getattr(getattr(odata, 'dtype', None), 'kind', None),
+        }
+        if check is not None:
+            pass
+        elif (getattr(getattr(sdata, 'dtype', None), 'names', None) is not None
+                or data_kinds & set('OSUTV')):
+            check = _python_array_compare(sdata, odata, compare)
+        else:
+            check = compare(sdata, odata)
 
         if isinstance(check, (np.bool, bool)):
             return masked if mask else check
@@ -4289,7 +4470,12 @@ class MaskedArray(ndarray):
                 # as equal if masked in both, unequal if masked in one.
                 # Note that this works automatically for structured arrays too.
                 # Ignore this for operations other than `==` and `!=`
-                check = np.where(mask, compare(smask, omask), check)
+                if getattr(getattr(smask, 'dtype', None), 'names', None):
+                    masked_check = _structured_array_compare(
+                        smask, omask, nomask, nomask, compare)
+                else:
+                    masked_check = compare(smask, omask)
+                check = np.where(mask, masked_check, check)
 
             if mask.shape != check.shape:
                 # Guarantee consistency of the shape, making a copy since the
@@ -4302,12 +4488,14 @@ class MaskedArray(ndarray):
 
         # Cast fill value to np.bool if needed. If it cannot be cast, the
         # default boolean fill value is used.
-        if check._fill_value is not None:
+        if check._fill_value is not None and not data_kinds & set('OSUTV'):
             try:
                 fill = _check_fill_value(check._fill_value, np.bool)
             except (TypeError, ValueError):
                 fill = _check_fill_value(None, np.bool)
             check._fill_value = fill
+        elif check._fill_value is not None:
+            check._fill_value = _check_fill_value(None, np.bool)
 
         return check
 
@@ -4699,7 +4887,7 @@ class MaskedArray(ndarray):
         if isinstance(self.data, np.matrix):
             if m is nomask:
                 m = np.zeros(self.shape, dtype=np.bool)
-            m = m.view(type(self.data))
+            m = np._ndarray_view_base(m, type(self.data))
 
         if m is nomask:
             # compare to _count_reduce_items in _methods.py
@@ -4788,7 +4976,13 @@ class MaskedArray(ndarray):
         #       try to guess this correct by sorting strides or deprecate.
         if order in "kKaA":
             order = "F" if (self._data.flags.f_contiguous and not self._data.flags.c_contiguous) else "C"
-        r = ndarray.ravel(self._data, order=order).view(type(self))
+        if getattr(self._baseclass, '__name__', None) == 'matrix':
+            data = np.ndarray.view(self._data, np.ndarray)
+            data = ndarray.ravel(data, order=order).reshape((1, -1))
+            data = np._ndarray_view_base(data, self._baseclass)
+        else:
+            data = ndarray.ravel(self._data, order=order)
+        r = data.view(type(self))
         r._update_from(self)
         if self._mask is not nomask:
             r._mask = ndarray.ravel(self._mask, order=order).reshape(r.shape)
