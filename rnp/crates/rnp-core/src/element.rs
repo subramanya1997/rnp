@@ -1,6 +1,7 @@
 //! Element types and the C-cast semantics numpy uses for `astype`.
 
 use crate::dtype::DType;
+use crate::f80::{C160, F80};
 use crate::fpe;
 use num_complex::Complex;
 
@@ -28,7 +29,9 @@ pub enum Scalar {
     Int(i64),
     Uint(u64),
     Float(f64),
+    Float80(F80),
     Complex(C64v),
+    Complex160(C160),
 }
 
 impl Scalar {
@@ -40,7 +43,9 @@ impl Scalar {
             Scalar::Int(_) => DType::I64,
             Scalar::Uint(_) => DType::U64,
             Scalar::Float(_) => DType::F64,
+            Scalar::Float80(_) => DType::F80,
             Scalar::Complex(_) => DType::C128,
+            Scalar::Complex160(_) => DType::C160,
         }
     }
 
@@ -50,7 +55,9 @@ impl Scalar {
             Scalar::Int(i) => i as f64,
             Scalar::Uint(u) => u as f64,
             Scalar::Float(f) => f,
+            Scalar::Float80(f) => f.to_f64(),
             Scalar::Complex(c) => c.re,
+            Scalar::Complex160(c) => c.re.to_f64(),
         }
     }
 
@@ -60,7 +67,9 @@ impl Scalar {
             Scalar::Int(i) => i,
             Scalar::Uint(u) => u as i64,
             Scalar::Float(f) => f2i64(f),
+            Scalar::Float80(f) => f2i64(f.to_f64()),
             Scalar::Complex(c) => f2i64(c.re),
+            Scalar::Complex160(c) => f2i64(c.re.to_f64()),
         }
     }
 
@@ -70,7 +79,9 @@ impl Scalar {
             Scalar::Int(i) => i as u64,
             Scalar::Uint(u) => u,
             Scalar::Float(f) => f2u64(f),
+            Scalar::Float80(f) => f2u64(f.to_f64()),
             Scalar::Complex(c) => f2u64(c.re),
+            Scalar::Complex160(c) => f2u64(c.re.to_f64()),
         }
     }
 
@@ -83,7 +94,9 @@ impl Scalar {
             Scalar::Int(i) => i as i32,
             Scalar::Uint(u) => u as i32,
             Scalar::Float(f) => f as i32,
+            Scalar::Float80(f) => f.to_f64() as i32,
             Scalar::Complex(c) => c.re as i32,
+            Scalar::Complex160(c) => c.re.to_f64() as i32,
         }
     }
 
@@ -93,13 +106,16 @@ impl Scalar {
             Scalar::Int(i) => i != 0,
             Scalar::Uint(u) => u != 0,
             Scalar::Float(f) => f != 0.0,
+            Scalar::Float80(f) => !f.is_zero(),
             Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
+            Scalar::Complex160(c) => !c.re.is_zero() || !c.im.is_zero(),
         }
     }
 
     fn as_complex(&self) -> C64v {
         match *self {
             Scalar::Complex(c) => c,
+            Scalar::Complex160(c) => Complex::new(c.re.to_f64(), c.im.to_f64()),
             other => Complex::new(other.as_f64(), 0.0),
         }
     }
@@ -127,11 +143,24 @@ impl Scalar {
             DType::F16 => Scalar::Float(F16::from_f64(self.as_f64()).to_f64()),
             DType::F32 => Scalar::Float(self.as_f64() as f32 as f64),
             DType::F64 => Scalar::Float(self.as_f64()),
+            DType::F80 => Scalar::Float80(match self {
+                Scalar::Float80(v) => v,
+                Scalar::Int(v) => F80::from_i64(v),
+                Scalar::Uint(v) => F80::from_u64(v),
+                Scalar::Complex160(v) => v.re,
+                other => F80::from_f64(other.as_f64()),
+            }),
             DType::C64 => {
                 let c = self.as_complex();
                 Scalar::Complex(Complex::new(c.re as f32 as f64, c.im as f32 as f64))
             }
             DType::C128 => Scalar::Complex(self.as_complex()),
+            DType::C160 => Scalar::Complex160(match self {
+                Scalar::Complex160(v) => v,
+                Scalar::Complex(v) => C160 { re: F80::from_f64(v.re), im: F80::from_f64(v.im) },
+                Scalar::Float80(v) => C160 { re: v, im: F80::ZERO },
+                other => C160 { re: F80::from_f64(other.as_f64()), im: F80::ZERO },
+            }),
             // Flexible dtypes hold bytes, not numbers: `Scalar` cannot
             // represent them, and every path that could reach here is
             // guarded by `DType::is_numeric`.
@@ -156,7 +185,9 @@ impl Scalar {
         if matches!(dtype.kind(), 'i' | 'u') {
             let real = match self {
                 Scalar::Float(v) => Some(v),
+                Scalar::Float80(v) => Some(v.to_f64()),
                 Scalar::Complex(v) => Some(v.re),
+                Scalar::Complex160(v) => Some(v.re.to_f64()),
                 _ => None,
             };
             if real.is_some_and(|v| !v.is_finite()) {
@@ -184,6 +215,7 @@ impl Scalar {
                 dtype == DType::F16 && F16::from_f64(v as f64).to_f64().is_infinite()
             }
             Scalar::Bool(_) => false,
+            Scalar::Float80(_) | Scalar::Complex160(_) => false,
         };
         if overflow {
             fpe::raise(fpe::OVER);
@@ -487,6 +519,14 @@ impl Element for f64 {
     }
 }
 
+impl Element for F80 {
+    const DTYPE: DType = DType::F80;
+    fn from_scalar(s: Scalar) -> Self {
+        match s.cast_with_fpe(DType::F80) { Scalar::Float80(v) => v, _ => unreachable!() }
+    }
+    fn to_scalar(self) -> Scalar { Scalar::Float80(self) }
+}
+
 impl Element for C32 {
     const DTYPE: DType = DType::C64;
     fn from_scalar(s: Scalar) -> Self {
@@ -511,6 +551,14 @@ impl Element for C64v {
     fn to_scalar(self) -> Scalar {
         Scalar::Complex(self)
     }
+}
+
+impl Element for C160 {
+    const DTYPE: DType = DType::C160;
+    fn from_scalar(s: Scalar) -> Self {
+        match s.cast_with_fpe(DType::C160) { Scalar::Complex160(v) => v, _ => unreachable!() }
+    }
+    fn to_scalar(self) -> Scalar { Scalar::Complex160(self) }
 }
 
 /// Run `$body` with `$T` bound to the Rust type for the given runtime dtype.
@@ -568,12 +616,20 @@ macro_rules! dispatch_dtype {
                 type $T = f64;
                 $body
             }
+            $crate::dtype::DType::F80 => {
+                type $T = $crate::f80::F80;
+                $body
+            }
             $crate::dtype::DType::C64 => {
                 type $T = $crate::element::C32;
                 $body
             }
             $crate::dtype::DType::C128 => {
                 type $T = $crate::element::C64v;
+                $body
+            }
+            $crate::dtype::DType::C160 => {
+                type $T = $crate::f80::C160;
                 $body
             }
             // datetime64 / timedelta64 are stored as int64; the *unit* is

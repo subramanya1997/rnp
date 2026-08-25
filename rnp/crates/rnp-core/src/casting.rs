@@ -50,7 +50,16 @@ pub fn same_value_preserved(
                 Err(SameValueError::Imaginary)
             }
         }
+        Scalar::Complex160(value) => {
+            if real_value_preserved(value.re.to_f64(), from_component, to_component).is_err() {
+                return Err(SameValueError::Changed);
+            }
+            if to.is_complex() {
+                real_value_preserved(value.im.to_f64(), from_component, to_component)
+            } else if value.im.is_zero() { Ok(()) } else { Err(SameValueError::Imaginary) }
+        }
         Scalar::Float(value) => real_value_preserved(value, from_component, to_component),
+        Scalar::Float80(value) => real_value_preserved(value.to_f64(), from_component, to_component),
         Scalar::Int(value) => integer_value_preserved(value as i128, to_component),
         Scalar::Uint(value) => unsigned_value_preserved(value as u128, to_component),
         Scalar::Bool(_) => Ok(()),
@@ -61,6 +70,7 @@ fn component_dtype(dtype: DType) -> DType {
     match dtype {
         DType::C64 => DType::F32,
         DType::C128 => DType::F64,
+        DType::C160 => DType::F80,
         other => other,
     }
 }
@@ -513,6 +523,10 @@ pub fn min_scalar_type(value: Scalar) -> DType {
                 DType::C128
             }
         }
+        Scalar::Float80(v) => min_scalar_type(Scalar::Float(v.to_f64())),
+        Scalar::Complex160(c) => min_scalar_type(Scalar::Complex(crate::element::C64v {
+            re: c.re.to_f64(), im: c.im.to_f64(),
+        })),
     }
 }
 

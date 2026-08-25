@@ -147,7 +147,9 @@ fn int_values(a: &NdArray) -> Vec<i64> {
             Scalar::Uint(u) => u as i64,
             Scalar::Bool(b) => b as i64,
             Scalar::Float(f) => f as i64,
+            Scalar::Float80(f) => f.to_f64() as i64,
             Scalar::Complex(c) => c.re as i64,
+            Scalar::Complex160(c) => c.re.to_f64() as i64,
         })
         .collect()
 }
@@ -192,7 +194,9 @@ pub fn where_<'py>(
             Scalar::Int(v) => v != 0,
             Scalar::Uint(v) => v != 0,
             Scalar::Float(v) => v != 0.0,
+            Scalar::Float80(v) => !v.is_zero(),
             Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
+            Scalar::Complex160(c) => !c.re.is_zero() || !c.im.is_zero(),
         };
         let v = if t { bx.read_at(xo[i]) } else { by.read_at(yo[i]) };
         out.write_at(i as isize * isz, v);

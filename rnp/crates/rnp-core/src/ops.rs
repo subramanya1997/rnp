@@ -10,6 +10,7 @@ use crate::dtype::{promote, promote_for_division, DType};
 use crate::element::{Element, NpBool, Scalar, C32, C64v, F16};
 use crate::error::{Error, Result};
 use crate::fpe;
+use crate::f80::{C160, F80};
 use crate::iter::{broadcast_shapes, broadcast_to, offsets};
 use crate::loops::{binary2, binary2_flagged};
 
@@ -561,6 +562,30 @@ macro_rules! impl_float_ops {
 }
 
 impl_float_ops!(f32, f64);
+
+impl Arith for F80 {
+    fn a_add(self, o: Self) -> Self { self.add(o) }
+    fn a_sub(self, o: Self) -> Self { self.sub(o) }
+    fn a_mul(self, o: Self) -> Self { self.mul(o) }
+    fn a_div(self, o: Self) -> Self { self.div(o) }
+}
+impl Cmp for F80 {
+    fn c_eq(self, o: Self) -> bool { self.partial_cmp_value(o) == Some(std::cmp::Ordering::Equal) }
+    fn c_lt(self, o: Self) -> bool { self.partial_cmp_value(o) == Some(std::cmp::Ordering::Less) }
+    fn c_le(self, o: Self) -> bool { matches!(self.partial_cmp_value(o), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) }
+    fn c_truthy(self) -> bool { !self.is_zero() }
+}
+impl MinMax for F80 {
+    fn m_min(self, o: Self) -> Self { if self.is_nan() { self } else if o.is_nan() { o } else if self.c_le(o) { self } else { o } }
+    fn m_max(self, o: Self) -> Self { if self.is_nan() { self } else if o.is_nan() { o } else if o.c_le(self) { self } else { o } }
+    fn m_fmin(self, o: Self) -> Self { if self.is_nan() { o } else if o.is_nan() { self } else if self.c_le(o) { self } else { o } }
+    fn m_fmax(self, o: Self) -> Self { if self.is_nan() { o } else if o.is_nan() { self } else if o.c_le(self) { self } else { o } }
+}
+impl FpClass for F80 {
+    fn fp_nan(self) -> bool { self.is_nan() }
+    fn fp_inf(self) -> bool { self.is_infinite() }
+    fn fp_zero(self) -> bool { self.is_zero() }
+}
 
 // numpy performs every half-precision operation in `float` and converts the
 // result back (`npy_half_add` etc. in `halffloat.c`).
@@ -1266,6 +1291,32 @@ impl RealFloat for F16 {
     }
 }
 
+impl RealFloat for F80 {
+    fn to_d(self) -> f64 { self.to_f64() }
+    fn from_d(v: f64) -> Self { F80::from_f64(v) }
+    fn r_pow(self, o: Self) -> Self { F80::from_f64(self.to_f64().powf(o.to_f64())) }
+    fn r_atan2(self, o: Self) -> Self { F80::from_f64(self.to_f64().atan2(o.to_f64())) }
+    fn r_hypot(self, o: Self) -> Self { F80::from_f64(self.to_f64().hypot(o.to_f64())) }
+    fn r_copysign(self, o: Self) -> Self { self.copysign(o) }
+    fn r_nextafter(self, o: Self) -> Self { F80::from_f64(next_after_f64(self.to_f64(), o.to_f64())) }
+    fn r_spacing(self) -> Self { F80::from_f64(RealFloat::r_spacing(self.to_f64())) }
+    fn r_logaddexp(self, o: Self) -> Self { F80::from_f64(logaddexp_f64(self.to_f64(), o.to_f64())) }
+    fn r_logaddexp2(self, o: Self) -> Self { F80::from_f64(logaddexp2_f64(self.to_f64(), o.to_f64())) }
+    fn r_heaviside(self, o: Self) -> Self {
+        if self.is_nan() { self } else if self.is_zero() { o }
+        else if self.is_sign_negative() { F80::ZERO } else { F80::ONE }
+    }
+    fn r_fmod(self, o: Self) -> Self { F80::from_f64(self.to_f64() % o.to_f64()) }
+    fn r_divmod(self, o: Self) -> (Self, Self) {
+        let (d, m) = divmod_f64(self.to_f64(), o.to_f64());
+        (F80::from_f64(d), F80::from_f64(m))
+    }
+    fn r_divmod_flags(self, o: Self) -> u8 { self.to_f64().r_divmod_flags(o.to_f64()) }
+    fn r_remainder_flags(self, o: Self) -> u8 { self.to_f64().r_remainder_flags(o.to_f64()) }
+    fn r_ldexp(self, n: i64) -> Self { F80::from_f64(scalbn_f64(self.to_f64(), n)) }
+    fn r_signbit(self) -> bool { self.is_sign_negative() }
+}
+
 /// Smith's algorithm, transcribed from numpy's `@TYPE@_divide` inner loop in
 /// `umath/loops.c.src`.
 ///
@@ -1376,6 +1427,40 @@ macro_rules! impl_complex_ops {
 }
 
 impl_complex_ops!(C32, f32; C64v, f64);
+
+impl Arith for C160 {
+    fn a_add(self, o: Self) -> Self { self.add(o) }
+    fn a_sub(self, o: Self) -> Self { self.sub(o) }
+    fn a_mul(self, o: Self) -> Self { self.mul(o) }
+    fn a_div(self, o: Self) -> Self { self.div(o) }
+}
+impl Cmp for C160 {
+    fn c_eq(self, o: Self) -> bool { self.re.c_eq(o.re) && self.im.c_eq(o.im) }
+    fn c_lt(self, o: Self) -> bool {
+        (self.re.c_lt(o.re) && !self.im.is_nan() && !o.im.is_nan())
+            || (self.re.c_eq(o.re) && self.im.c_lt(o.im))
+    }
+    fn c_le(self, o: Self) -> bool {
+        (self.re.c_lt(o.re) && !self.im.is_nan() && !o.im.is_nan())
+            || (self.re.c_eq(o.re) && self.im.c_le(o.im))
+    }
+    fn c_truthy(self) -> bool { !self.re.is_zero() || !self.im.is_zero() }
+}
+impl MinMax for C160 {
+    fn m_min(self, o: Self) -> Self { if self.fp_nan() || self.c_le(o) { self } else { o } }
+    fn m_max(self, o: Self) -> Self { if self.fp_nan() || o.c_le(self) { self } else { o } }
+    fn m_fmin(self, o: Self) -> Self { if o.fp_nan() || self.c_le(o) { self } else { o } }
+    fn m_fmax(self, o: Self) -> Self { if o.fp_nan() || o.c_le(self) { self } else { o } }
+}
+impl FpClass for C160 {
+    fn fp_nan(self) -> bool { self.re.is_nan() || self.im.is_nan() }
+    fn fp_inf(self) -> bool { self.re.is_infinite() || self.im.is_infinite() }
+    fn fp_zero(self) -> bool { self.re.is_zero() && self.im.is_zero() }
+}
+impl CplxParts for C160 {
+    fn c_re(self) -> f64 { self.re.to_f64() }
+    fn c_im(self) -> f64 { self.im.to_f64() }
+}
 
 // numpy's bool `add` is logical or and `mul` is logical and; `subtract` is
 // rejected before it reaches an inner loop.
@@ -1524,7 +1609,8 @@ fn no_bool(d: DType) -> DType {
 /// `np.hypot(np.uint8(1), np.uint8(1))` comes out float16.
 fn to_float(d: DType) -> DType {
     match d {
-        DType::F16 | DType::F32 | DType::F64 | DType::C64 | DType::C128 => d,
+        DType::F16 | DType::F32 | DType::F64 | DType::F80
+        | DType::C64 | DType::C128 | DType::C160 => d,
         _ => crate::dtype::promote(d, DType::F16),
     }
 }
@@ -1865,7 +1951,9 @@ fn as_i128(s: Scalar) -> i128 {
         Scalar::Int(i) => i as i128,
         Scalar::Uint(u) => u as i128,
         Scalar::Float(f) => f as i128,
+        Scalar::Float80(f) => f.to_f64() as i128,
         Scalar::Complex(c) => c.re as i128,
+        Scalar::Complex160(c) => c.re.to_f64() as i128,
     }
 }
 
@@ -1875,7 +1963,9 @@ fn as_f64(s: Scalar) -> f64 {
         Scalar::Int(i) => i as f64,
         Scalar::Uint(u) => u as f64,
         Scalar::Float(f) => f,
+        Scalar::Float80(f) => f.to_f64(),
         Scalar::Complex(c) => c.re,
+        Scalar::Complex160(c) => c.re.to_f64(),
     }
 }
 
@@ -2047,8 +2137,10 @@ where
         DType::F16 => go!(F16, |x, y, r| scale_flags(x, y, r, true)),
         DType::F32 => go!(f32, |x, y, r| scale_flags(x, y, r, true)),
         DType::F64 => go!(f64, |x, y, r| scale_flags(x, y, r, true)),
+        DType::F80 => go!(F80, |x, y, r| scale_flags(x, y, r, true)),
         DType::C64 => go!(C32, cplx_div_flags),
         DType::C128 => go!(C64v, cplx_div_flags),
+        DType::C160 => go!(C160, cplx_div_flags),
         other => panic!("run_inexact_arith: {other:?}"),
     }
 }
@@ -2077,8 +2169,10 @@ fn run_binary_typed<T: Element + Send + Sync>(
         DType::F16 => run_float_extra::<F16>(a, b, o as *mut F16, n, op),
         DType::F32 => run_float_extra::<f32>(a, b, o as *mut f32, n, op),
         DType::F64 => run_float_extra::<f64>(a, b, o as *mut f64, n, op),
+        DType::F80 => run_float_extra::<F80>(a, b, o as *mut F80, n, op),
         DType::C64 => run_complex_extra::<C32>(a, b, o as *mut C32, n, op),
         DType::C128 => run_complex_extra::<C64v>(a, b, o as *mut C64v, n, op),
+        DType::C160 => run_complex_extra::<C160>(a, b, o as *mut C160, n, op),
         other => panic!("run_binary_typed: unsupported dtype {other:?}"),
     }
 }
@@ -2308,6 +2402,16 @@ impl CplxPow for C32 {
     #[inline]
     fn c_pow(self, o: Self) -> Self {
         cpow_f32(self, o)
+    }
+}
+
+impl CplxPow for C160 {
+    fn c_pow(self, o: Self) -> Self {
+        let r = cpow_f64(
+            C64v::new(self.re.to_f64(), self.im.to_f64()),
+            C64v::new(o.re.to_f64(), o.im.to_f64()),
+        );
+        C160 { re: F80::from_f64(r.re), im: F80::from_f64(r.im) }
     }
 }
 
@@ -2955,8 +3059,10 @@ pub fn binary_scalar(
                 | DType::F16
                 | DType::F32
                 | DType::F64
+                | DType::F80
                 | DType::C64
                 | DType::C128
+                | DType::C160
         )
     };
     if !simple(dta) || !simple(dtb) {
@@ -2999,6 +3105,15 @@ where
             let r = match T::DTYPE {
                 DType::C64 => {
                     let (a, b) = (C32::from_scalar(x.to_scalar()), C32::from_scalar(y.to_scalar()));
+                    flags(
+                        a.c_re().is_nan() || b.c_re().is_nan(),
+                        a.c_im().is_nan() || b.c_im().is_nan(),
+                        a.c_re() == b.c_re(),
+                    );
+                    cmp_pick(a, b, op)
+                }
+                DType::C160 => {
+                    let (a, b) = (C160::from_scalar(x.to_scalar()), C160::from_scalar(y.to_scalar()));
                     flags(
                         a.c_re().is_nan() || b.c_re().is_nan(),
                         a.c_im().is_nan() || b.c_im().is_nan(),
@@ -3103,8 +3218,10 @@ fn scalar_inexact_arith<T: Element + Arith>(x: T, y: T, op: BinOp) -> Scalar {
         DType::F16 => go!(F16, |x, y, r| scale_flags(x, y, r, true)),
         DType::F32 => go!(f32, |x, y, r| scale_flags(x, y, r, true)),
         DType::F64 => go!(f64, |x, y, r| scale_flags(x, y, r, true)),
+        DType::F80 => go!(F80, |x, y, r| scale_flags(x, y, r, true)),
         DType::C64 => go!(C32, cplx_div_flags),
         DType::C128 => go!(C64v, cplx_div_flags),
+        DType::C160 => go!(C160, cplx_div_flags),
         other => panic!("scalar_inexact_arith: {other:?}"),
     }
 }
@@ -3142,8 +3259,10 @@ fn scalar_binary_extra<T: Element>(x: T, y: T, op: BinOp) -> Scalar {
         DType::F16 => scalar_float_extra::<F16>(as_t!(F16), op),
         DType::F32 => scalar_float_extra::<f32>(as_t!(f32), op),
         DType::F64 => scalar_float_extra::<f64>(as_t!(f64), op),
+        DType::F80 => scalar_float_extra::<F80>(as_t!(F80), op),
         DType::C64 => scalar_complex_extra::<C32>(as_t!(C32), op),
         DType::C128 => scalar_complex_extra::<C64v>(as_t!(C64v), op),
+        DType::C160 => scalar_complex_extra::<C160>(as_t!(C160), op),
         other => panic!("scalar_binary_extra: unsupported dtype {other:?}"),
     }
 }

@@ -288,7 +288,9 @@ fn truthy(s: Scalar) -> bool {
         Scalar::Int(i) => i != 0,
         Scalar::Uint(u) => u != 0,
         Scalar::Float(f) => f != 0.0,
+        Scalar::Float80(f) => !f.is_zero(),
         Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
+        Scalar::Complex160(c) => !c.re.is_zero() || !c.im.is_zero(),
     }
 }
 
@@ -299,7 +301,9 @@ fn scalar_to_i64(s: Scalar) -> i64 {
         Scalar::Uint(u) => u as i64,
         Scalar::Bool(b) => b as i64,
         Scalar::Float(f) => f as i64,
+        Scalar::Float80(f) => f.to_f64() as i64,
         Scalar::Complex(c) => c.re as i64,
+        Scalar::Complex160(c) => c.re.to_f64() as i64,
     }
 }
 
@@ -1168,7 +1172,9 @@ pub fn choose(sel: &NdArray, choices: &[NdArray], mode: TakeMode) -> Result<NdAr
             Scalar::Uint(v) => v as i64,
             Scalar::Bool(b) => b as i64,
             Scalar::Float(f) => f as i64,
+            Scalar::Float80(f) => f.to_f64() as i64,
             Scalar::Complex(c) => c.re as i64,
+            Scalar::Complex160(c) => c.re.to_f64() as i64,
         };
         let k = mode.apply(raw, n).ok_or_else(|| {
             Error::ValueError("invalid entry in choice array".to_string())

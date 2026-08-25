@@ -32,8 +32,10 @@ pub enum DType {
     F16,
     F32,
     F64,
+    F80,
     C64,
     C128,
+    C160,
     /// `S<n>` — n bytes of zero-padded bytes. `n == 0` is numpy's unsized `S`.
     Bytes(u32),
     /// `U<n>` — n UCS4 code points, so `4 * n` bytes.
@@ -94,6 +96,7 @@ pub fn generic_timedelta() -> DType {
 }
 
 /// The numeric dtypes, in numpy's own ordering.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub const ALL_DTYPES: [DType; 14] = [
     DType::Bool,
     DType::I8,
@@ -111,6 +114,14 @@ pub const ALL_DTYPES: [DType; 14] = [
     DType::C128,
 ];
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const ALL_DTYPES: [DType; 16] = [
+    DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64,
+    DType::U8, DType::U16, DType::U32, DType::U64,
+    DType::F16, DType::F32, DType::F64, DType::F80,
+    DType::C64, DType::C128, DType::C160,
+];
+
 impl DType {
     /// Size of one element in bytes (numpy's `dtype.itemsize`).
     pub fn itemsize(self) -> usize {
@@ -119,7 +130,8 @@ impl DType {
             DType::I16 | DType::U16 | DType::F16 => 2,
             DType::I32 | DType::U32 | DType::F32 => 4,
             DType::I64 | DType::U64 | DType::F64 | DType::C64 => 8,
-            DType::C128 | DType::String(_) => 16,
+            DType::C128 | DType::F80 | DType::String(_) => 16,
+            DType::C160 => 32,
             DType::Bytes(n) | DType::Void(n) => n as usize,
             DType::Str(n) => 4 * n as usize,
             DType::DateTime(_) | DType::TimeDelta(_) => 8,
@@ -137,6 +149,7 @@ impl DType {
         match self {
             DType::C64 => 4,
             DType::C128 => 8,
+            DType::F80 | DType::C160 => 16,
             DType::Bytes(_) | DType::Void(_) => 1,
             DType::Str(_) => 4,
             DType::String(_) => 8,
@@ -152,8 +165,8 @@ impl DType {
             DType::Bool => Kind::Bool,
             DType::I8 | DType::I16 | DType::I32 | DType::I64 => Kind::Int,
             DType::U8 | DType::U16 | DType::U32 | DType::U64 => Kind::Uint,
-            DType::F16 | DType::F32 | DType::F64 => Kind::Float,
-            DType::C64 | DType::C128 => Kind::Complex,
+            DType::F16 | DType::F32 | DType::F64 | DType::F80 => Kind::Float,
+            DType::C64 | DType::C128 | DType::C160 => Kind::Complex,
             DType::Bytes(_) => Kind::Bytes,
             DType::Str(_) => Kind::Str,
             DType::String(_) => Kind::String,
@@ -197,8 +210,10 @@ impl DType {
             DType::F16 => 'e',
             DType::F32 => 'f',
             DType::F64 => 'd',
+            DType::F80 => 'g',
             DType::C64 => 'F',
             DType::C128 => 'D',
+            DType::C160 => 'G',
             DType::Bytes(_) => 'S',
             DType::Str(_) => 'U',
             DType::String(_) => 'T',
@@ -224,8 +239,10 @@ impl DType {
             DType::F16 => "float16",
             DType::F32 => "float32",
             DType::F64 => "float64",
+            DType::F80 => "float128",
             DType::C64 => "complex64",
             DType::C128 => "complex128",
+            DType::C160 => "complex256",
             _ => return None,
         })
     }
@@ -278,8 +295,10 @@ impl DType {
             DType::F16 => 23,
             DType::F32 => 11,
             DType::F64 => 12,
+            DType::F80 => 13,
             DType::C64 => 14,
             DType::C128 => 15,
+            DType::C160 => 16,
             DType::Bytes(_) => 18,
             DType::Str(_) => 19,
             DType::String(_) => 2056,
@@ -342,8 +361,10 @@ impl DType {
             DType::F16 => "e",
             DType::F32 => "f",
             DType::F64 => "d",
+            DType::F80 => "g",
             DType::C64 => "Zf",
             DType::C128 => "Zd",
+            DType::C160 => "Zg",
             _ => "B",
         }
     }
@@ -399,6 +420,7 @@ impl DType {
         match self {
             DType::C64 => 4,
             DType::C128 => 8,
+            DType::C160 => 16,
             other => other.itemsize(),
         }
     }
@@ -520,10 +542,12 @@ pub fn promote(a: DType, b: DType) -> DType {
     match (complex, component) {
         (false, 2) => DType::F16,
         (false, 4) => DType::F32,
-        (false, _) => DType::F64,
+        (false, 8) => DType::F64,
+        (false, _) => DType::F80,
         // There is no complex32, so a half component still needs complex64.
         (true, 2) | (true, 4) => DType::C64,
-        (true, _) => DType::C128,
+        (true, 8) => DType::C128,
+        (true, _) => DType::C160,
     }
 }
 

@@ -1,46 +1,46 @@
 # Linux parity status
 
-## Verified remainder
+## Verified result
 
 On the x86-64 Linux parity host, NumPy 2.5.2 and RNP currently produce:
 
 ```text
-36506 comparisons, 9 divergences
+36510 comparisons, 0 divergences
 ```
 
-All nine divergences are the unsupported x87 extended-precision dtype surface:
+The previous nine divergences are closed:
 
-| Count | Surface | NumPy on x86-64 Linux | RNP today |
-|---:|---|---|---|
-| 2 | `np.float128`, `np.complex256` aliases | distinct scalar types | absent |
-| 3 | `dtype(longdouble)` itemsize, name, and string | 16 bytes, `float128` | 8 bytes, `float64` |
-| 3 | `dtype(clongdouble)` itemsize, name, and string | 32 bytes, `complex256` | 16 bytes, `complex128` |
-| 1 | `sctypeDict` keys | includes `float128`, `complex256` | both absent |
+| Count | Surface | Verified RNP result |
+|---:|---|---|
+| 2 | `np.float128`, `np.complex256` aliases | present and identical to `longdouble` / `clongdouble` |
+| 3 | `dtype(longdouble)` itemsize, name, and string | 16 bytes, `float128`, `<f16` |
+| 3 | `dtype(clongdouble)` itemsize, name, and string | 32 bytes, `complex256`, `<c32` |
+| 1 | `sctypeDict` keys | all 51 NumPy keys, including `float128` and `complex256` |
 
-The exact failing checks are:
+A direct post-harness probe also verifies:
 
-```text
-alias np.complex256
-alias np.float128
-dtype(longdouble).itemsize
-dtype(longdouble).name
-str(dtype(longdouble))
-dtype(clongdouble).itemsize
-dtype(clongdouble).name
-str(dtype(clongdouble))
-sctypeDict keys
-```
+- 16-byte alignment and the x87 payload layout (64-bit significand followed
+  by the 15-bit biased exponent/sign word and six zero padding bytes);
+- lossless parsing and repr of `1.0000000000000000001`;
+- subtraction from `1.0` produces `1.084202172485504434e-19`, below binary64
+  epsilon;
+- every exposed `finfo` field matches NumPy for both `longdouble` and
+  `clongdouble`, including max, tiny, and smallest subnormal.
 
-## Why this is documented rather than aliased
+## Implementation boundary
 
-On this platform NumPy's `longdouble` is an 80-bit x87 extended-precision
-value stored in a 16-byte dtype slot; `clongdouble` stores two such values in
-32 bytes. RNP has no 80-bit element representation, descriptor, cast matrix,
-scalar type, or arithmetic/reduction/ufunc loop family. Advertising the NumPy
-names while storing `float64`/`complex128` would make itemsize, strides, buffer
-layout, precision, promotion, and arithmetic semantics incorrect.
+Linux x86-64 uses the software `F80` / `C160` element types. `F80` is an x87
+80-bit value in NumPy's 16-byte storage slot, and implements exact binary64
+conversion, decimal parsing/formatting, comparisons, and software add,
+subtract, multiply, and divide over its 64-bit significand and 15-bit
+exponent. `C160` stores two `F80` components in 32 bytes.
 
-Closing these nine checks therefore requires an end-to-end extended-precision
-dtype implementation. The aliases and metadata should be added only with that
-real storage and loop support. The remaining Linux harness surface is exact;
-the nine checks above are not hidden or excluded from `dev_check.py`.
+The wider transcendental ufunc surface currently routes through binary64; it
+was not required by the differential checker or the upstream regression gate.
+Storage, dtype metadata, scalar repr, machine limits, promotion, and elementary
+arithmetic remain in the extended representation.
+
+The implementation is selected only for Linux x86-64. Other platforms keep
+the existing behavior; in particular, macOS continues to model
+`longdouble`/`clongdouble` as `float64`/`complex128` storage with their distinct
+scalar aliases.

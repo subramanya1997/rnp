@@ -7,13 +7,45 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyComplex, PyFloat, PyInt, PyList, PySequence, PyString, PyTuple};
 
 use rnp_core::descr::Descr;
-use rnp_core::{promote, DType, NdArray, Scalar};
+use rnp_core::{promote, C160, DType, F80, NdArray, Scalar};
 
 use crate::pyarray::PyNdArray;
+
+#[pyclass(name = "_F80Value", module = "_rnp", frozen, skip_from_py_object)]
+#[derive(Copy, Clone)]
+pub struct PyF80Value { pub value: F80 }
+
+#[pymethods]
+impl PyF80Value {
+    fn __float__(&self) -> f64 { self.value.to_f64() }
+    fn __int__(&self) -> i64 { self.value.to_f64() as i64 }
+    fn __bool__(&self) -> bool { !self.value.is_zero() }
+    fn __str__(&self) -> String { self.value.to_shortest_string() }
+    fn __repr__(&self) -> String { self.value.to_shortest_string() }
+    #[getter] fn real(&self) -> Self { *self }
+    #[getter] fn imag(&self) -> Self { Self { value: F80::ZERO } }
+}
+
+#[pyclass(name = "_C160Value", module = "_rnp", frozen, skip_from_py_object)]
+#[derive(Copy, Clone)]
+pub struct PyC160Value { pub value: C160 }
+
+#[pymethods]
+impl PyC160Value {
+    fn __complex__<'py>(&self, py: Python<'py>) -> Bound<'py, PyComplex> {
+        PyComplex::from_doubles(py, self.value.re.to_f64(), self.value.im.to_f64())
+    }
+    fn __bool__(&self) -> bool { !self.value.re.is_zero() || !self.value.im.is_zero() }
+    #[getter] fn real(&self) -> PyF80Value { PyF80Value { value: self.value.re } }
+    #[getter] fn imag(&self) -> PyF80Value { PyF80Value { value: self.value.im } }
+    fn conjugate(&self) -> Self { Self { value: C160 { re: self.value.re, im: self.value.im.neg() } } }
+}
 
 /// Convert a Python scalar to a core `Scalar`. Returns `None` for anything
 /// that is not a recognised scalar (sequences, arrays, ...).
 pub fn scalar_from_py(obj: &Bound<'_, PyAny>) -> Option<Scalar> {
+    if let Ok(v) = obj.extract::<PyRef<'_, PyF80Value>>() { return Some(Scalar::Float80(v.value)); }
+    if let Ok(v) = obj.extract::<PyRef<'_, PyC160Value>>() { return Some(Scalar::Complex160(v.value)); }
     // bool first: it is a subclass of int.
     if obj.is_instance_of::<PyBool>() {
         return Some(Scalar::Bool(obj.extract::<bool>().ok()?));
@@ -44,7 +76,9 @@ pub fn scalar_to_py<'py>(py: Python<'py>, s: Scalar) -> PyResult<Bound<'py, PyAn
         Scalar::Int(i) => i.into_pyobject(py)?.into_any(),
         Scalar::Uint(u) => u.into_pyobject(py)?.into_any(),
         Scalar::Float(f) => f.into_pyobject(py)?.into_any(),
+        Scalar::Float80(f) => Py::new(py, PyF80Value { value: f })?.into_bound(py).into_any(),
         Scalar::Complex(c) => PyComplex::from_doubles(py, c.re, c.im).into_any(),
+        Scalar::Complex160(c) => Py::new(py, PyC160Value { value: c })?.into_bound(py).into_any(),
     })
 }
 
@@ -468,7 +502,19 @@ pub fn check_int_store(target: DType, src: Option<DType>, v: Scalar) -> PyResult
                 t as i128
             }
         }
-        Scalar::Complex(_) => return Ok(()),
+        Scalar::Float80(f) => {
+            let f = f.to_f64();
+            if !f.is_finite() {
+                if src.is_some() && !signed { return Ok(()); }
+                return Err(if f.is_nan() {
+                    PyValueError::new_err("cannot convert float NaN to integer")
+                } else {
+                    pyo3::exceptions::PyOverflowError::new_err("cannot convert float infinity to integer")
+                });
+            }
+            f.trunc() as i128
+        }
+        Scalar::Complex(_) | Scalar::Complex160(_) => return Ok(()),
     };
     // An *unsigned* target does not check a numpy scalar at all: probed,
     // `np.array([np.int64(-1)], dtype=np.uint8)` is 255 and
@@ -1037,7 +1083,8 @@ pub fn weak_kind_promote(arr: DType, s: Scalar) -> DType {
         Scalar::Bool(_) => (0, ()),
         Scalar::Int(_) | Scalar::Uint(_) => (1, ()),
         Scalar::Float(_) => (2, ()),
-        Scalar::Complex(_) => (3, ()),
+        Scalar::Float80(_) => (2, ()),
+        Scalar::Complex(_) | Scalar::Complex160(_) => (3, ()),
     };
     if scalar_level <= arr_level {
         return arr;
@@ -1255,7 +1302,9 @@ fn datetime_element(
                         dtm::NAT
                     }
                 }
+                Scalar::Float80(f) => if f.is_finite() { f.to_f64() as i64 } else { dtm::NAT },
                 Scalar::Complex(c) => c.re as i64,
+                Scalar::Complex160(c) => c.re.to_f64() as i64,
             },
             None,
         ));

@@ -289,7 +289,9 @@ fn int_values(a: &NdArray) -> Vec<i64> {
             Scalar::Uint(u) => u as i64,
             Scalar::Bool(b) => b as i64,
             Scalar::Float(f) => f as i64,
+            Scalar::Float80(f) => f.to_f64() as i64,
             Scalar::Complex(c) => c.re as i64,
+            Scalar::Complex160(c) => c.re.to_f64() as i64,
         })
         .collect()
 }
@@ -1874,7 +1876,9 @@ impl PyNdArray {
                 Scalar::Uint(u) => u as i64,
                 Scalar::Bool(b) => b as i64,
                 Scalar::Float(f) => f as i64,
+                Scalar::Float80(f) => f.to_f64() as i64,
                 Scalar::Complex(c) => c.re as i64,
+                Scalar::Complex160(c) => c.re.to_f64() as i64,
             })
             .collect();
         let vals = array_from_any(values, Some(self.arr.dtype()), false)?;
@@ -2376,7 +2380,9 @@ impl PyNdArray {
                 Scalar::Int(i) => i != 0,
                 Scalar::Uint(u) => u != 0,
                 Scalar::Float(f) => f != 0.0,
+                Scalar::Float80(f) => !f.is_zero(),
                 Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
+                Scalar::Complex160(c) => !c.re.is_zero() || !c.im.is_zero(),
             }),
             0 => Err(PyValueError::new_err(
                 "The truth value of an empty array is ambiguous.",
@@ -2399,7 +2405,9 @@ impl PyNdArray {
             Scalar::Int(i) => i as f64,
             Scalar::Uint(u) => u as f64,
             Scalar::Float(f) => f,
+            Scalar::Float80(f) => f.to_f64(),
             Scalar::Complex(c) => c.re,
+            Scalar::Complex160(c) => c.re.to_f64(),
         })
     }
 
@@ -2414,7 +2422,9 @@ impl PyNdArray {
             Scalar::Int(i) => i,
             Scalar::Uint(u) => u as i64,
             Scalar::Float(f) => f as i64,
+            Scalar::Float80(f) => f.to_f64() as i64,
             Scalar::Complex(c) => c.re as i64,
+            Scalar::Complex160(c) => c.re.to_f64() as i64,
         })
     }
 
@@ -2875,7 +2885,9 @@ fn as_i64(s: Scalar) -> i64 {
         Scalar::Uint(u) => u as i64,
         Scalar::Bool(b) => b as i64,
         Scalar::Float(f) => f as i64,
+        Scalar::Float80(f) => f.to_f64() as i64,
         Scalar::Complex(c) => c.re as i64,
+        Scalar::Complex160(c) => c.re.to_f64() as i64,
     }
 }
 
@@ -2921,7 +2933,9 @@ impl PyNdArray {
                 Scalar::Int(i) => i != 0,
                 Scalar::Uint(u) => u != 0,
                 Scalar::Float(f) => f != 0.0,
+                Scalar::Float80(f) => !f.is_zero(),
                 Scalar::Complex(c) => c.re != 0.0 || c.im != 0.0,
+                Scalar::Complex160(c) => !c.re.is_zero() || !c.im.is_zero(),
             }
         };
         let tuple_axis = axis.is_some_and(|a| !a.is_none() && a.extract::<isize>().is_err());

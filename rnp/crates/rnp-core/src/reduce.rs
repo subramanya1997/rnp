@@ -15,6 +15,7 @@
 use crate::array::NdArray;
 use crate::dtype::{DType, Kind};
 use crate::element::{C64v, Element, Scalar, C32, F16};
+use crate::f80::{C160, F80};
 use crate::error::{Error, Result};
 use crate::ops::Arith;
 
@@ -525,6 +526,14 @@ impl MaybeNan for C64v {
         self.re.is_nan() || self.im.is_nan()
     }
 }
+impl MaybeNan for F80 {
+    fn elem_is_nan(self) -> bool { self.is_nan() }
+    fn is_neg_zero(self) -> bool { self.is_zero() && self.is_sign_negative() }
+    fn is_pos_zero(self) -> bool { self.is_zero() && !self.is_sign_negative() }
+}
+impl MaybeNan for C160 {
+    fn elem_is_nan(self) -> bool { self.re.is_nan() || self.im.is_nan() }
+}
 
 /// The ordered max/min of two elements, ignoring NaN and signed zero (both
 /// are corrected afterwards in `extreme_contig`).
@@ -562,8 +571,10 @@ extreme_by_cmp!(
     u64,
     crate::element::NpBool,
     F16,
+    F80,
     C32,
-    C64v
+    C64v,
+    C160
 );
 
 macro_rules! extreme_by_intrinsic {

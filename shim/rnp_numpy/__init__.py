@@ -877,6 +877,10 @@ from ._scalars import (  # noqa: E402,F401
 )
 from ._scalars import False_, True_  # noqa: E402
 
+if hasattr(_sc, "float128"):
+    float128 = _sc.float128
+    complex256 = _sc.complex256
+
 bool = bool_
 float_ = float64
 complex_ = complex128
@@ -1546,6 +1550,14 @@ class finfo:
                         precision=15, resolution=1e-15,
                         epsneg=1.1102230246251565e-16, iexp=11, machep=-52,
                         negep=-53, maxexp=1024, minexp=-1022),
+        "float128": dict(bits=128, eps="1.084202172485504434e-19",
+                         max="1.189731495357231765e+4932",
+                         min="-1.189731495357231765e+4932",
+                         tiny="3.3621031431120935063e-4932", nmant=63,
+                         nexp=15, precision=18, resolution="1e-18",
+                         epsneg="5.42101086242752217e-20", iexp=15,
+                         machep=-63, negep=-64, maxexp=16384,
+                         minexp=-16382),
     }
 
     #: Attributes numpy exposes as scalars *of the inspected dtype* rather
@@ -1560,7 +1572,8 @@ class finfo:
     def __init__(self, float_type):
         d = dtype(float_type)
         if d.kind == "c":
-            d = dtype("float32" if d.itemsize == 8 else "float64")
+            d = dtype("float32" if d.itemsize == 8 else
+                      "float128" if d.itemsize == 32 else "float64")
         if d.name not in self._PARAMS:
             raise ValueError(f"data type {d.name!r} not inexact")
         self.dtype = d
@@ -1570,6 +1583,7 @@ class finfo:
         self.smallest_normal = self.tiny
         self.smallest_subnormal = _scalar({
             "float16": 6e-08, "float32": 1e-45, "float64": 5e-324,
+            "float128": "4e-4951",
         }[d.name])
 
     def __repr__(self):

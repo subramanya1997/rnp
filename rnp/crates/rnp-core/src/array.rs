@@ -180,11 +180,13 @@ pub fn swap_layout(dt: DType) -> Option<(usize, usize)> {
         DType::I16 | DType::U16 | DType::F16 => Some((2, 1)),
         DType::I32 | DType::U32 | DType::F32 => Some((4, 1)),
         DType::I64 | DType::U64 | DType::F64 => Some((8, 1)),
+        DType::F80 => Some((16, 1)),
         DType::DateTime(_) | DType::TimeDelta(_) => Some((8, 1)),
         // A complex is two reals side by side; the *halves* swap, the pair
         // order does not. This is what numpy's `@TYPE@_copyswapn` does.
         DType::C64 => Some((4, 2)),
         DType::C128 => Some((8, 2)),
+        DType::C160 => Some((16, 2)),
         // `U<n>` is n UCS4 code points, each swapped independently.
         DType::Str(n) => {
             if n == 0 {
@@ -642,7 +644,9 @@ impl NdArray {
                 Scalar::Int(i) => i as u64,
                 Scalar::Uint(u) => u,
                 Scalar::Float(f) => f.to_bits(),
+                Scalar::Float80(f) => f.significand,
                 Scalar::Complex(c) => c.re.to_bits(),
+                Scalar::Complex160(c) => c.re.significand,
             };
             self.write_raw_at(byte_off, &bits.to_le_bytes());
             return;
