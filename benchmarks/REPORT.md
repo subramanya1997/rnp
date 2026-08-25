@@ -79,3 +79,23 @@ Ratio = port µs / NumPy µs — **below 1.0 means the port is faster**. Raw num
   optimization pass routed the float matmul family through Accelerate under
   NumPy's exact blasability predicate and added thresholded Rayon parallelism,
   producing the table above with the differential checkers still at zero.
+
+## Round 2 (2026-08-25)
+
+Dispatch-layer pass on the losing rows, differential checkers at zero throughout:
+
+| Case | Round 1 | Round 2 |
+|---|---:|---:|
+| matmul f64 32² | 1.78× | **1.19×** |
+| matmul f32 32² | 2.03× | **1.25×** |
+| matmul f64/f32 128² | 1.11× / 1.24× | **1.02× / 1.10×** |
+| matvec f64 512 | 1.31× | **1.05×** |
+| dot f64 256² | 1.17× | **0.99×** |
+| batched 4096×8×8 | 1.06× | **1.02×** |
+| bitwise_and i32 1M | 1.21× | **1.02×** (noise-level) |
+| scalar add / extract / slice view | 1.6–7× | improved, still >1 |
+
+The remaining >1 rows are sub-microsecond fixed costs (PyO3 object construction,
+Python-defined scalar classes). Reaching parity there requires native extension
+scalar types and a C-level view header — recorded as future architecture work,
+not further dispatch shaving.

@@ -69,8 +69,9 @@ lower is faster):
 | matmul int32 256² | 0.12× | 8.6× faster |
 | boolean mask / setitem | 0.37–0.49× | ~2.5× faster |
 | `add.reduce` (f64) | 0.64× | 1.6× faster |
-| matmul f64 512², vecdot 1M | 1.00–1.01× | BLAS parity |
-| scalar ops / slice views | 1.5–7× | fixed ~0.4 µs dispatch overhead |
+| matmul f64 512², dot 256², vecdot 1M | 0.97–1.02× | BLAS parity |
+| matmul 32² / matvec | 1.05–1.25× | small-size dispatch, ~0.3 µs |
+| scalar ops / slice views | 1.5–7× | fixed sub-µs overhead; needs native scalar types |
 
 NumPy is single-threaded for elementwise work; the port parallelizes with Rayon above
 a size threshold **without changing any result bit** (reductions keep NumPy's exact
@@ -90,8 +91,11 @@ third-party code:
   append-only slab (deliberate correctness-first trade); long-running churn of object
   arrays leaks memory until per-element refcounting lands.
 - **Threading unaudited.** The multithreading test file does not collect yet.
-- **One platform proven.** All parity claims are for macOS arm64 + Accelerate;
-  Linux/x86 needs its own differential run.
+- **Linux x86_64: 99.975% bit-exact.** The Linux build (dlopening numpy's own
+  bundled OpenBLAS) passes the differential harness at 36,506 comparisons with
+  9 remaining divergences — all 80-bit x87 `longdouble` storage items,
+  documented in [`harness/LINUX_PARITY.md`](harness/LINUX_PARITY.md). macOS
+  arm64 remains fully bit-exact.
 
 ## Layout
 
