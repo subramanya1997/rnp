@@ -113,13 +113,25 @@ fn lanes(arr: &NdArray, axis: usize) -> Vec<Vec<isize>> {
 /// cannot propagate a Python exception, so object lanes use insertion sort;
 /// object arrays in NumPy's own tests are small and this preserves the first
 /// rich-comparison failure verbatim.
-fn lane_order(py: Python<'_>, arr: &NdArray, lane: &[isize]) -> PyResult<Vec<usize>> {
+fn lane_order(
+    py: Python<'_>,
+    arr: &NdArray,
+    lane: &[isize],
+    descending: bool,
+) -> PyResult<Vec<usize>> {
     let mut order: Vec<usize> = (0..lane.len()).collect();
     for i in 1..order.len() {
         let mut j = i;
-        while j > 0
-            && compare_at(py, arr, lane[order[j]], lane[order[j - 1]])? == Ordering::Less
-        {
+        while j > 0 {
+            let ordering = compare_at(py, arr, lane[order[j]], lane[order[j - 1]])?;
+            let out_of_order = if descending {
+                ordering == Ordering::Greater
+            } else {
+                ordering == Ordering::Less
+            };
+            if !out_of_order {
+                break;
+            }
             order.swap(j, j - 1);
             j -= 1;
         }
@@ -127,14 +139,19 @@ fn lane_order(py: Python<'_>, arr: &NdArray, lane: &[isize]) -> PyResult<Vec<usi
     Ok(order)
 }
 
-pub fn sort_inplace(py: Python<'_>, arr: &NdArray, axis: usize) -> PyResult<()> {
+pub fn sort_inplace(
+    py: Python<'_>,
+    arr: &NdArray,
+    axis: usize,
+    descending: bool,
+) -> PyResult<()> {
     if !arr.flags.writeable {
         return Err(PyValueError::new_err(
             "assignment destination is read-only",
         ));
     }
     for lane in lanes(arr, axis) {
-        let order = lane_order(py, arr, &lane)?;
+        let order = lane_order(py, arr, &lane, descending)?;
         let values: Vec<Scalar> = lane.iter().map(|&off| arr.read_at(off)).collect();
         for (dst, &src) in lane.iter().zip(order.iter()) {
             arr.write_at(*dst, values[src]);
@@ -143,7 +160,12 @@ pub fn sort_inplace(py: Python<'_>, arr: &NdArray, axis: usize) -> PyResult<()> 
     Ok(())
 }
 
-pub fn argsort(py: Python<'_>, arr: &NdArray, axis: usize) -> PyResult<NdArray> {
+pub fn argsort(
+    py: Python<'_>,
+    arr: &NdArray,
+    axis: usize,
+    descending: bool,
+) -> PyResult<NdArray> {
     let out = NdArray::zeros(arr.shape.clone(), DType::I64).map_err(crate::err)?;
     if arr.ndim() == 0 {
         out.write_at(out.byte_offset, Scalar::Int(0));
@@ -157,7 +179,7 @@ pub fn argsort(py: Python<'_>, arr: &NdArray, axis: usize) -> PyResult<NdArray> 
     let bases: Vec<isize> =
         rnp_core::iter::offsets(&shape, &strides, out.byte_offset).collect();
     for (lane, base) in lanes(arr, axis).iter().zip(bases) {
-        let order = lane_order(py, arr, lane)?;
+        let order = lane_order(py, arr, lane, descending)?;
         for k in 0..n as usize {
             out.write_at(
                 base + k as isize * out_step,

@@ -94,6 +94,7 @@ _objectops.install(ndarray)
 _rnp_zeros = zeros
 _rnp_empty = empty
 _rnp_ones = ones
+_DESCENDING_UNSET = object()
 
 
 def _normalize_alloc_order(order):
@@ -663,17 +664,28 @@ def ravel(a):
     return _asarr(a).ravel()
 
 
-def sort(a, axis=-1, kind=None, order=None, *, stable=None):
+def sort(a, axis=-1, kind=None, order=None, *, stable=None,
+         descending=_DESCENDING_UNSET):
+    original_type = type(a) if isinstance(a, ndarray) else ndarray
     a = _asarr(a).copy()
+    if original_type is not ndarray:
+        a = a.view(original_type)
     if axis is None:
         a = a.ravel()
         axis = -1
-    a.sort(axis, kind, order, stable=stable)
+    kwargs = {"stable": stable}
+    if descending is not _DESCENDING_UNSET:
+        kwargs["descending"] = descending
+    a.sort(axis=axis, kind=kind, order=order, **kwargs)
     return a
 
 
-def argsort(a, axis=-1, kind=None, order=None, *, stable=None):
-    return _asarr(a).argsort(axis, kind, order, stable=stable)
+def argsort(a, axis=-1, kind=None, order=None, *, stable=None,
+            descending=_DESCENDING_UNSET):
+    kwargs = {"stable": stable}
+    if descending is not _DESCENDING_UNSET:
+        kwargs["descending"] = descending
+    return _asarr(a).argsort(axis=axis, kind=kind, order=order, **kwargs)
 
 
 def partition(a, kth, axis=-1, kind="introselect", order=None):

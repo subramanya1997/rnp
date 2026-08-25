@@ -12,26 +12,45 @@ use crate::array::NdArray;
 use crate::element::Scalar;
 use crate::error::{Error, Result};
 
-/// numpy's float order: NaN is greater than everything, NaNs tie.
-fn cmp_f64(a: f64, b: f64) -> Ordering {
+/// NumPy's float order leaves NaNs last in both ascending and descending order.
+fn cmp_f64_direction(a: f64, b: f64, descending: bool) -> Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
+        (false, false) if descending => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
         (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
     }
 }
 
 /// numpy's total order on one element value.
 pub fn cmp_scalar(a: Scalar, b: Scalar) -> Ordering {
+    cmp_scalar_direction(a, b, false)
+}
+
+fn cmp_scalar_direction(a: Scalar, b: Scalar, descending: bool) -> Ordering {
     match (a, b) {
-        (Scalar::Bool(x), Scalar::Bool(y)) => x.cmp(&y),
-        (Scalar::Int(x), Scalar::Int(y)) => x.cmp(&y),
-        (Scalar::Uint(x), Scalar::Uint(y)) => x.cmp(&y),
-        (Scalar::Complex(x), Scalar::Complex(y)) => {
-            cmp_f64(x.re, y.re).then_with(|| cmp_f64(x.im, y.im))
+        (Scalar::Bool(x), Scalar::Bool(y)) => {
+            if descending { y.cmp(&x) } else { x.cmp(&y) }
         }
-        _ => cmp_f64(a.as_f64(), b.as_f64()),
+        (Scalar::Int(x), Scalar::Int(y)) => {
+            if descending { y.cmp(&x) } else { x.cmp(&y) }
+        }
+        (Scalar::Uint(x), Scalar::Uint(y)) => {
+            if descending { y.cmp(&x) } else { x.cmp(&y) }
+        }
+        (Scalar::Complex(x), Scalar::Complex(y)) => {
+            let x_class = (u8::from(x.re.is_nan()) << 1) | u8::from(x.im.is_nan());
+            let y_class = (u8::from(y.re.is_nan()) << 1) | u8::from(y.im.is_nan());
+            x_class.cmp(&y_class).then_with(|| match x_class {
+                0 => cmp_f64_direction(x.re, y.re, descending)
+                    .then_with(|| cmp_f64_direction(x.im, y.im, descending)),
+                1 => cmp_f64_direction(x.re, y.re, descending),
+                2 => cmp_f64_direction(x.im, y.im, descending),
+                _ => Ordering::Equal,
+            })
+        }
+        _ => cmp_f64_direction(a.as_f64(), b.as_f64(), descending),
     }
 }
 
@@ -178,28 +197,36 @@ fn key_at(plan: &KeyPlan, off: isize) -> Key {
     )
 }
 
-/// numpy's datetime order: NaT is greater than everything and ties with
-/// itself, exactly as NaN does for floats (probed: `np.sort` puts NaT last).
-fn cmp_time(a: i64, b: i64) -> Ordering {
+/// NumPy's datetime order leaves NaT last in both sort directions.
+fn cmp_time_direction(a: i64, b: i64, descending: bool) -> Ordering {
     match (a == crate::datetime::NAT, b == crate::datetime::NAT) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
+        (false, false) if descending => b.cmp(&a),
         (false, false) => a.cmp(&b),
     }
 }
 
 fn cmp_key(a: &Key, b: &Key) -> Ordering {
+    cmp_key_direction(a, b, false)
+}
+
+fn cmp_key_direction(a: &Key, b: &Key, descending: bool) -> Ordering {
     match (a, b) {
-        (Key::Num(x), Key::Num(y)) => cmp_scalar(*x, *y),
-        (Key::Time(x), Key::Time(y)) => cmp_time(*x, *y),
-        (Key::Text(x), Key::Text(y)) => x.cmp(y),
-        (Key::Raw(x), Key::Raw(y)) => x.cmp(y),
+        (Key::Num(x), Key::Num(y)) => cmp_scalar_direction(*x, *y, descending),
+        (Key::Time(x), Key::Time(y)) => cmp_time_direction(*x, *y, descending),
+        (Key::Text(x), Key::Text(y)) => {
+            if descending { y.cmp(x) } else { x.cmp(y) }
+        }
+        (Key::Raw(x), Key::Raw(y)) => {
+            if descending { y.cmp(x) } else { x.cmp(y) }
+        }
         // A structured element compares on its first field, then on the
         // second when those tie, and so on -- numpy's `VOID_compare`.
         (Key::Fields(x), Key::Fields(y)) => {
             for (p, q) in x.iter().zip(y.iter()) {
-                let c = cmp_key(p, q);
+                let c = cmp_key_direction(p, q, descending);
                 if c != Ordering::Equal {
                     return c;
                 }
@@ -214,6 +241,16 @@ fn cmp_key(a: &Key, b: &Key) -> Ordering {
 /// default introsort is not stable but nothing observable depends on which
 /// equal element wins, so both use the same (stable) implementation.
 pub fn sort_inplace(arr: &mut NdArray, axis: usize, _stable: bool) -> Result<()> {
+    sort_inplace_direction(arr, axis, _stable, false)
+}
+
+/// Direction-aware sort used by NumPy 2.5's `descending=` keyword.
+pub fn sort_inplace_direction(
+    arr: &mut NdArray,
+    axis: usize,
+    _stable: bool,
+    descending: bool,
+) -> Result<()> {
     check_axis(arr, axis)?;
     if arr.dtype().is_object() {
         return Err(Error::NotImplemented("sort on object arrays".into()));
@@ -232,7 +269,7 @@ pub fn sort_inplace(arr: &mut NdArray, axis: usize, _stable: bool) -> Result<()>
         let n = lane.len();
         let mut order: Vec<usize> = (0..n).collect();
         let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
-        order.sort_by(|&i, &j| cmp_key(&keys[i], &keys[j]));
+        order.sort_by(|&i, &j| cmp_key_direction(&keys[i], &keys[j], descending));
         // Snapshot the raw bytes, then lay them back down in order; writing
         // in place would clobber sources still to be read.
         scratch.clear();
@@ -251,6 +288,16 @@ pub fn sort_inplace(arr: &mut NdArray, axis: usize, _stable: bool) -> Result<()>
 /// documents for equal keys under `kind='stable'` and produces in practice
 /// for the small inputs the tests use.
 pub fn argsort(arr: &NdArray, axis: usize, _stable: bool) -> Result<NdArray> {
+    argsort_direction(arr, axis, _stable, false)
+}
+
+/// Direction-aware argsort used by NumPy 2.5's `descending=` keyword.
+pub fn argsort_direction(
+    arr: &NdArray,
+    axis: usize,
+    _stable: bool,
+    descending: bool,
+) -> Result<NdArray> {
     check_axis(arr, axis)?;
     if arr.dtype().is_object() {
         return Err(Error::NotImplemented("argsort on object arrays".into()));
@@ -267,7 +314,7 @@ pub fn argsort(arr: &NdArray, axis: usize, _stable: bool) -> Result<NdArray> {
     for (lane, &base) in lanes(arr, axis).iter().zip(out_bases.iter()) {
         let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
         let mut order: Vec<usize> = (0..lane.len()).collect();
-        order.sort_by(|&i, &j| cmp_key(&keys[i], &keys[j]));
+        order.sort_by(|&i, &j| cmp_key_direction(&keys[i], &keys[j], descending));
         for k in 0..n as usize {
             out.write_at(base + k as isize * out_step, Scalar::Int(order[k] as i64));
         }
@@ -553,6 +600,45 @@ mod tests {
         let o = argsort(&a, 0, false).unwrap();
         let got: Vec<i64> = (0..4).map(|i| o.get_flat(i).as_f64() as i64).collect();
         assert_eq!(got, vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn descending_keeps_nan_last_and_equal_indices_stable() {
+        let mut a = f64_array(&[2.0, f64::NAN, 1.0, 2.0, f64::NAN]);
+        let indices = argsort_direction(&a, 0, true, true).unwrap();
+        let got: Vec<i64> = (0..5)
+            .map(|i| indices.get_flat(i).as_f64() as i64)
+            .collect();
+        assert_eq!(got, vec![0, 3, 2, 1, 4]);
+
+        sort_inplace_direction(&mut a, 0, true, true).unwrap();
+        assert_eq!(a.get_flat(0).as_f64(), 2.0);
+        assert_eq!(a.get_flat(1).as_f64(), 2.0);
+        assert_eq!(a.get_flat(2).as_f64(), 1.0);
+        assert!(a.get_flat(3).as_f64().is_nan());
+        assert!(a.get_flat(4).as_f64().is_nan());
+    }
+
+    #[test]
+    fn complex_nan_classes_precede_directional_value_order() {
+        let finite = Scalar::Complex(num_complex::Complex64::new(2.0, 2.0));
+        let imag_nan = Scalar::Complex(num_complex::Complex64::new(1.0, f64::NAN));
+        let real_nan = Scalar::Complex(num_complex::Complex64::new(f64::NAN, 1.0));
+        let both_nan = Scalar::Complex(num_complex::Complex64::new(f64::NAN, f64::NAN));
+        for descending in [false, true] {
+            assert_eq!(
+                cmp_scalar_direction(finite, imag_nan, descending),
+                Ordering::Less
+            );
+            assert_eq!(
+                cmp_scalar_direction(imag_nan, real_nan, descending),
+                Ordering::Less
+            );
+            assert_eq!(
+                cmp_scalar_direction(real_nan, both_nan, descending),
+                Ordering::Less
+            );
+        }
     }
 
     /// A tiny xorshift so the randomised checks below are deterministic and

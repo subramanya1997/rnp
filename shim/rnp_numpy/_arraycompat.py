@@ -988,7 +988,7 @@ def _make_str_inplace(name, fn):
     return inplace
 
 
-def _string_sort_values(arr):
+def _string_sort_values(arr, descending=False):
     """Return StringDType values in NumPy order, with NaN-like NAs last."""
     from ._core.strings import _is_nan_na
     values = arr.tolist()
@@ -1001,22 +1001,26 @@ def _string_sort_values(arr):
             missing.append((value, index))
         else:
             raise ValueError("Cannot compare null that is not a nan-like value")
-    strings.sort(key=lambda item: item[0])
+    strings.sort(key=lambda item: item[0], reverse=bool(descending))
     return strings + missing
 
 
-def sort_method(self, axis=-1, kind=None, order=None, *, stable=None):
+def sort_method(self, axis=-1, kind=None, order=None, *, stable=None,
+                descending=None):
     if self.dtype.kind != "T" or self.ndim != 1 or axis not in (-1, 0):
-        return _orig_sort(self, axis, kind, order, stable=stable)
-    ordered = _string_sort_values(self)
+        return _orig_sort(self, axis, kind, order, stable=stable,
+                          descending=descending)
+    ordered = _string_sort_values(self, descending)
     self[:] = [value for value, _ in ordered]
     return None
 
 
-def argsort_method(self, axis=-1, kind=None, order=None, *, stable=None):
+def argsort_method(self, axis=-1, kind=None, order=None, *, stable=None,
+                   descending=None):
     if self.dtype.kind != "T" or self.ndim != 1 or axis not in (-1, 0):
-        return _orig_argsort(self, axis, kind, order, stable=stable)
-    ordered = _string_sort_values(self)
+        return _orig_argsort(self, axis, kind, order, stable=stable,
+                             descending=descending)
+    ordered = _string_sort_values(self, descending)
     return _pkg().array([index for _, index in ordered], dtype=_pkg().intp)
 
 
