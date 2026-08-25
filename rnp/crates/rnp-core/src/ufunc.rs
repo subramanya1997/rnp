@@ -1495,9 +1495,14 @@ mod tests {
             get_c(&unary(&t, UnOp::Log10).unwrap(), 0).re,
             -307.6526555685888
         );
-        // sin(x+0j) keeps the imaginary zero positive.
+        // The C99 complex libm controls the zero sign: Apple keeps it
+        // positive, while glibc returns -0 for this huge real input.
         let big = c128(&[(f64::MAX, 0.0)]);
-        assert!(get_c(&unary(&big, UnOp::Sin).unwrap(), 0).im.is_sign_positive());
+        let sin_big = get_c(&unary(&big, UnOp::Sin).unwrap(), 0);
+        assert_eq!(
+            sin_big.im.is_sign_negative(),
+            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        );
         assert_eq!(
             get_c(&unary(&big, UnOp::Tan).unwrap(), 0),
             C64v::new(-0.004962015874444894, 0.0)
