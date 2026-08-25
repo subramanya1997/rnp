@@ -410,6 +410,12 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
         from . import _datetime as _dtmod  # noqa: F401
         strs = _rnp._datetime_strings(self, casting="unsafe")
         width = dt.itemsize // (4 if dt.kind == "U" else 1)
+        if (src.kind == "M" and width
+                and _b.any(len(text) > width for text in strs)):
+            raise RuntimeError(
+                "The string provided for NumPy ISO datetime formatting was "
+                f"too short, with length {width}"
+            )
         if width == 0:
             width = _rnp._datetime_string_len(src)
         out = _empty(self.shape, _dtype(f"{dt.char}{width}"))
@@ -843,6 +849,23 @@ def array_wrap(self, array, context=None, return_scalar=False):
 
 def setitem(self, key, value):
     _check_advanced_index_size(key)
+    value_dtype = getattr(value, "dtype", None)
+    is_time_scalar = (not isinstance(value, ndarray)
+                      and value_dtype is not None
+                      and value_dtype.kind in "mM")
+    time_name = str(value_dtype) if is_time_scalar else ""
+    rejects_integer_assignment = (
+        is_time_scalar and self.dtype.kind in "iu"
+        and (value_dtype.kind == "M"
+             or time_name not in ("timedelta64", "timedelta64[ns]"))
+    )
+    if rejects_integer_assignment:
+        raise TypeError(
+            f"int() argument must be a string, a bytes-like object or a "
+            f"real number, not '{type(value).__name__}'"
+        )
+    if is_time_scalar and self.dtype.kind in "SU":
+        value = str(value)
     # `a[dst] = a[src]` must behave as if the right-hand side were read in
     # full before anything is written, exactly as numpy's PyArray_AssignArray
     # does: when source and destination alias, materialise the source first.

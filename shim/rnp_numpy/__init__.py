@@ -357,6 +357,14 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
             _void_dt = globals()["dtype"](dtype)
         except (TypeError, ValueError):
             _void_dt = None
+        _obj_dtype = getattr(obj, "dtype", None)
+        if (not isinstance(obj, ndarray) and _obj_dtype is not None
+                and _obj_dtype.kind in "mM" and _void_dt is not None
+                and _void_dt.kind in "SU"):
+            # Constructor coercion uses the scalar's display text. Explicit
+            # ndarray.astype remains a cast and intentionally follows its
+            # separate (stricter for datetime64) resolver.
+            obj = str(obj)
         if (isinstance(obj, ndarray) and _void_dt is not None
                 and _void_dt.kind == "T"):
             if copy is False:

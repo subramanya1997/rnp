@@ -752,6 +752,13 @@ pub fn array_from_any(
     if let Some(d) = dtype.filter(|d| d.is_datetime_like()) {
         return array_from_datetime(obj, d);
     }
+    // Flexible dtypes take a completely separate path: their elements are
+    // rendered Python values. This must precede numpy-scalar extraction:
+    // datetime64(123, "s") -> "1970-01-01T00:02:03", not byte 123 (`'{'`).
+    let wants_text = matches!(dtype, Some(DType::Bytes(_)) | Some(DType::Str(_)));
+    if wants_text || (dtype.is_none() && first_leaf_is_text(obj)) {
+        return array_from_text(obj, dtype);
+    }
     // A numpy scalar is a strong 0-d operand.
     if let Some((sd, sv)) = np_scalar_descr(obj)? {
         let d = dtype.unwrap_or(sd.dt);
@@ -767,12 +774,6 @@ pub fn array_from_any(
     // entry per field.
     if let Some(DType::Struct(id)) = dtype {
         return array_from_records(obj, id);
-    }
-    // Flexible dtypes take a completely separate path: their elements are
-    // Python str/bytes, which `Scalar` cannot carry.
-    let wants_text = matches!(dtype, Some(DType::Bytes(_)) | Some(DType::Str(_)));
-    if wants_text || (dtype.is_none() && first_leaf_is_text(obj)) {
-        return array_from_text(obj, dtype);
     }
     // A Python int too wide for any integer dtype: object, or an error.
     if let Some(h) = huge_int(obj)? {
