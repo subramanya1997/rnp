@@ -356,13 +356,21 @@ class _array_converter:
         return arr
 
 
-# `numpy.linalg` is out of scope for this lane (it needs real LAPACK kernels).
-# `_polynomial_impl` imports these three at module scope, so they have to
-# exist as names or the whole module — and with it `np.poly1d` — fails to
-# import.  Each raises only when called.
-eigvals = _not_available("linalg.eigvals")
-inv = _not_available("linalg.inv")
-lstsq = _not_available("linalg.lstsq")
+# `_polynomial_impl` imports these at module load time, before the top-level
+# package has finished wiring its linalg namespace. Resolve them only when a
+# legacy polynomial operation actually calls one; the backed linalg wrappers
+# are fully available by then.
+def _linalg_function(name):
+    def call(*args, **kwargs):
+        from rnp_numpy import linalg
+        return getattr(linalg, name)(*args, **kwargs)
+    call.__name__ = name
+    return call
+
+
+eigvals = _linalg_function("eigvals")
+inv = _linalg_function("inv")
+lstsq = _linalg_function("lstsq")
 
 
 def _monotonicity(xp):
