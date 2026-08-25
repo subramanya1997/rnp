@@ -4095,6 +4095,16 @@ def _percentile_dispatcher(a, q, axis=None, out=None, overwrite_input=None,
     return (a, q, out, weights)
 
 
+def _coerce_plain_numeric_object_array(array):
+    """Use float64 storage for object arrays containing only builtin numbers."""
+    if array.dtype.kind != "O":
+        return array
+    values = np._flat_values(array)
+    if all(type(value) in (bool, int, float) for value in values):
+        return np.asarray(values, dtype=np.float64).reshape(array.shape)
+    return array
+
+
 @array_function_dispatch(_percentile_dispatcher)
 def percentile(a,
                q,
@@ -4270,6 +4280,7 @@ def percentile(a,
 
     """
     a = np.asanyarray(a)
+    a = _coerce_plain_numeric_object_array(a)
     if a.dtype.kind == "c":
         raise TypeError("a must be an array of real numbers")
 
@@ -4279,6 +4290,7 @@ def percentile(a,
         raise ValueError("Percentiles must be in the range [0, 100]")
 
     if weights is not None:
+        weights = _coerce_plain_numeric_object_array(np.asanyarray(weights))
         if method != "inverted_cdf":
             msg = ("Only method 'inverted_cdf' supports weights. "
                    f"Got: {method}.")
@@ -4519,6 +4531,7 @@ def quantile(a,
 
     """
     a = np.asanyarray(a)
+    a = _coerce_plain_numeric_object_array(a)
     if a.dtype.kind == "c":
         raise TypeError("a must be an array of real numbers")
 
@@ -4529,6 +4542,7 @@ def quantile(a,
         raise ValueError("Quantiles must be in the range [0, 1]")
 
     if weights is not None:
+        weights = _coerce_plain_numeric_object_array(np.asanyarray(weights))
         if method != "inverted_cdf":
             msg = ("Only method 'inverted_cdf' supports weights. "
                    f"Got: {method}.")
@@ -4641,8 +4655,11 @@ def _lerp(a, b, t, out=None):
     """
     diff_b_a = b - a
     lerp_interpolation = add(a, diff_b_a * t, out=... if out is None else out)
+    subtract_kwargs = {}
+    if lerp_interpolation.dtype.kind not in "Mm":
+        subtract_kwargs["dtype"] = type(lerp_interpolation.dtype)
     subtract(b, diff_b_a * (1 - t), out=lerp_interpolation, where=t >= 0.5,
-             casting='unsafe', dtype=type(lerp_interpolation.dtype))
+             casting='unsafe', **subtract_kwargs)
     if lerp_interpolation.ndim == 0 and out is None:
         lerp_interpolation = lerp_interpolation[()]  # unpack 0d arrays
     return lerp_interpolation
@@ -4788,6 +4805,7 @@ def _quantile(
     supports_nans = (
         np.issubdtype(arr.dtype, np.inexact) or arr.dtype.kind in 'Mm'
     )
+    nan_detector = np.isnat if arr.dtype.kind in 'Mm' else np.isnan
 
     if weights is None:
         # --- Computation of indexes
@@ -4818,7 +4836,7 @@ def _quantile(
                 arr.partition(
                     concatenate((virtual_indexes.ravel(), [-1])), axis=0,
                 )
-                slices_having_nans = np.isnan(arr[-1, ...])
+                slices_having_nans = nan_detector(arr[-1, ...])
             else:
                 # cannot contain nan
                 arr.partition(virtual_indexes.ravel(), axis=0)
@@ -4836,7 +4854,7 @@ def _quantile(
                                           ))),
                 axis=0)
             if supports_nans:
-                slices_having_nans = np.isnan(arr[-1, ...])
+                slices_having_nans = nan_detector(arr[-1, ...])
             else:
                 slices_having_nans = None
             # --- Get values from indexes
@@ -4874,7 +4892,7 @@ def _quantile(
 
         if supports_nans:
             # may contain nan, which would sort to the end
-            slices_having_nans = np.isnan(arr[-1, ...])
+            slices_having_nans = nan_detector(arr[-1, ...])
         else:
             # cannot contain nan
             slices_having_nans = np.array(False, dtype=bool)

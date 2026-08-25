@@ -86,11 +86,28 @@ def _is_array(x):
             and not isinstance(x, np.generic))
 
 
+_MASKED = object()
+
+
 def _flat(x):
     """Elements of `x` in C order as Python scalars, plus its shape."""
     if _is_array(x):
         if not isinstance(x, np.ndarray):
             x = np.asarray(x.__array__())
+        # MaskedArray.tolist() builds an object array internally.  The core
+        # port intentionally has no native object storage, and testing
+        # comparisons only need NumPy's rule that a masked comparison result
+        # does not count as a mismatch.  Flatten the public data/mask pair
+        # separately and mark masked positions with a private sentinel.
+        mask = getattr(x, "_mask", None)
+        data = getattr(x, "_data", None)
+        if mask is not None and data is not None:
+            values = np._flat_values(data)
+            masks = np._flat_values(np.asarray(mask, dtype=np.bool_))
+            if len(masks) == 1 and len(values) != 1:
+                masks *= len(values)
+            return [(_MASKED if masked else value)
+                    for value, masked in zip(values, masks)], tuple(x.shape)
         if getattr(x.dtype, "names", None):
             flat = x.reshape(-1)
             return [flat[i] for i in range(flat.size)], tuple(x.shape)
@@ -103,6 +120,8 @@ def _flat(x):
 
 def _values_equal(a, b):
     """Elementwise equality with numpy's NaN-equals-NaN testing semantics."""
+    if a is _MASKED or b is _MASKED:
+        return True
     if a is b:
         return True
     names = getattr(getattr(a, "dtype", None), "names", None)
@@ -252,6 +271,8 @@ def assert_array_less(x, y, err_msg="", verbose=True, *, strict=False):
 
 
 def _close(a, b, rtol, atol):
+    if a is _MASKED or b is _MASKED:
+        return True
     if _values_equal(a, b):
         return True
     try:
@@ -286,12 +307,72 @@ def assert_approx_equal(actual, desired, significant=7, err_msg="",
 
 
 def assert_array_almost_equal_nulp(x, y, nulp=1):
-    assert_allclose(x, y, rtol=nulp * 2.220446049250313e-16)
+    ax = np.abs(x)
+    ay = np.abs(y)
+    ref = nulp * np.spacing(np.where(ax > ay, ax, ay))
+    if not np.all(np.abs(x - y) <= ref):
+        if np.iscomplexobj(x) or np.iscomplexobj(y):
+            msg = f"Arrays are not equal to {nulp} ULP"
+        else:
+            max_nulp = np.max(_nulp_diff(x, y))
+            msg = f"Arrays are not equal to {nulp} ULP (max is {max_nulp:g})"
+        raise AssertionError(msg)
 
 
 def assert_array_max_ulp(a, b, maxulp=1, dtype=None):
-    assert_allclose(a, b, rtol=maxulp * 2.220446049250313e-16)
-    return 0
+    ret = _nulp_diff(a, b, dtype)
+    if not np.all(ret <= maxulp):
+        raise AssertionError(
+            f"Arrays are not almost equal up to {maxulp:g} ULP "
+            f"(max difference is {np.max(ret):g} ULP)")
+    return ret
+
+
+def _integer_repr(x, view_dtype, complement):
+    """Interpret float bits in monotonic signed-magnitude order."""
+    result = x.view(view_dtype)
+    if result.size != 1:
+        negative = result < 0
+        result[negative] = complement - result[negative]
+    elif result < 0:
+        result = complement - result
+    return result
+
+
+def _float_integer_repr(x):
+    if x.dtype == np.float16:
+        return _integer_repr(x, np.int16, np.int16(-(2 ** 15)))
+    if x.dtype == np.float32:
+        return _integer_repr(x, np.int32, np.int32(-(2 ** 31)))
+    if x.dtype == np.float64:
+        return _integer_repr(x, np.int64, np.int64(-(2 ** 63)))
+    raise ValueError(f"Unsupported dtype {x.dtype}")
+
+
+def _nulp_diff(x, y, dtype=None):
+    """Return elementwise distance in representable floating-point values."""
+    if dtype is not None:
+        x = np.asarray(x, dtype=dtype)
+        y = np.asarray(y, dtype=dtype)
+    else:
+        x = np.asarray(x)
+        y = np.asarray(y)
+
+    common = np.common_type(x, y)
+    if np.iscomplexobj(x) or np.iscomplexobj(y):
+        raise NotImplementedError("_nulp not implemented for complex array")
+
+    x = np.array([x], dtype=common)
+    y = np.array([y], dtype=common)
+    x[np.isnan(x)] = np.nan
+    y[np.isnan(y)] = np.nan
+    if x.shape != y.shape:
+        raise ValueError(
+            f"Arrays do not have the same shape: {x.shape} - {y.shape}")
+
+    rx = _float_integer_repr(x)
+    ry = _float_integer_repr(y)
+    return np.abs(np.asarray(rx - ry, dtype=common))
 
 
 def assert_string_equal(actual, desired):

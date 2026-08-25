@@ -624,6 +624,74 @@ def _split(line, delimiter):
     return line.split(delimiter)
 
 
+def _quoted_records(lines, quotechar):
+    """Yield logical records while preserving newlines inside quotes."""
+    record = []
+    in_quotes = False
+    for chunk in lines:
+        i = 0
+        while i < len(chunk):
+            char = chunk[i]
+            if char == quotechar:
+                if (in_quotes and i + 1 < len(chunk)
+                        and chunk[i + 1] == quotechar):
+                    record.extend((char, char))
+                    i += 2
+                    continue
+                in_quotes = not in_quotes
+                record.append(char)
+                i += 1
+                continue
+            if not in_quotes and char in "\r\n":
+                if char == "\r" and i + 1 < len(chunk) and chunk[i + 1] == "\n":
+                    i += 1
+                yield "".join(record)
+                record = []
+            else:
+                record.append(char)
+            i += 1
+    if record:
+        yield "".join(record)
+
+
+def _split_quoted(line, delimiter, quotechar, comments):
+    """Split one record using NumPy/loadtxt's doubled-quote rules."""
+    fields = []
+    field = []
+    in_quotes = False
+    saw_quote = False
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if char == quotechar:
+            saw_quote = True
+            if (in_quotes and i + 1 < len(line)
+                    and line[i + 1] == quotechar):
+                field.append(quotechar)
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if not in_quotes and comments and char in comments:
+            break
+        is_delimiter = (char.isspace() if delimiter is None
+                        else char == delimiter)
+        if not in_quotes and is_delimiter:
+            if delimiter is not None or field:
+                fields.append("".join(field))
+                field = []
+            if delimiter is None:
+                while i + 1 < len(line) and line[i + 1].isspace():
+                    i += 1
+        else:
+            field.append(char)
+        i += 1
+    if delimiter is not None or field or saw_quote:
+        fields.append("".join(field))
+    return fields, saw_quote
+
+
 def _dtype_converter(dt):
     kind = dt.kind
     def numeric(converter, text):
@@ -729,17 +797,25 @@ def _read_rows(fname, comments, delimiter, skiprows, usecols, max_rows,
 
     rows = []
     seen = 0
-    for line in _line_source(fname, encoding):
+    lines = _line_source(fname, encoding)
+    if quotechar:
+        lines = _quoted_records(lines, quotechar)
+    for line in lines:
         if seen < skiprows:
             seen += 1
             continue
         seen += 1
-        line = _strip_comments(line.rstrip("\r\n"), comment_list)
+        line = line.rstrip("\r\n") if not quotechar else line
         if quotechar:
-            line = line.replace(quotechar, "")
-        fields = _split(line, delimiter)
+            fields, saw_quote = _split_quoted(
+                line, delimiter, quotechar, comment_list)
+        else:
+            line = _strip_comments(line, comment_list)
+            fields = _split(line, delimiter)
+            saw_quote = False
         fields = [f for f in fields] if delimiter is None else fields
-        if not fields or (len(fields) == 1 and not fields[0].strip()):
+        if (not fields or (len(fields) == 1 and not fields[0].strip()
+                           and not saw_quote)):
             continue
         rows.append(fields)
         if (max_rows is not None and skip_footer == 0
@@ -849,6 +925,10 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
             raise ValueError(
                 f"the number of columns changed from {ncols} to {len(r)} "
                 "at some point")
+        if structured and len(r) != len(leaf_dtypes):
+            raise ValueError(
+                f"the dtype passed requires {len(leaf_dtypes)} columns "
+                f"but {len(r)} were found at row 1")
         out = []
         for j, field in enumerate(r):
             if allconv is not None:
@@ -862,7 +942,7 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
             if isinstance(field, str):
                 converter = (_dtype_converter(leaf_dtypes[j])
                              if structured else conv)
-                field = converter(field.strip())
+                field = converter(field if quotechar else field.strip())
             out.append(field)
         if structured:
             if len(out) != len(leaf_dtypes):
@@ -890,6 +970,9 @@ def loadtxt(fname, dtype=float, comments='#', delimiter=None,
 
 
 def _guess_column_dtype(values):
+    lowered = [value.strip().lower() for value in values]
+    if lowered and all(value in {"true", "false"} for value in lowered):
+        return _np.dtype(bool)
     for conv, dt in ((int, _np.dtype(int)),
                      (float, _np.dtype(float)),
                      (complex, _np.dtype(complex))):
@@ -914,9 +997,6 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
     """Load data from a text file, with missing values handled as specified."""
     if like is not None:
         raise NotImplementedError("genfromtxt: `like=` is not supported")
-    if usemask:
-        raise NotImplementedError(
-            "genfromtxt: `usemask=True` is not supported by rnp yet")
 
     if names is True or names == "":
         names = None
@@ -952,11 +1032,6 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
     missing.add("")
 
     dt = None if dtype is None else _np.dtype(dtype)
-    structured = dt is not None and dt.names is not None
-    if dt is None and names is not None:
-        raise NotImplementedError(
-            "genfromtxt: `names=` requires structured array support, which "
-            "rnp does not have yet")
 
     ncols = len(rows[0]) if rows else 0
     if invalid_raise:
@@ -972,17 +1047,45 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
         cols = [[r[j] for r in rows] for j in range(ncols)]
         guessed = [_guess_column_dtype([v for v in c if v not in missing])
                    for c in cols]
-        dt = guessed[0] if guessed else _np.dtype(float)
-        for g in guessed[1:]:
-            dt = _np.promote_types(dt, g)
+        if names is not None or (guessed and
+                                 any(g != guessed[0] for g in guessed[1:])):
+            field_names = (names if names is not None else
+                           [defaultfmt % i for i in range(ncols)])
+            dt = _np.dtype(list(zip(field_names, guessed)))
+        else:
+            dt = guessed[0] if guessed else _np.dtype(float)
+    elif names is not None and dt.names is None:
+        dt = _np.dtype([(name, dt) for name in names])
+
+    structured = dt.names is not None
 
     conv = _dtype_converter(dt)
-    if filling_values is None:
-        fill = 0 if dt.kind in "iub" else (
-            float("nan") if dt.kind == "f" else
-            complex("nan") if dt.kind == "c" else "")
-    else:
-        fill = filling_values
+
+    def default_fill(field_dtype):
+        if field_dtype.kind in "iu":
+            return -1
+        if field_dtype.kind == "b":
+            return False
+        if field_dtype.kind == "f":
+            return float("nan")
+        if field_dtype.kind == "c":
+            return complex("nan")
+        return ""
+
+    def is_missing(field):
+        if field in missing:
+            return True
+        try:
+            numeric = float(field)
+        except (TypeError, ValueError):
+            return False
+        for marker in missing:
+            try:
+                if numeric == float(marker):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
 
     colconv = None
     allconv = None
@@ -998,10 +1101,22 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
             _dtype_converter(dt.fields[name][0]) for name in dt.names]
 
     data = []
+    mask_rows = []
     for r in rows:
         out = []
+        row_mask = []
         for j, field in enumerate(r):
-            if field in missing:
+            missing_field = is_missing(field)
+            row_mask.append(missing_field)
+            if missing_field:
+                field_dtype = (dt.fields[dt.names[j]][0]
+                               if structured else dt)
+                if filling_values is None:
+                    fill = default_fill(field_dtype)
+                elif isinstance(filling_values, dict):
+                    fill = filling_values.get(j, default_fill(field_dtype))
+                else:
+                    fill = filling_values
                 out.append(fill)
                 continue
             if allconv is not None:
@@ -1020,9 +1135,12 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
                 except ValueError:
                     if not loose:
                         raise
-                    field = fill
+                    field_dtype = (dt.fields[dt.names[j]][0]
+                                   if structured else dt)
+                    field = default_fill(field_dtype)
             out.append(field)
         data.append(tuple(out) if structured else out)
+        mask_rows.append(tuple(row_mask) if structured else row_mask)
 
     if not data:
         import warnings
@@ -1032,6 +1150,13 @@ def genfromtxt(fname, dtype=float, comments='#', delimiter=None,
     else:
         arr = _np.array(data, dtype=dt)
     arr = _ensure_ndmin(arr, ndmin)
+    if usemask:
+        if structured:
+            mask_dtype = _np.dtype([(name, bool) for name in dt.names])
+            mask = _np.array(mask_rows, dtype=mask_dtype)
+        else:
+            mask = _np.array(mask_rows, dtype=bool)
+        arr = _np.ma.array(arr, mask=mask, copy=False)
     return arr.T if unpack else arr
 
 

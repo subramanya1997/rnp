@@ -1490,6 +1490,32 @@ def _join_by_dispatcher(
     return (r1, r2)
 
 
+def _structured_keys(array, fields):
+    """Materialize comparable Python keys from structured array fields."""
+    fields = (fields,) if isinstance(fields, str) else tuple(fields)
+
+    def python_value(value):
+        if isinstance(value, np.ndarray):
+            flat = np._flat_values(getattr(value, "_data", value))
+            if value.shape == ():
+                return flat[0]
+            return tuple(flat)
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    return [tuple(python_value(array[name][i]) for name in fields)
+            for i in range(len(array))]
+
+
+def _structured_argsort(array, fields):
+    """Stable record ordering for the shim's unsupported ``order=`` path."""
+    keys = _structured_keys(array, fields)
+    indices = list(range(len(array)))
+    indices.sort(key=keys.__getitem__)
+    return np.asarray(indices, dtype=np.intp)
+
+
 @array_function_dispatch(_join_by_dispatcher)
 def join_by(key, r1, r2, jointype='inner', r1postfix='1', r2postfix='2',
             defaults=None, usemask=True, asrecarray=False):
@@ -1582,11 +1608,15 @@ def join_by(key, r1, r2, jointype='inner', r1postfix='1', r2postfix='2',
 
     # Concatenate the two arrays for comparison
     aux = ma.concatenate((r1k, r2k))
-    idx_sort = aux.argsort(order=key)
+    idx_sort = _structured_argsort(aux, key)
     aux = aux[idx_sort]
     #
     # Get the common keys
-    flag_in = ma.concatenate(([False], aux[1:] == aux[:-1]))
+    sorted_keys = _structured_keys(aux, key)
+    flag_in = np.asarray(
+        [False] + [current == previous for previous, current
+                   in zip(sorted_keys, sorted_keys[1:])],
+        dtype=np.bool_)
     flag_in[:-1] = flag_in[1:] + flag_in[:-1]
     idx_in = idx_sort[flag_in]
     idx_1 = idx_in[(idx_in < nb1)]
@@ -1630,7 +1660,7 @@ def join_by(key, r1, r2, jointype='inner', r1postfix='1', r2postfix='2',
             _, cdtype = ndtype[nameidx]
             if fname in key:
                 # The current field is part of the key: take the largest dtype
-                ndtype[nameidx] = (fname, max(fdtype, cdtype))
+                ndtype[nameidx] = (fname, np.promote_types(fdtype, cdtype))
             else:
                 # The current field is not part of the key: add the suffixes,
                 # and place the new field adjacent to the old one
@@ -1663,7 +1693,9 @@ def join_by(key, r1, r2, jointype='inner', r1postfix='1', r2postfix='2',
         if (jointype == 'outer') and r2spc:
             current[-r2spc:] = selected[r2cmn:]
     # Sort and finalize the output
-    output.sort(order=key)
+    output_order = _structured_argsort(output, key)
+    output = ma.array(output._data[output_order],
+                      mask=output._mask[output_order], copy=False)
     kwargs = {'usemask': usemask, 'asrecarray': asrecarray}
     return _fix_output(_fix_defaults(output, defaults), **kwargs)
 

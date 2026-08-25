@@ -197,7 +197,11 @@ def _remove_nan_1d(arr1d, second_arr1d=None, overwrite_input=False):
     """
     if arr1d.dtype == object:
         # object arrays do not support `isnan` (gh-9009), so make a guess
-        c = np.not_equal(arr1d, arr1d, dtype=bool)
+        # The native object ufunc loop is intentionally outside this lane.
+        # A 1-D Python comparison is sufficient here and matches NumPy's
+        # object-array NaN convention (the only value unequal to itself).
+        c = np.asarray([bool(value != value)
+                        for value in np._flat_values(arr1d)], dtype=bool)
     else:
         c = np.isnan(arr1d)
 
