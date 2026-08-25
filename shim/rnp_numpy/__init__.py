@@ -129,6 +129,13 @@ def empty(shape, dtype=None, order="C", *, like=None):
 
 
 def ones(shape, dtype=None, order="C", *, like=None):
+    if dtype is not None:
+        _dt = globals()["dtype"](dtype)
+        if _dt.kind == "m" and str(_dt) == "timedelta64":
+            # `ones` materializes the integer value 1.  NumPy deprecates that
+            # implicit conversion specifically for a generic timedelta unit;
+            # allocating `empty` or zero-filled storage remains warning-free.
+            _sc._warn_generic(stacklevel=3)
     return _alloc_with_order(_rnp_ones, shape, dtype, order)
 
 
