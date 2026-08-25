@@ -37,6 +37,7 @@ dtype = _rnp.dtype
 ndarray = _rnp.ndarray
 
 _SCALAR_BY_NAME = {}
+_NO_ARRAY_UFUNC = object()
 
 
 def _void_key(v):
@@ -678,6 +679,8 @@ def _install_operators(cls):
             # would silently bind the modulus to the opcode. Keyword-only
             # keeps numpy's TypeError while still compiling to a LOAD_FAST.
             def fwd(self, other, *, _c=code):
+                if getattr(other, "__array_ufunc__", _NO_ARRAY_UFUNC) is None:
+                    return NotImplemented
                 r = _sb2(_c, self, other)
                 return NotImplemented if r is None else r
 

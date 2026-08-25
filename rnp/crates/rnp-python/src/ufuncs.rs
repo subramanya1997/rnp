@@ -1410,6 +1410,28 @@ fn classify(obj: &Bound<'_, PyAny>) -> PyResult<SOperand> {
     if let Some((d, s)) = np_scalar(obj)? {
         return Ok(SOperand::Strong(d, s));
     }
+    // Subclasses of Python's numeric builtins are strong scalars. NumPy
+    // discovers them like an array scalar of the builtin's default dtype,
+    // rather than applying weak-scalar promotion as it does for the exact
+    // builtin classes above.
+    if obj.is_instance_of::<pyo3::types::PyFloat>() {
+        return Ok(SOperand::Strong(
+            DType::F64,
+            Scalar::Float(obj.extract::<f64>()?),
+        ));
+    }
+    if obj.is_instance_of::<pyo3::types::PyInt>() {
+        return Ok(match scalar_from_py(obj) {
+            Some(s) => SOperand::Strong(DType::I64, s.cast(DType::I64)),
+            None => SOperand::Other,
+        });
+    }
+    if obj.is_instance_of::<pyo3::types::PyComplex>() {
+        return Ok(match scalar_from_py(obj) {
+            Some(s) => SOperand::Strong(DType::C128, s.cast(DType::C128)),
+            None => SOperand::Other,
+        });
+    }
     Ok(match scalar_from_py(obj) {
         Some(s) => SOperand::Weak(s),
         None => SOperand::Other,
