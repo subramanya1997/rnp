@@ -743,7 +743,11 @@ fn axis_len(arr: &NdArray, axis: usize) -> usize {
 ///   * an out-of-bounds *negative* index is reported by its **normalised**
 ///     value, not the one the caller passed: on a length-5 axis `kth=-6`
 ///     raises `kth(=-1) out of bounds (5)`, while `kth=5` raises `kth(=5)`.
-fn norm_kths(kth: &Bound<'_, PyAny>, n: usize) -> PyResult<Vec<usize>> {
+fn norm_kths(
+    kth: &Bound<'_, PyAny>,
+    n: usize,
+    array_is_empty: bool,
+) -> PyResult<Vec<usize>> {
     let items: Vec<Bound<'_, PyAny>> = if let Ok(seq) = kth.try_iter() {
         seq.collect::<PyResult<Vec<_>>>()?
     } else {
@@ -756,12 +760,18 @@ fn norm_kths(kth: &Bound<'_, PyAny>, n: usize) -> PyResult<Vec<usize>> {
             .and_then(|i| i.extract::<isize>())
             .map_err(|_| PyTypeError::new_err("Partition index must be integer"))?;
         let k = if raw < 0 { raw + n as isize } else { raw };
-        if k < 0 || k >= n as isize {
+        // NumPy still validates the index protocol for an empty array, but
+        // skips bounds checking because no partitioning work can occur.  This
+        // applies to the whole array, not merely to a zero-length axis.
+        if !array_is_empty && (k < 0 || k >= n as isize) {
             return Err(PyValueError::new_err(format!(
                 "kth(={k}) out of bounds ({n})"
             )));
         }
-        out.push(k as usize);
+        // The value is never consumed for an empty array.  Avoid converting a
+        // negative out-of-range rank to usize while preserving the validation
+        // and no-op behavior above.
+        out.push(if array_is_empty { 0 } else { k as usize });
     }
     Ok(out)
 }
@@ -1120,7 +1130,7 @@ impl PyNdArray {
         check_select_kind(kind)?;
         let ax = norm_sort_axis(&self.arr, axis)?;
         let n = axis_len(&self.arr, ax);
-        let kths = norm_kths(kth, n)?;
+        let kths = norm_kths(kth, n, self.arr.size() == 0)?;
         if self.arr.dtype().is_object() {
             // A fully ordered lane is also a valid partition for every kth.
             // It uses the same rich-comparison path and error propagation.
@@ -1153,7 +1163,7 @@ impl PyNdArray {
             }
         };
         let n = axis_len(&arr, ax);
-        let kths = norm_kths(kth, n)?;
+        let kths = norm_kths(kth, n, arr.size() == 0)?;
         if arr.dtype().is_object() {
             let out = crate::objects::argsort(py, &arr, ax, false)?;
             return PyNdArray::into_py_any(out, py);
