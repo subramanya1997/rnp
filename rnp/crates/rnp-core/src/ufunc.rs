@@ -932,8 +932,8 @@ fn unary_swapped(a: &NdArray, op: UnOp) -> Result<NdArray> {
 
 fn unary_native(a: &NdArray, op: UnOp) -> Result<NdArray> {
     if a.dtype().is_datetime_like() {
-        // Only `negative`/`positive`/`absolute`/`sign`/`isfinite` have
-        // datetime loops, and only for timedelta64.
+        // Datetime predicates accept both families; arithmetic unary loops
+        // are restricted to timedelta64 by `datetime_ops::unary`.
         return crate::datetime_ops::unary(a, op.name());
     }
     if op == UnOp::IsNat {

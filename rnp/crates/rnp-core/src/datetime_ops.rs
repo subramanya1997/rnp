@@ -713,7 +713,7 @@ pub fn isnat(a: &NdArray) -> Result<NdArray> {
     Ok(out)
 }
 
-/// `negative` / `positive` / `absolute` / `sign` / `isfinite` on timedelta64.
+/// Unary ufunc loops shared by datetime64 and timedelta64.
 pub fn unary(a: &NdArray, name: &str) -> Result<NdArray> {
     let dt = a.dtype();
     let out_dt = match name {
@@ -731,7 +731,7 @@ pub fn unary(a: &NdArray, name: &str) -> Result<NdArray> {
             }
             DType::F64
         }
-        "isfinite" | "isnat" => DType::Bool,
+        "isfinite" | "isinf" | "isnan" | "isnat" => DType::Bool,
         _ => {
             let f = family(dt);
             return Err(ufunc_no_loop(name, &[&f]));
@@ -762,6 +762,8 @@ pub fn unary(a: &NdArray, name: &str) -> Result<NdArray> {
                 0.0
             }),
             "isfinite" => Scalar::Bool(x != NAT),
+            "isinf" => Scalar::Bool(false),
+            "isnan" => Scalar::Bool(x == NAT),
             _ => Scalar::Bool(x == NAT),
         };
         out.write_at(oo[k], v);
@@ -781,6 +783,21 @@ mod tests {
             a.write_at((i * 8) as isize, Scalar::Int(v));
         }
         a
+    }
+
+    #[test]
+    fn datetime_predicates_classify_only_nat_as_nan() {
+        let a = td(&[0, NAT, -1], UNIT_D);
+        let finite = unary(&a, "isfinite").unwrap();
+        let infinite = unary(&a, "isinf").unwrap();
+        let nan = unary(&a, "isnan").unwrap();
+        assert_eq!(finite.get_flat(0), Scalar::Bool(true));
+        assert_eq!(finite.get_flat(1), Scalar::Bool(false));
+        assert_eq!(infinite.get_flat(0), Scalar::Bool(false));
+        assert_eq!(infinite.get_flat(1), Scalar::Bool(false));
+        assert_eq!(nan.get_flat(0), Scalar::Bool(false));
+        assert_eq!(nan.get_flat(1), Scalar::Bool(true));
+        assert_eq!(nan.get_flat(2), Scalar::Bool(false));
     }
     fn dt(vals: &[i64], base: u8) -> NdArray {
         let a =
