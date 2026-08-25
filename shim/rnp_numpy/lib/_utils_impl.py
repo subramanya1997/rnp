@@ -511,8 +511,24 @@ def drop_metadata(dtype, /):
         ``np.can_cast(new_dtype, dtype, casting="no")``.
 
     """
+    def has_metadata(dt):
+        if dt.metadata is not None:
+            return True
+        if dt.fields is not None:
+            return any(has_metadata(dt.fields[name][0])
+                       for name in (dt.names or ()))
+        if dt.subdtype is not None:
+            return has_metadata(dt.subdtype[0])
+        return False
+
+    # The port creates fresh Python dtype wrappers for field lookups, so
+    # NumPy's upstream identity-based recursion would rebuild every
+    # structured dtype even when no metadata exists.  Detect metadata by
+    # content first and preserve the required identity fast path.
+    if not has_metadata(dtype):
+        return dtype
+
     if dtype.fields is not None:
-        found_metadata = dtype.metadata is not None
 
         names = []
         formats = []
@@ -520,16 +536,10 @@ def drop_metadata(dtype, /):
         titles = []
         for name, field in dtype.fields.items():
             field_dt = drop_metadata(field[0])
-            if field_dt is not field[0]:
-                found_metadata = True
-
             names.append(name)
             formats.append(field_dt)
             offsets.append(field[1])
             titles.append(None if len(field) < 3 else field[2])
-
-        if not found_metadata:
-            return dtype
 
         structure = {
             'names': names, 'formats': formats, 'offsets': offsets, 'titles': titles,
@@ -541,13 +551,8 @@ def drop_metadata(dtype, /):
         # subarray dtype
         subdtype, shape = dtype.subdtype
         new_subdtype = drop_metadata(subdtype)
-        if dtype.metadata is None and new_subdtype is subdtype:
-            return dtype
-
         return np.dtype((new_subdtype, shape))
     else:
         # Normal unstructured dtype
-        if dtype.metadata is None:
-            return dtype
         # Note that `dt.str` doesn't round-trip e.g. for user-dtypes.
         return np.dtype(dtype.str)

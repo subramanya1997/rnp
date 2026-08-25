@@ -883,19 +883,9 @@ def resize(a, new_shape):
 
 
 def save(file, arr, allow_pickle=True, fix_imports=_builtins.bool(True)):
-    """`np.save` — this port stores the pickle stream, which `np.load` reads
-    back. numpy's own `.npy` container is not reproduced."""
-    import pickle as _pickle
-
-    arr = _asarr(arr)
-    if hasattr(file, "write"):
-        _pickle.dump(arr, file)
-        return
-    name = _builtins.str(file)
-    if not name.endswith(".npy"):
-        name += ".npy"
-    with _builtins.open(name, "wb") as fh:
-        _pickle.dump(arr, fh)
+    """Save an array in NumPy's NPY container."""
+    from .lib._npyio_impl import save as _format_save
+    return _format_save(file, arr, allow_pickle=allow_pickle)
 
 
 def load(file, mmap_mode=None, allow_pickle=False, fix_imports=True,

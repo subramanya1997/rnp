@@ -293,11 +293,30 @@ def dtype_to_descr(dtype):
     dtype = new_dtype
 
     if dtype.names is not None:
-        # This is a record array. The .descr is fine.  XXX: parts of the
-        # record array with an empty name, like padding bytes, still get
-        # fiddled with. This needs to be fixed in the C implementation of
-        # dtype().
-        return dtype.descr
+        # The native port's ``dtype.descr`` currently collapses subarray
+        # fields to void and omits explicit offset padding.  NPY headers need
+        # the logical field layout, so build the descriptor from ``fields``.
+        descr = []
+        offset = 0
+        for name in dtype.names:
+            field = dtype.fields[name]
+            field_dtype, field_offset = field[:2]
+            if field_offset > offset:
+                descr.append(('', f'|V{field_offset - offset}'))
+
+            field_name = ((field[2], name) if len(field) >= 3
+                          and field[2] is not None else name)
+            if field_dtype.subdtype is None:
+                field_descr = dtype_to_descr(field_dtype)
+                descr.append((field_name, field_descr))
+            else:
+                base, shape = field_dtype.subdtype
+                descr.append((field_name, dtype_to_descr(base), shape))
+            offset = max(offset, field_offset + field_dtype.itemsize)
+
+        if dtype.itemsize > offset:
+            descr.append(('', f'|V{dtype.itemsize - offset}'))
+        return descr
     elif not type(dtype)._legacy:
         # this must be a user-defined dtype since numpy does not yet expose any
         # non-legacy dtypes in the public API
@@ -634,6 +653,9 @@ def _read_array_header(fp, version, max_header_size=_MAX_HEADER_SIZE):
     """
     see read_array_header_1_0
     """
+    if max_header_size is None:
+        max_header_size = _MAX_HEADER_SIZE
+
     # Read an unsigned, little-endian short int which has the length of the
     # header.
     import ast
