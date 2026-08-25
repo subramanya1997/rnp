@@ -861,6 +861,13 @@ def _check_advanced_index_size(key):
 
 
 def getitem(self, key):
+    # Exact ndarrays do not need the Python compatibility work below unless
+    # the key is a tuple (the only form that can contain multiple advanced
+    # index arrays whose broadcast size needs the overflow check).  Keeping
+    # the overwhelmingly common integer/slice forms on the native slot also
+    # avoids a Python frame on every scalar read and view construction.
+    if type(self) is ndarray and not isinstance(key, _b.tuple):
+        return _orig_getitem(self, key)
     _check_advanced_index_size(key)
     result = _orig_getitem(self, key)
     if (isinstance(result, ndarray) and type(self) is not ndarray and

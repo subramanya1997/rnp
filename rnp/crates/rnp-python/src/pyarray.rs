@@ -2120,6 +2120,21 @@ impl PyNdArray {
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
         let me = slf.borrow().arr.clone();
+        // A single slice on a 1-D array is the hottest view path.  Avoid the
+        // general index parser and planner, which allocate an IndexItem Vec
+        // and rebuild the view one axis at a time for this simple case.
+        if me.ndim() == 1 {
+            if let Ok(slice) = key.cast::<PySlice>() {
+                let ind = slice.indices(me.shape[0])?;
+                let view = me.slice_axis(
+                    0,
+                    ind.start,
+                    ind.slicelength as isize,
+                    ind.step,
+                );
+                return Ok(PyNdArray::view_of(view, slf)?.into_bound(py).into_any());
+            }
+        }
         // `a[i]` on a 1-d numeric array is the single most common indexing
         // expression there is, and going through the general machinery for it
         // costs a `Vec<IndexItem>`, a view `NdArray` (two more `Vec`s and an
