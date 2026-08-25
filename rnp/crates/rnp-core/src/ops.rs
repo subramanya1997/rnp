@@ -1302,7 +1302,7 @@ macro_rules! impl_complex_ops {
                 if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
                     <$t>::new(
                         self.re * o.re - self.im * o.im,
-                        self.re * o.im + self.im * o.re,
+                        self.im * o.re + self.re * o.im,
                     )
                 } else {
                     <$t>::new(
@@ -2831,6 +2831,15 @@ mod tests {
             (0x45a5_5a0f, 0xc571_9750)
         };
         assert_eq!((r.re.to_bits(), r.im.to_bits()), expected);
+
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            let nan_inf = Arith::a_mul(
+                C64v::new(f64::NAN, 0.0),
+                C64v::new(f64::INFINITY, 0.0),
+            );
+            assert!(nan_inf.re.is_nan() && nan_inf.im.is_nan());
+            assert!(nan_inf.im.is_sign_positive());
+        }
     }
 
     #[test]
