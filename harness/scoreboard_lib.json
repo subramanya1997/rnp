@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-24T22:47:17.301036+00:00",
-  "overall_passed": 4172,
+  "timestamp": "2026-08-25T00:50:25.218711+00:00",
+  "overall_passed": 4201,
   "overall_total": 4759,
   "files": [
     {
@@ -69,24 +69,24 @@
     },
     {
       "file": "lib/test_function_base.py",
-      "passed": 1295,
-      "failed": 128,
+      "passed": 1309,
+      "failed": 114,
       "errors": 0,
       "skipped": 73,
       "total": 1496
     },
     {
       "file": "lib/test_histograms.py",
-      "passed": 59,
-      "failed": 9,
+      "passed": 65,
+      "failed": 3,
       "errors": 0,
       "skipped": 1,
       "total": 69
     },
     {
       "file": "lib/test_index_tricks.py",
-      "passed": 54,
-      "failed": 12,
+      "passed": 55,
+      "failed": 11,
       "errors": 0,
       "skipped": 0,
       "total": 66
@@ -117,8 +117,8 @@
     },
     {
       "file": "lib/test_nanfunctions.py",
-      "passed": 1086,
-      "failed": 107,
+      "passed": 1089,
+      "failed": 104,
       "errors": 0,
       "skipped": 86,
       "total": 1279
@@ -173,8 +173,8 @@
     },
     {
       "file": "lib/test_twodim_base.py",
-      "passed": 31,
-      "failed": 6,
+      "passed": 36,
+      "failed": 1,
       "errors": 0,
       "skipped": 0,
       "total": 37
