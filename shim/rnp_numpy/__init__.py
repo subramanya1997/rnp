@@ -1731,6 +1731,9 @@ _wire_subsystem(
 
 def dot(a, b, out=None):
     """Dot product of two arrays (numpy's `np.dot`)."""
+    if (type(a) is ndarray and type(b) is ndarray
+            and a.dtype.kind != "O" and b.dtype.kind != "O"):
+        return _rnp._dot(a, b, out=out)
     a = asarray(a)
     b = asarray(b)
     if (getattr(getattr(a, "dtype", None), "kind", None) == "O" or

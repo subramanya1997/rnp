@@ -500,6 +500,26 @@ class ufunc:
                  axes=None, axis=None, keepdims=None):
         if not self._ok:
             self._nope()
+        # Exact ndarray gufunc calls with no options need none of the Python
+        # override, casting, axis-remapping, or object-loop machinery below.
+        # This is the ordinary matmul/vecdot/matvec call made by numerical
+        # code, so hand it straight to the native planner and BLAS route.
+        if (self.signature is not None and len(args) == self.nin
+                and out is None and where is _UNSET
+                and casting == "same_kind" and order == "K"
+                and dtype is None and subok is True and signature is None
+                and axes is None and axis is None and keepdims is None
+                and type(args[0]) is ndarray and type(args[1]) is ndarray):
+            try:
+                res = _rnp._matmul(self.__name__, args[0], args[1])
+            except NotImplementedError:
+                # Object arrays use the Python element protocol below.
+                pass
+            else:
+                _errstate.drain(self.__name__)
+                if isinstance(res, ndarray) and res.ndim == 0:
+                    return res[()]
+                return res
         if not isinstance(casting, str):
             raise TypeError(
                 f"casting must be str, not {type(casting).__name__}")
