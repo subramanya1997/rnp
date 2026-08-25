@@ -684,7 +684,9 @@ fn int_at(a: &NdArray, off: isize) -> i64 {
         Scalar::Uint(u) => u as i64,
         Scalar::Bool(b) => b as i64,
         Scalar::Float(f) => f as i64,
+        Scalar::Float80(f) => f.to_f64() as i64,
         Scalar::Complex(c) => c.re as i64,
+        Scalar::Complex160(c) => c.re.to_f64() as i64,
     }
 }
 

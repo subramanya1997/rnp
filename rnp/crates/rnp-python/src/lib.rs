@@ -299,7 +299,9 @@ fn arange(
             Scalar::Int(i) => i as f64,
             Scalar::Uint(u) => u as f64,
             Scalar::Float(f) => f,
+            Scalar::Float80(f) => f.to_f64(),
             Scalar::Complex(c) => c.re,
+            Scalar::Complex160(c) => c.re.to_f64(),
         };
         Ok((v, exact))
     };
@@ -1316,6 +1318,8 @@ fn _dtype_table(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 #[pymodule]
 fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNdArray>()?;
+    m.add_class::<convert::PyF80Value>()?;
+    m.add_class::<convert::PyC160Value>()?;
     adopt::mark_ndarray_as_sequence(m.py());
     m.add_class::<PyDType>()?;
     m.add_class::<pyarray::PyFlags>()?;

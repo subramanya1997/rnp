@@ -909,13 +909,13 @@ fn parse_scalar_spec(s: &str) -> Option<Descr> {
     if matches!(rest, "Q" | "ulonglong") {
         return Some(Descr::with_alias(DType::U64, bo, Alias::ULongLong));
     }
-    // On macOS/arm64 numpy's long double is an IEEE double; the port models
-    // it as float64 with numpy's own num/char (a documented M1 gap).
     if matches!(rest, "g" | "longdouble" | "longfloat" | "float128" | "f16") {
-        return Some(Descr::with_alias(DType::F64, bo, Alias::LongDouble));
+        let dt = if cfg!(all(target_os = "linux", target_arch = "x86_64")) { DType::F80 } else { DType::F64 };
+        return Some(Descr::with_alias(dt, bo, Alias::LongDouble));
     }
     if matches!(rest, "G" | "clongdouble" | "clongfloat" | "complex256" | "c32") {
-        return Some(Descr::with_alias(DType::C128, bo, Alias::CLongDouble));
+        let dt = if cfg!(all(target_os = "linux", target_arch = "x86_64")) { DType::C160 } else { DType::C128 };
+        return Some(Descr::with_alias(dt, bo, Alias::CLongDouble));
     }
     let dt = DType::from_plain_name(rest)?;
     Some(Descr::new(dt, bo))

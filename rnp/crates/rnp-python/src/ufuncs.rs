@@ -7,7 +7,7 @@
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyString, PyTuple};
 
 use rnp_core::element::Scalar;
 use rnp_core::{fpe, BinOp, DType, NdArray, UnOp};
@@ -16,6 +16,7 @@ use crate::convert::{array_from_any, np_scalar, scalar_from_py, weak_dtype};
 use crate::pyarray::{store_or_wrap, PyNdArray};
 use crate::pydtype::{dtype_from_any, PyDType};
 
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 static FPE_REPORTER: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -972,6 +973,12 @@ pub fn _scalar_cast<'py>(
     value: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let dt = dtype_from_any(dtype)?;
+    if dt == DType::F80 {
+        if let Ok(text) = value.cast::<PyString>() {
+            let parsed = rnp_core::F80::from_str(text.to_str()?).map_err(PyValueError::new_err)?;
+            return crate::convert::scalar_to_py(py, Scalar::Float80(parsed));
+        }
+    }
     let s = match np_scalar(value)? {
         Some((_, s)) => s,
         None => match scalar_from_py(value) {
@@ -1189,7 +1196,16 @@ fn int_overflowed(op: BinOp, x: Scalar, y: Scalar, r: Scalar, dt: DType) -> bool
 
 /// The dtypes a numpy scalar can have, in the order the shim's wrapper table
 /// uses. `_scalar_dtype_names()` hands the same order to Python.
-pub const SCALAR_DTYPES: [DType; 14] = [
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const SCALAR_DTYPES: &[DType] = &[
+    DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64,
+    DType::U8, DType::U16, DType::U32, DType::U64,
+    DType::F16, DType::F32, DType::F64, DType::F80,
+    DType::C64, DType::C128, DType::C160,
+];
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub const SCALAR_DTYPES: &[DType] = &[
     DType::Bool,
     DType::I8,
     DType::I16,

@@ -110,6 +110,8 @@ def _float_str(v, name):
     `str(np.float32(1e-4))` is `1e-04` -- the stored value is 9.9999997e-05,
     whose exponent is -5).
     """
+    if name == "float128":
+        return str(v)
     if v != v:
         return "nan"
     if v == _math.inf:
@@ -141,7 +143,8 @@ def _complex_str(v, name):
     """numpy formats a complex scalar the way Python does, except that each
     component is rendered with *its own* float type's rules -- which is why
     `str(np.complex64(2147483647))` is `(2.1474836e+09+0j)`."""
-    comp = "float32" if name == "complex64" else "float64"
+    comp = ("float32" if name == "complex64" else
+            "float128" if name == "complex256" else "float64")
 
     def part(x):
         # Python's complex repr drops a trailing `.0`: `str(1+2j) == '(1+2j)'`.
@@ -650,7 +653,7 @@ def _unary(opname, a):
 #: `_rnp._scalar_dtype_names()` reports. The Rust fast path hands back that
 #: code instead of building a `dtype` object, so the whole result-typing step
 #: on this side is one list index.
-_WRAPS = [None] * 14
+_WRAPS = [None] * len(_rnp._scalar_dtype_names())
 
 _sb2 = _rnp._scalar_binop2
 _report_fpe = _errstate.report
@@ -926,7 +929,7 @@ def _cast(cls, value, *extra, **kw):
         k = cls.dtype.kind
         if k in "iu":
             value = int(text, 0)
-        elif k == "f":
+        elif k == "f" and cls.dtype.name != "float128":
             value = _builtins.float(text)
         elif k == "c":
             value = complex(text)
@@ -1105,14 +1108,18 @@ def _install_numeric_extras(cls, d):
         cls.__repr__ = lambda self: "np.True_" if self._v else "np.False_"
         cls.__str__ = lambda self: "True" if self._v else "False"
     elif kind == "f":
-        cls.__repr__ = lambda self, n=name, c=cls: \
-            f"np.{c.__name__}({_float_str(self._v, n)})"
+        cls.__repr__ = lambda self, n=name, c=cls: (
+            f"np.{c.__name__}('{_float_str(self._v, n)}')"
+            if n == "float128" else
+            f"np.{c.__name__}({_float_str(self._v, n)})")
         cls.__str__ = lambda self, n=name: _float_str(self._v, n)
     elif kind == "c":
         # `str` parenthesises a complex with a real part but not a pure
         # imaginary one, so the parens are stripped only when present.
-        cls.__repr__ = lambda self, n=name: \
-            f"np.{n}({_strip_parens(_complex_str(self._v, n))})"
+        cls.__repr__ = lambda self, n=name, c=cls: (
+            f"np.{c.__name__}('{_strip_parens(_complex_str(self._v, n))}')"
+            if n == "complex256" else
+            f"np.{n}({_strip_parens(_complex_str(self._v, n))})")
         cls.__str__ = lambda self, n=name: _complex_str(self._v, n)
     else:
         # numpy reprs a scalar by its *dtype* name, so `np.longlong(0)` shows
@@ -1162,7 +1169,11 @@ def _forward(method):
 
 
 def _real_type(d):
-    return complex64_real if d.name == "complex64" else float64
+    if d.name == "complex64":
+        return complex64_real
+    if d.name == "complex256":
+        return longdouble
+    return float64
 
 
 # ---- the concrete numeric types -------------------------------------------
@@ -1239,8 +1250,9 @@ def _install_extended_precision_operators(cls):
             setattr(cls, method_name, method)
 
 
-_install_extended_precision_operators(longdouble)
-_install_extended_precision_operators(clongdouble)
+if longdouble.dtype.name == "float64":
+    _install_extended_precision_operators(longdouble)
+    _install_extended_precision_operators(clongdouble)
 
 #: `np.complex64(1+2j).real` is a float32.
 complex64_real = float32
@@ -1251,6 +1263,14 @@ _SCALAR_BY_NAME.update({
     "uint64": uint64, "float16": float16, "float32": float32,
     "float64": float64, "complex64": complex64, "complex128": complex128,
 })
+
+if longdouble.dtype.name == "float128":
+    float128 = longdouble
+    complex256 = clongdouble
+    _SCALAR_BY_NAME.update({
+        "float128": longdouble,
+        "complex256": clongdouble,
+    })
 
 True_ = bool_(True)
 False_ = bool_(False)
@@ -2049,6 +2069,8 @@ sctypeDict.update({
     "object": object_, "object_": object_,
     "longdouble": longdouble, "clongdouble": clongdouble,
 })
+if longdouble.dtype.name == "float128":
+    sctypeDict.update({"float128": longdouble, "complex256": clongdouble})
 # numpy's `sctypeDict` is keyed by *name* only -- the single-character codes
 # are not registered (probed: `'?' not in np.sctypeDict`).
 
@@ -2101,4 +2123,6 @@ def registry():
     d.update({"longlong": longlong, "ulonglong": ulonglong,
               "longdouble": longdouble, "clongdouble": clongdouble,
               "datetime64": datetime64, "timedelta64": timedelta64})
+    if longdouble.dtype.name == "float128":
+        d.update({"float128": longdouble, "complex256": clongdouble})
     return d
