@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-25T00:54:35.300587+00:00",
-  "overall_passed": 1256,
+  "timestamp": "2026-08-25T03:14:12.808643+00:00",
+  "overall_passed": 1341,
   "overall_total": 1349,
   "files": [
     {
@@ -21,48 +21,48 @@
     },
     {
       "file": "random/test_generator_mt19937.py",
-      "passed": 289,
-      "failed": 33,
+      "passed": 320,
+      "failed": 2,
       "errors": 0,
       "skipped": 0,
       "total": 322
     },
     {
       "file": "random/test_generator_mt19937_regressions.py",
-      "passed": 16,
-      "failed": 3,
+      "passed": 18,
+      "failed": 1,
       "errors": 0,
       "skipped": 0,
       "total": 19
     },
     {
       "file": "random/test_random.py",
-      "passed": 126,
-      "failed": 16,
+      "passed": 139,
+      "failed": 3,
       "errors": 0,
       "skipped": 0,
       "total": 142
     },
     {
       "file": "random/test_randomstate.py",
-      "passed": 168,
-      "failed": 13,
+      "passed": 180,
+      "failed": 1,
       "errors": 0,
       "skipped": 0,
       "total": 181
     },
     {
       "file": "random/test_randomstate_regression.py",
-      "passed": 14,
-      "failed": 7,
+      "passed": 21,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 21
     },
     {
       "file": "random/test_regression.py",
-      "passed": 19,
-      "failed": 2,
+      "passed": 21,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 21
@@ -77,8 +77,8 @@
     },
     {
       "file": "random/test_smoke.py",
-      "passed": 527,
-      "failed": 18,
+      "passed": 545,
+      "failed": 0,
       "errors": 0,
       "skipped": 3,
       "total": 548
