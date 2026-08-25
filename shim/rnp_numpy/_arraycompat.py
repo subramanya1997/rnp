@@ -486,6 +486,11 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
 # ---------------------------------------------------------------------------
 
 def copy_method(self, /, order="C"):
+    # The engine's native copy already implements the default C-order case.
+    # Only subclasses and alternate-order requests need the compatibility
+    # wrapper's ordering and result retyping work.
+    if type(self) is ndarray and order == "C":
+        return _orig_copy(self)
     result = _ordered_copy(self, self.dtype, _norm_order(order, "C"))
     if type(self) is not ndarray and type(result) is ndarray:
         result = result.view(type(self))
