@@ -44,3 +44,14 @@ The implementation is selected only for Linux x86-64. Other platforms keep
 the existing behavior; in particular, macOS continues to model
 `longdouble`/`clongdouble` as `float64`/`complex128` storage with their distinct
 scalar aliases.
+
+## Full-suite scoreboard, Linux x86_64 (2026-08-25, main @ f036983)
+
+core 32316/34229 (94.4%), lib 4153/4759, ma 4177/4376, fft 157/159,
+random 1324/1349, polynomial 566/610, top 129/207, matrixlib 99/209,
+linalg 158/485 — GRAND TOTAL 43079/46383 (92.9%).
+
+Known gap driving linalg (32.6% vs 100% on macOS) and matrixlib: the Linux
+runtime backend dlopens numpy's bundled scipy-openblas64 for BLAS (gemm/dotc)
+but does not yet resolve its LAPACK entry points; macOS links Accelerate
+LAPACK. Extending the dlopen backend to LAPACK closes it.
