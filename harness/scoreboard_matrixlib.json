@@ -1,36 +1,36 @@
 {
-  "timestamp": "2026-08-25T00:54:38.573038+00:00",
-  "overall_passed": 151,
+  "timestamp": "2026-08-25T01:45:15.702972+00:00",
+  "overall_passed": 188,
   "overall_total": 209,
   "files": [
     {
       "file": "matrixlib/test_defmatrix.py",
-      "passed": 17,
-      "failed": 27,
+      "passed": 39,
+      "failed": 5,
       "errors": 0,
       "skipped": 0,
       "total": 44
     },
     {
       "file": "matrixlib/test_interaction.py",
-      "passed": 9,
-      "failed": 14,
+      "passed": 19,
+      "failed": 4,
       "errors": 0,
       "skipped": 0,
       "total": 23
     },
     {
       "file": "matrixlib/test_masked_matrix.py",
-      "passed": 3,
-      "failed": 11,
+      "passed": 11,
+      "failed": 3,
       "errors": 0,
       "skipped": 0,
       "total": 14
     },
     {
       "file": "matrixlib/test_matrix_linalg.py",
-      "passed": 120,
-      "failed": 0,
+      "passed": 114,
+      "failed": 6,
       "errors": 0,
       "skipped": 0,
       "total": 120
@@ -54,8 +54,8 @@
     },
     {
       "file": "matrixlib/test_regression.py",
-      "passed": 1,
-      "failed": 3,
+      "passed": 4,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 4

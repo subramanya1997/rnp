@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-08-25T00:50:44.398943+00:00",
-  "overall_passed": 4104,
-  "overall_total": 4352,
+  "timestamp": "2026-08-25T01:45:29.785335+00:00",
+  "overall_passed": 4184,
+  "overall_total": 4376,
   "files": [
     {
       "file": "ma/test_arrayobject.py",
@@ -13,8 +13,8 @@
     },
     {
       "file": "ma/test_core.py",
-      "passed": 4021,
-      "failed": 148,
+      "passed": 4074,
+      "failed": 95,
       "errors": 0,
       "skipped": 3,
       "total": 4172
@@ -29,19 +29,19 @@
     },
     {
       "file": "ma/test_extras.py",
-      "passed": 58,
-      "failed": 45,
+      "passed": 68,
+      "failed": 35,
       "errors": 0,
       "skipped": 0,
       "total": 103
     },
     {
       "file": "ma/test_mrecords.py",
-      "passed": 0,
-      "failed": 0,
+      "passed": 6,
+      "failed": 18,
       "errors": 0,
       "skipped": 0,
-      "total": 0
+      "total": 24
     },
     {
       "file": "ma/test_old_ma.py",
@@ -53,16 +53,16 @@
     },
     {
       "file": "ma/test_regression.py",
-      "passed": 10,
-      "failed": 3,
+      "passed": 11,
+      "failed": 2,
       "errors": 0,
       "skipped": 0,
       "total": 13
     },
     {
       "file": "ma/test_subclassing.py",
-      "passed": 3,
-      "failed": 13,
+      "passed": 13,
+      "failed": 3,
       "errors": 0,
       "skipped": 0,
       "total": 16
