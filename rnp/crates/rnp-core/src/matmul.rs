@@ -33,6 +33,7 @@
 use std::borrow::Cow;
 
 use crate::array::{shape_size, NdArray};
+use crate::f80::{C160, F80};
 use crate::descr::Descr;
 use crate::dtype::{promote, DType};
 use crate::element::{C64v, Element, NpBool, C32, F16};
@@ -410,8 +411,10 @@ fn has_loop(dt: DType) -> bool {
             | DType::F16
             | DType::F32
             | DType::F64
+            | DType::F80
             | DType::C64
             | DType::C128
+            | DType::C160
             | DType::Object
     )
 }
@@ -764,6 +767,14 @@ macro_rules! float_elem {
 float_elem!(f32, sdot, sgemv, sgemm);
 float_elem!(f64, ddot, dgemv, dgemm);
 
+impl MatElem for F80 {
+    type Acc = F80;
+    fn acc_zero() -> F80 { F80::ZERO }
+    fn acc_add(acc: F80, x: F80, y: F80) -> F80 { acc.add(x.mul(y)) }
+    fn acc_finish(acc: F80) -> F80 { acc }
+    conj_is_plain!();
+}
+
 impl MatElem for NpBool {
     type Acc = bool;
     #[inline]
@@ -1097,6 +1108,20 @@ impl MatElem for C64v {
         unsafe { crate::blas::zgemm_vecmat(x, lda, y, ldb, transpose_y, out, n, m) };
         Some(())
     }
+}
+
+impl MatElem for C160 {
+    type Acc = C160;
+    fn acc_zero() -> C160 { C160::ZERO }
+    fn acc_add(acc: C160, x: C160, y: C160) -> C160 { acc.add(x.mul(y)) }
+    fn acc_finish(acc: C160) -> C160 { acc }
+
+    type ConjAcc = C160;
+    fn conj_zero() -> C160 { C160::ZERO }
+    fn conj_add(acc: C160, x: C160, y: C160) -> C160 {
+        acc.add(C160 { re: x.re, im: x.im.neg() }.mul(y))
+    }
+    fn conj_finish(acc: C160) -> C160 { acc }
 }
 
 /// Read one `T` out of `arr` at a byte offset.
@@ -1878,6 +1903,7 @@ pub fn matmul(
         DType::F16 => kernel::<F16>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
         DType::F32 => kernel::<f32>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
         DType::F64 => kernel::<f64>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
+        DType::F80 => kernel::<F80>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
         DType::C64 => kernel::<C32>(
             kind,
             &av,
@@ -1894,6 +1920,15 @@ pub fn matmul(
             &mut out,
             kind.conjugates_first(),
             conj_route,
+            &p,
+        ),
+        DType::C160 => kernel::<C160>(
+            kind,
+            &av,
+            &bv,
+            &mut out,
+            kind.conjugates_first(),
+            ConjRoute::Scalar,
             &p,
         ),
         _ => {

@@ -265,8 +265,9 @@ _CLASS_NAMES = {
     "uint8": "UInt8DType", "uint16": "UInt16DType",
     "uint32": "UInt32DType", "uint64": "UInt64DType",
     "float16": "Float16DType", "float32": "Float32DType",
-    "float64": "Float64DType", "complex64": "Complex64DType",
-    "complex128": "Complex128DType", "bytes": "BytesDType",
+    "float64": "Float64DType", "float128": "LongDoubleDType",
+    "complex64": "Complex64DType", "complex128": "Complex128DType",
+    "complex256": "CLongDoubleDType", "bytes": "BytesDType",
     "str": "StrDType", "void": "VoidDType", "object": "ObjectDType",
     "datetime64": "DateTime64DType", "timedelta64": "TimeDelta64DType",
 }

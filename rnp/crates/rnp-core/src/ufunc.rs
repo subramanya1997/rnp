@@ -11,6 +11,7 @@ use crate::array::NdArray;
 use crate::dtype::DType;
 use crate::element::{Element, NpBool, Scalar, C32, C64v, F16};
 use crate::error::{Error, Result};
+use crate::f80::{C160, F80};
 use crate::fpe;
 use crate::loops::{unary1, unary1_flagged};
 use crate::ops::{Arith, Cmp, CplxPow, FpClass, IntOps, SignedBits};
@@ -264,10 +265,11 @@ impl UnOp {
             }
             // `absolute` on complex yields the real component type.
             let out = if self == Absolute {
-                if d == DType::C64 {
-                    DType::F32
-                } else {
-                    DType::F64
+                match d {
+                    DType::C64 => DType::F32,
+                    DType::C128 => DType::F64,
+                    DType::C160 => DType::F80,
+                    _ => unreachable!("complex dtype resolution"),
                 }
             } else {
                 d
@@ -1052,10 +1054,17 @@ fn unary_native(a: &NdArray, op: UnOp) -> Result<NdArray> {
                 let o = unsafe { out.buffer.as_mut_ptr() as *mut f32 };
                 unary1::<C32, f32, _>(src, o, n, |z| z.c_abs() as f32);
             }
-            _ => {
+            DType::C128 => {
                 let o = unsafe { out.buffer.as_mut_ptr() as *mut f64 };
                 unary1::<C64v, f64, _>(src, o, n, |z| z.c_abs());
             }
+            DType::C160 => {
+                let o = unsafe { out.buffer.as_mut_ptr() as *mut F80 };
+                unary1::<C160, F80, _>(src, o, n, |z| {
+                    F80::from_f64(z.re.to_f64().hypot(z.im.to_f64()))
+                });
+            }
+            _ => unreachable!("absolute resolved a non-complex compute dtype"),
         }
         return Ok(out);
     }
@@ -1077,6 +1086,18 @@ fn unary_native(a: &NdArray, op: UnOp) -> Result<NdArray> {
         DType::F16 => run_float_un::<F16>(src, &out, n, op),
         DType::F32 => run_float_un::<f32>(src, &out, n, op),
         DType::F64 => run_float_un::<f64>(src, &out, n, op),
+        DType::F80 => {
+            // Linux long-double linalg needs the exact sign-bit operations;
+            // transcendental long-double loops remain outside this surface.
+            let o = unsafe { out.buffer.as_mut_ptr() as *mut F80 };
+            match op {
+                UnOp::Negative => unary1::<F80, F80, _>(src, o, n, F80::neg),
+                UnOp::Positive | UnOp::Conjugate => unary1::<F80, F80, _>(src, o, n, |x| x),
+                UnOp::Absolute | UnOp::Fabs => unary1::<F80, F80, _>(src, o, n, F80::abs),
+                UnOp::OnesLike => unary1::<F80, F80, _>(src, o, n, |_| F80::ONE),
+                other => return Err(Error::NotImplemented(format!("unary {other:?} on F80"))),
+            }
+        }
         DType::C64 => run_cplx_un::<C32>(src, &out, n, op),
         DType::C128 => run_cplx_un::<C64v>(src, &out, n, op),
         other => return Err(Error::NotImplemented(format!("unary on {other:?}"))),
@@ -1121,6 +1142,14 @@ fn run_bool_out(a: &NdArray, o: *mut u8, n: usize, compute: DType, op: UnOp) {
         DType::F16 => go!(F16),
         DType::F32 => go!(f32),
         DType::F64 => go!(f64),
+        DType::F80 => match op {
+            UnOp::LogicalNot => unary1::<F80, u8, _>(a, o, n, |x| !Cmp::c_truthy(x) as u8),
+            UnOp::IsNan => unary1::<F80, u8, _>(a, o, n, |x| FpClass::fp_nan(x) as u8),
+            UnOp::IsInf => unary1::<F80, u8, _>(a, o, n, |x| FpClass::fp_inf(x) as u8),
+            UnOp::IsFinite => unary1::<F80, u8, _>(a, o, n, |x| FpClass::fp_finite(x) as u8),
+            UnOp::Signbit => unary1::<F80, u8, _>(a, o, n, |x| x.is_sign_negative() as u8),
+            other => panic!("no F80 bool-output loop for {}", other.name()),
+        },
         DType::C64 => match op {
             UnOp::LogicalNot => unary1::<C32, u8, _>(a, o, n, |x| !Cmp::c_truthy(x) as u8),
             UnOp::IsNan => unary1::<C32, u8, _>(a, o, n, |x| FpClass::fp_nan(x) as u8),
@@ -1128,13 +1157,21 @@ fn run_bool_out(a: &NdArray, o: *mut u8, n: usize, compute: DType, op: UnOp) {
             UnOp::IsFinite => unary1::<C32, u8, _>(a, o, n, |x| FpClass::fp_finite(x) as u8),
             other => panic!("no complex bool-output loop for {}", other.name()),
         },
-        _ => match op {
+        DType::C128 => match op {
             UnOp::LogicalNot => unary1::<C64v, u8, _>(a, o, n, |x| !Cmp::c_truthy(x) as u8),
             UnOp::IsNan => unary1::<C64v, u8, _>(a, o, n, |x| FpClass::fp_nan(x) as u8),
             UnOp::IsInf => unary1::<C64v, u8, _>(a, o, n, |x| FpClass::fp_inf(x) as u8),
             UnOp::IsFinite => unary1::<C64v, u8, _>(a, o, n, |x| FpClass::fp_finite(x) as u8),
             other => panic!("no complex bool-output loop for {}", other.name()),
         },
+        DType::C160 => match op {
+            UnOp::LogicalNot => unary1::<C160, u8, _>(a, o, n, |x| !Cmp::c_truthy(x) as u8),
+            UnOp::IsNan => unary1::<C160, u8, _>(a, o, n, |x| FpClass::fp_nan(x) as u8),
+            UnOp::IsInf => unary1::<C160, u8, _>(a, o, n, |x| FpClass::fp_inf(x) as u8),
+            UnOp::IsFinite => unary1::<C160, u8, _>(a, o, n, |x| FpClass::fp_finite(x) as u8),
+            other => panic!("no complex bool-output loop for {}", other.name()),
+        },
+        other => panic!("no bool-output loop for {other:?}"),
     }
 }
 
