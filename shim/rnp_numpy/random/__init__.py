@@ -12,12 +12,26 @@ Every message below was probed from real numpy 2.5.2.
 import operator as _operator
 import random as _random
 import warnings as _warnings
+from collections.abc import Sequence as _Sequence
 import functools as _functools
 import inspect as _inspect
 import math
+import sys as _sys
 import types as _types
 
-from .. import arange, array, asarray, empty, float64, int_, zeros
+from .. import (
+    arange,
+    array,
+    asarray,
+    broadcast_to,
+    dtype as _dtype,
+    empty,
+    float64,
+    int_,
+    ndarray,
+    zeros,
+)
+from .._arraycompat import broadcast_arrays
 from .bit_generator import (
     ISeedSequence,
     ISpawnableSeedSequence,
@@ -35,6 +49,21 @@ from ._bit_generators import (
 from ._generator import Generator
 from ._legacy import LegacyDistributions, LegacyMT19937
 from ._distributions import DistributionKernels
+from .. import _core as _core_module
+from .._core import multiarray as _core_multiarray
+
+# NumPy 1.x random pickle payloads name the pre-2.0 ``numpy.core`` package.
+# The redirector maps that spelling to ``rnp_numpy.core`` while this shim's
+# implementation lives at ``rnp_numpy._core``.
+_sys.modules.setdefault("rnp_numpy.core", _core_module)
+_sys.modules.setdefault("rnp_numpy.core.multiarray", _core_multiarray)
+
+# Random's memoryview shuffle contract reaches the ndarray buffer through
+# ``arr.data``.  The Rust ndarray already exports the buffer protocol, so the
+# missing property is only a Python-level adapter and belongs here until the
+# broader ndarray compatibility lane can own it.
+if not hasattr(ndarray, "data"):
+    ndarray.data = property(memoryview)
 
 _rng = LegacyMT19937()
 
@@ -140,17 +169,134 @@ def _standard_normal(r, size=None):
     return _fill(_shape(size), lambda: r.gauss(0.0, 1.0))
 
 
+def _legacy_masked_values(r, bits, bounds):
+    """NumPy's dtype-specific, buffered masked-rejection integer fill."""
+    remaining = 0
+    buffer = 0
+    chunks = 32 // bits if bits < 32 else 1
+    piece_mask = (1 << bits) - 1 if bits < 32 else 0xFFFFFFFF
+
+    def next_piece():
+        nonlocal remaining, buffer
+        if remaining == 0:
+            buffer = r.next_uint32()
+            remaining = chunks - 1
+        else:
+            buffer >>= bits
+            remaining -= 1
+        return buffer & piece_mask
+
+    values = []
+    for low_value, high_value in bounds:
+        inclusive_range = high_value - low_value - 1
+        if inclusive_range == 0:
+            values.append(low_value)
+            continue
+        if bits == 1:
+            values.append(low_value + next_piece())
+            continue
+        mask = inclusive_range
+        mask |= mask >> 1
+        mask |= mask >> 2
+        mask |= mask >> 4
+        mask |= mask >> 8
+        mask |= mask >> 16
+        mask |= mask >> 32
+        if bits < 32:
+            while True:
+                value = next_piece() & mask
+                if value <= inclusive_range:
+                    break
+        elif bits == 32 or inclusive_range <= 0xFFFFFFFF:
+            while True:
+                value = r.next_uint32() & mask
+                if value <= inclusive_range:
+                    break
+        else:
+            while True:
+                value = r.next_uint64() & mask
+                if value <= inclusive_range:
+                    break
+        values.append(low_value + value)
+    return values
+
+
 def _randint(r, low, high=None, size=None, dtype=int_):
-    low = _operator.index(low)
+    original_dtype = dtype
+    name = str(_dtype("long" if dtype is int else dtype))
+    info = {
+        "bool": (1, 0, 2),
+        "int8": (8, -(1 << 7), 1 << 7),
+        "uint8": (8, 0, 1 << 8),
+        "int16": (16, -(1 << 15), 1 << 15),
+        "uint16": (16, 0, 1 << 16),
+        "int32": (32, -(1 << 31), 1 << 31),
+        "uint32": (32, 0, 1 << 32),
+        "int64": (64, -(1 << 63), 1 << 63),
+        "uint64": (64, 0, 1 << 64),
+    }
+    if name.startswith((">", "<")):
+        _warnings.warn(
+            "Providing a dtype with a non-native byteorder is not supported. "
+            "If you require platform-independent byteorder, call byteswap "
+            "when required.\nIn future version, providing byteorder will "
+            "raise a ValueError",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        name = name[1:]
+        name = {"i1": "int8", "u1": "uint8", "i2": "int16",
+                "u2": "uint16", "i4": "int32", "u4": "uint32",
+                "i8": "int64", "u8": "uint64"}.get(name, name)
+        dtype = name
+    if name not in info:
+        raise TypeError(f"Unsupported dtype {str(_dtype(original_dtype))!r} for randint")
+    bits, dtype_low, dtype_high = info[name]
+
     if high is None:
         low, high = 0, low
+
+    scalar_bounds = True
+    try:
+        low_value = _operator.index(low)
+        high_value = _operator.index(high)
+    except TypeError:
+        scalar_bounds = False
+
+    if scalar_bounds:
+        shape = _shape(size)
+        if size is not None and _count(shape) == 0:
+            return empty(shape, dtype=dtype)
+        bounds = [(low_value, high_value)] * (1 if size is None else _count(shape))
     else:
-        high = _operator.index(high)
-    if low >= high:
-        raise ValueError("low >= high")
-    if size is None:
-        return r.randrange(low, high)
-    return _fill(_shape(size), lambda: r.randrange(low, high), dtype)
+        low_array, high_array = broadcast_arrays(asarray(low), asarray(high))
+        shape = tuple(low_array.shape) if size is None else _shape(size)
+        if _count(shape) == 0:
+            return empty(shape, dtype=dtype)
+        low_array = broadcast_to(low_array, shape)
+        high_array = broadcast_to(high_array, shape)
+        try:
+            bounds = [(_operator.index(lo), _operator.index(hi))
+                      for lo, hi in zip(low_array.flat, high_array.flat)]
+        except TypeError:
+            raise TypeError("low and high must be integers") from None
+
+    for low_value, high_value in bounds:
+        if low_value < dtype_low:
+            raise ValueError(f"low is out of bounds for {name}")
+        if high_value > dtype_high:
+            raise ValueError(f"high is out of bounds for {name}")
+        if low_value >= high_value:
+            raise ValueError("high <= 0" if low_value == 0 else "low >= high")
+
+    values = _legacy_masked_values(r, bits, bounds)
+    if size is None and scalar_bounds:
+        if original_dtype is int:
+            return int(values[0])
+        if original_dtype is bool:
+            return bool(values[0])
+        return array(values, dtype=dtype)[0]
+    return array(values, dtype=dtype).reshape(shape)
 
 
 def _random_integers(r, low, high=None, size=None):
@@ -180,6 +326,14 @@ def _permutation(r, x):
 
 
 def _shuffle(r, x):
+    if not isinstance(x, (ndarray, _Sequence)):
+        _warnings.warn(
+            f"you are shuffling a '{type(x).__name__}' object which is not a "
+            "subclass of 'Sequence'; `shuffle` is not guaranteed to behave "
+            "correctly.",
+            UserWarning,
+            stacklevel=2,
+        )
     n = len(x)
     for i in range(n - 1, 0, -1):
         j = r.randrange(i + 1)
@@ -224,15 +378,23 @@ def _choice(r, a, size=None, replace=True, p=None):
             raise ValueError("probabilities must be numeric") from None
         if p_array.ndim != 1:
             raise ValueError("'p' must be 1-dimensional")
-        weights = [float(w) for w in p_array.tolist()]
+        try:
+            weights = [float(w) for w in p_array.tolist()]
+        except (TypeError, ValueError):
+            raise ValueError("probabilities contain NaN") from None
         if len(weights) != pop:
             raise ValueError("'a' and 'p' must have same size")
         if any(not math.isfinite(w) for w in weights):
             raise ValueError("probabilities contain NaN")
         if any(w < 0 for w in weights):
             raise ValueError("probabilities are not non-negative")
-        total = sum(weights)
-        if abs(total - 1.0) > 1e-8:
+        total = math.fsum(weights)
+        eps = {
+            "float16": 0.0009765625,
+            "float32": 1.1920928955078125e-07,
+            "float64": 2.220446049250313e-16,
+        }.get(str(p_array.dtype), 2.220446049250313e-16)
+        if abs(total - 1.0) > math.sqrt(eps):
             raise ValueError("probabilities do not sum to 1")
 
     if pop == 0:
@@ -386,19 +548,22 @@ class RandomState:
 
     _poisson_lam_max = 9.223372006484771e18
 
-    def __init__(self, s=None):
-        if isinstance(s, type) and issubclass(s, BitGenerator):
+    def __init__(self, seed=None):
+        if isinstance(seed, type) and issubclass(seed, BitGenerator):
             raise ValueError("RandomState requires an instantiated BitGenerator")
-        self._bit_generator = s if isinstance(s, BitGenerator) else LegacyMT19937(s)
+        self._bit_generator = (seed if isinstance(seed, BitGenerator)
+                               else LegacyMT19937(seed))
         self._legacy = LegacyDistributions(self._bit_generator)
         self._modern = DistributionKernels(self._bit_generator)
 
     def seed(self, s=None):
         if isinstance(self._bit_generator, LegacyMT19937):
             self._bit_generator.seed(s)
-        else:
+        elif isinstance(self._bit_generator, MT19937):
             replacement = type(self._bit_generator)(s)
             self._bit_generator.state = replacement.state
+        else:
+            raise TypeError("can only re-seed a MT19937 BitGenerator")
         self._legacy.has_gauss = False
         self._legacy.gauss_value = 0.0
 
@@ -423,31 +588,7 @@ class RandomState:
         return self._fill(size, self._legacy.gauss)
 
     def randint(self, low, high=None, size=None, dtype=int_):
-        low = _operator.index(low)
-        if high is None:
-            low, high = 0, low
-        else:
-            high = _operator.index(high)
-        shape = _shape(size)
-        if size is not None and _count(shape) == 0:
-            return _fill(shape, lambda: 0, dtype)
-        if low >= high:
-            raise ValueError("low >= high")
-        maximum = high - low - 1
-        def draw():
-            mask = maximum
-            mask |= mask >> 1
-            mask |= mask >> 2
-            mask |= mask >> 4
-            mask |= mask >> 8
-            mask |= mask >> 16
-            mask |= mask >> 32
-            while True:
-                value = (self._bit_generator.next_uint32() if maximum <= 0xFFFFFFFF
-                         else self._bit_generator.next_uint64()) & mask
-                if value <= maximum:
-                    return low + value
-        return self._fill(size, draw, dtype)
+        return _randint(self._bit_generator, low, high, size, dtype)
 
     def random_integers(self, low, high=None, size=None):
         _warnings.warn("This function is deprecated", DeprecationWarning, stacklevel=2)
@@ -466,6 +607,21 @@ class RandomState:
         return result
 
     def shuffle(self, x):
+        if isinstance(x, ndarray) and type(x) is not ndarray and x.ndim == 1:
+            _warnings.warn(
+                "Shuffling a one dimensional array subclass may produce "
+                "incorrect results due to view semantics.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif not isinstance(x, (ndarray, _Sequence)):
+            _warnings.warn(
+                f"you are shuffling a '{type(x).__name__}' object which is "
+                "not a subclass of 'Sequence'; `shuffle` is not guaranteed "
+                "to behave correctly.",
+                UserWarning,
+                stacklevel=2,
+            )
         for i in range(len(x) - 1, 0, -1):
             j = self.randint(0, i + 1)
             try:
@@ -761,7 +917,93 @@ class RandomState:
     def _legacy_binomial(self, n, p):
         use_p = p if p <= 0.5 else 1.0 - p
         if use_p * n > 30.0:
-            return self._modern.binomial(n, p)
+            r = use_p
+            q = 1.0 - r
+            fm = n * r + r
+            m = math.floor(fm)
+            p1 = math.floor(2.195 * math.sqrt(n * r * q) - 4.6 * q) + 0.5
+            xm = m + 0.5
+            xl = xm - p1
+            xr = xm + p1
+            c = 0.134 + 20.5 / (15.3 + m)
+            a = (fm - xl) / (fm - xl * r)
+            laml = a * (1.0 + a / 2.0)
+            a = (xr - fm) / (xr * q)
+            lamr = a * (1.0 + a / 2.0)
+            p2 = p1 * (1.0 + 2.0 * c)
+            p3 = p2 + c / laml
+            p4 = p3 + c / lamr
+            nrq = n * r * q
+            while True:
+                u = self._bit_generator.next_double() * p4
+                v = self._bit_generator.next_double()
+                needs_ratio_test = False
+                if u <= p1:
+                    y = math.floor(xm - p1 * v + u)
+                elif u <= p2:
+                    x = xl + (u - p1) / c
+                    v = v * c + 1.0 - abs(m - x + 0.5) / p1
+                    if v > 1.0:
+                        continue
+                    y = math.floor(x)
+                    needs_ratio_test = True
+                elif u <= p3:
+                    if v == 0.0:
+                        continue
+                    y = math.floor(xl + math.log(v) / laml)
+                    if y < 0:
+                        continue
+                    v = v * (u - p2) * laml
+                    needs_ratio_test = True
+                else:
+                    if v == 0.0:
+                        continue
+                    y = math.floor(xr - math.log(v) / lamr)
+                    if y > n:
+                        continue
+                    v = v * (u - p3) * lamr
+                    needs_ratio_test = True
+
+                if needs_ratio_test:
+                    k = abs(y - m)
+                    if k <= 20 or k >= nrq / 2.0 - 1.0:
+                        s = r / q
+                        a = s * (n + 1)
+                        ratio = 1.0
+                        if m < y:
+                            for i in range(m + 1, y + 1):
+                                ratio *= a / i - s
+                        elif m > y:
+                            for i in range(y + 1, m + 1):
+                                ratio /= a / i - s
+                        if v > ratio:
+                            continue
+                    else:
+                        rho = ((k / nrq)
+                               * ((k * (k / 3.0 + 0.625)
+                                   + 0.16666666666666666) / nrq + 0.5))
+                        t = -k * k / (2.0 * nrq)
+                        log_v = math.log(v)
+                        if log_v > t + rho:
+                            continue
+                        if log_v >= t - rho:
+                            x1 = y + 1.0
+                            f1 = m + 1.0
+                            z = n + 1.0 - m
+                            w = n - y + 1.0
+                            x2, f2, z2, w2 = x1*x1, f1*f1, z*z, w*w
+                            correction = (
+                                xm * math.log(f1 / x1)
+                                + (n - m + 0.5) * math.log(z / w)
+                                + (y - m) * math.log(w * r / (x1 * q))
+                                + (13680. - (462. - (132. - (99. - 140. / f2) / f2) / f2) / f2) / f1 / 166320.
+                                + (13680. - (462. - (132. - (99. - 140. / z2) / z2) / z2) / z2) / z / 166320.
+                                + (13680. - (462. - (132. - (99. - 140. / x2) / x2) / x2) / x2) / x1 / 166320.
+                                + (13680. - (462. - (132. - (99. - 140. / w2) / w2) / w2) / w2) / w / 166320.
+                            )
+                            if log_v > correction:
+                                continue
+                return n - y if p > 0.5 else y
         q = 1.0 - use_p
         qn = math.exp(n * math.log(q))
         np_ = n * use_p
@@ -793,7 +1035,10 @@ class RandomState:
             self._legacy.standard_gamma(n) * ((1.0 - p) / p)), int_)
 
     def dirichlet(self, alpha, size=None):
-        values = [float(v) for v in asarray(alpha).flat]
+        alpha_array = asarray(alpha)
+        if alpha_array.ndim != 1:
+            raise ValueError("object too deep for desired array")
+        values = [float(v) for v in alpha_array.flat]
         if any(v <= 0.0 or math.isnan(v) for v in values):
             raise ValueError("alpha <= 0")
         rows = 1 if size is None else _count(_shape(size))
@@ -805,8 +1050,31 @@ class RandomState:
         return array(out).reshape(_shape(size) + (len(values),))
 
     def multinomial(self, n, pvals, size=None):
-        n = _operator.index(n)
-        probs = [float(v) for v in asarray(pvals).flat]
+        try:
+            n = _operator.index(n)
+        except TypeError:
+            n = int(n)
+        if n < 0:
+            raise ValueError("n < 0")
+        p_array = asarray(pvals)
+        if p_array.ndim == 0:
+            raise TypeError("pvals must be a 1-d sequence")
+        if p_array.ndim != 1:
+            raise ValueError("object too deep for desired array")
+        probs = [float(v) for v in p_array.flat]
+        if any(v < 0.0 or v > 1.0 or math.isnan(v) for v in probs):
+            raise ValueError("pvals < 0, pvals > 1 or pvals contains NaNs")
+        if math.fsum(probs[:-1]) > 1.0 + 1e-12:
+            if (str(p_array.dtype) in ("float16", "float32")
+                    and math.fsum(probs) < 1.0001):
+                raise ValueError(
+                    "The pvals array is cast to 64-bit floating point prior "
+                    "to checking the sum. Precision changes when casting may "
+                    "cause problems."
+                )
+            raise ValueError("sum(pvals[:-1]) > 1.0")
+        if not probs:
+            return empty(_shape(size) + (0,), dtype=int_)
         rows = 1 if size is None else _count(_shape(size))
         out = []
         for _ in range(rows):
@@ -952,6 +1220,11 @@ class RandomState:
     def __setstate__(self, state):
         self.set_state(state)
 
+    def __reduce__(self):
+        from . import _pickle
+        constructor = getattr(_pickle, "__randomstate_ctor")
+        return constructor, (self._bit_generator,), self.get_state(legacy=False)
+
     def __repr__(self):
         return f"RandomState({type(self._bit_generator).__name__.replace('Legacy', '')}) at {id(self):#X}"
 
@@ -1078,7 +1351,7 @@ def _validate_broadcast_distribution(name, values):
         reject(value["ngood"] + value["nbad"] < value["nsample"],
                "ngood + nbad < nsample")
     elif name == "logseries":
-        reject(not 0 < value["p"] < 1,
+        reject(not 0 <= value["p"] < 1,
                "p < 0, p >= 1 or p contains NaNs")
 
 
@@ -1145,6 +1418,20 @@ for _legacy_name in (
     "triangular", "vonmises", "wald", "weibull", "zipf", "tomaxint",
 ):
     globals()[_legacy_name] = getattr(_global_random_state, _legacy_name)
+    setattr(mtrand, _legacy_name, getattr(_global_random_state, _legacy_name))
+
+
+def seed(seed=None):
+    """Reseed the singleton, including a hot-swapped BitGenerator."""
+    if isinstance(_global_random_state._bit_generator,
+                  (LegacyMT19937, MT19937)):
+        return _global_random_state.seed(seed)
+    bitgen_type = type(_global_random_state._bit_generator)
+    replacement = bitgen_type(seed)
+    _global_random_state.set_state(replacement.state)
+
+
+setattr(mtrand, "seed", seed)
 ranf = sample = random_sample
 
 
