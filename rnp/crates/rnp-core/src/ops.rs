@@ -3193,8 +3193,10 @@ where
         }
         BinOp::FloorDiv => (x.r_divmod(y).0, x.r_divmod_flags(y)),
         BinOp::Mod => (x.r_divmod(y).1, x.r_remainder_flags(y)),
-        // numpy's fmod raises nothing at all, even for `fmod(1.0, 0.0)`.
-        BinOp::Fmod => (x.r_fmod(y), 0),
+        // Keep the scalar fast path identical to the array loop: glibc leaves
+        // invalid set for a zero divisor or infinite dividend, while Apple's
+        // corresponding loop is silent.
+        BinOp::Fmod => (x.r_fmod(y), platform_mod_invalid_flags(x, y)),
         BinOp::Arctan2 => (x.r_atan2(y), 0),
         BinOp::Hypot => {
             let r = x.r_hypot(y);
