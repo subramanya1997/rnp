@@ -929,8 +929,9 @@ def _cast(cls, value, *extra, **kw):
         k = cls.dtype.kind
         if k in "iu":
             value = int(text, 0)
-        elif k == "f" and cls.dtype.name != "float128":
-            value = _builtins.float(text)
+        elif k == "f":
+            if cls.dtype.name != "float128":
+                value = _builtins.float(text)
         elif k == "c":
             value = complex(text)
         else:
