@@ -2211,6 +2211,19 @@ array = _NonBindingCallable(array)
 
 
 __all__ = [n for n in dir() if not n.startswith("_")]
+if "testing" not in __all__:
+    __all__.append("testing")
+
+
+def __getattr__(name):
+    """Load public submodules that NumPy exposes lazily."""
+    if name == "testing":
+        module = _importlib.import_module(".testing", __name__)
+        globals()[name] = module
+        if _sys.modules.get("numpy") is _sys.modules.get(__name__):
+            _sys.modules.setdefault("numpy.testing", module)
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # --------------------------------------------------------------------------
