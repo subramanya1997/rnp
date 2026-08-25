@@ -995,12 +995,14 @@ class nditer:
 
         n = self._external_chunk_len()
         chunks = []
+        c_axes = list(range(len(self._logical_shape) - 1, -1, -1))
+        f_axes = list(range(len(self._logical_shape)))
         for operand, (arr, mode) in enumerate(zip(
                 self._operands, self._op_flags)):
-            coords = [self._operand_coord(
-                arr, self._coord_at(self._pos + offset)) for offset in range(n)]
-            c_axes = list(range(len(self._logical_shape) - 1, -1, -1))
-            f_axes = list(range(len(self._logical_shape)))
+            # Keep the contiguous fast paths ahead of coordinate expansion.
+            # A 16 MiB uint8 buffer contains 16 million elements; constructing
+            # that many Python coordinate tuples before taking a simple slice
+            # made np.savez's large-array test exceed the per-file timeout.
             if (operand not in self._lazy_casts
                     and tuple(arr.shape) == self._logical_shape
                     and ((arr.flags.c_contiguous and self._axis_fast == c_axes)
@@ -1013,6 +1015,17 @@ class nditer:
                     chunk.flags.writeable = False
                 chunks.append(chunk)
                 continue
+            if (operand not in self._lazy_casts
+                    and len(self._logical_shape) == 1 and arr.ndim == 1
+                    and tuple(arr.shape) == self._logical_shape
+                    and not self._axis_reverse[0]):
+                chunk = arr[self._pos:self._pos + n]
+                if "readonly" in mode:
+                    chunk.flags.writeable = False
+                chunks.append(chunk)
+                continue
+            coords = [self._operand_coord(
+                arr, self._coord_at(self._pos + offset)) for offset in range(n)]
             repeated = coords and all(coord == coords[0] for coord in coords)
             contig_read_copy = "contig" in mode and "readonly" in mode
             contig_write_copy = (
@@ -1027,15 +1040,6 @@ class nditer:
                     writeable="readonly" not in mode)
                 if operand in self._lazy_casts:
                     chunk = self._cast_array(chunk, self._lazy_casts[operand])
-                    chunk.flags.writeable = False
-                chunks.append(chunk)
-                continue
-            if (operand not in self._lazy_casts
-                    and len(self._logical_shape) == 1 and arr.ndim == 1
-                    and tuple(arr.shape) == self._logical_shape
-                    and not self._axis_reverse[0]):
-                chunk = arr[self._pos:self._pos + n]
-                if "readonly" in mode:
                     chunk.flags.writeable = False
                 chunks.append(chunk)
                 continue

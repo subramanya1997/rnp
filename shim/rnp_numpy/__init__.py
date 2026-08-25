@@ -610,9 +610,34 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
         res = _arraycompat_mod().object_array_discovery(obj)
         return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
                 if order not in (None, "K", "k") or ndmin else res)
+    if (_void_dt is not None and _void_dt.kind == "u"
+            and isinstance(obj, (list, tuple))):
+        # NumPy scalar -> unsigned construction casts through the scalar's
+        # storage dtype.  Going straight to the requested dtype would apply
+        # Python-integer bounds checks before the modular unsigned cast (for
+        # example, int8(-1) -> uint8 must wrap to 255).  Signed destinations
+        # deliberately retain their constructor bounds checks.
+        _scalar_dtypes = []
+        if _scalar_dtype_tree(obj, _scalar_dtypes) and _scalar_dtypes:
+            try:
+                _source_dtype = _scalar_dtypes[0]
+                for _next_dtype in _scalar_dtypes[1:]:
+                    _source_dtype = promote_types(
+                        _source_dtype, _next_dtype
+                    )
+            except TypeError:
+                _source_dtype = globals()["dtype"]("O")
+            if _source_dtype.kind != "O":
+                res = _rnp_array(
+                    obj, _source_dtype, copy=_copy
+                ).astype(_void_dt)
+                return (_arraycompat_mod().finish_array(
+                    res, order, ndmin, copy
+                ) if order not in (None, "K", "k") or ndmin else res)
     if (isinstance(obj, (list, tuple))
             and ((_void_dt is not None and _void_dt.kind in "SU")
                  or (_void_dt is not None and _void_dt.kind != "O"
+                     and _void_dt.names is None
                      and _has_nested_arraylike(obj)))):
         _arraylike_dtypes = []
         obj = _flatten_nested_arraylikes(obj, _arraylike_dtypes)
