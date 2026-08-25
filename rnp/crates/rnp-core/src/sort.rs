@@ -160,16 +160,44 @@ fn push_leaves(
     }
 }
 
-fn key_plan(arr: &NdArray) -> KeyPlan {
+fn key_plan_order(arr: &NdArray, order: Option<&[String]>) -> Result<KeyPlan> {
     if arr.descr.is_struct() {
         let mut leaves = Vec::new();
-        push_leaves(arr, arr.descr, 0, &mut leaves);
-        return KeyPlan { leaves, plain: false };
+        let def = arr.descr.struct_def().expect("structured descriptor");
+        let mut selected = vec![false; def.fields.len()];
+        if let Some(names) = order {
+            for name in names {
+                let Some(index) = def.fields.iter().position(|field| field.name == *name) else {
+                    return Err(Error::ValueError(format!("unknown field name: {name}")));
+                };
+                if selected[index] {
+                    return Err(Error::ValueError(format!("duplicate field name: {name}")));
+                }
+                selected[index] = true;
+                let field = &def.fields[index];
+                push_leaves(arr, field.descr, field.offset, &mut leaves);
+            }
+        }
+        for (index, field) in def.fields.iter().enumerate() {
+            if !selected[index] {
+                push_leaves(arr, field.descr, field.offset, &mut leaves);
+            }
+        }
+        return Ok(KeyPlan { leaves, plain: false });
     }
-    KeyPlan {
+    if order.is_some() {
+        return Err(Error::ValueError(
+            "Cannot specify order when the array has no fields.".into(),
+        ));
+    }
+    Ok(KeyPlan {
         leaves: vec![(0, leaf_of(arr, arr.descr))],
         plain: true,
-    }
+    })
+}
+
+fn key_plan(arr: &NdArray) -> KeyPlan {
+    key_plan_order(arr, None).expect("default sort key plan")
 }
 
 fn leaf_key(leaf: &Leaf, off: isize) -> Key {
@@ -251,6 +279,19 @@ pub fn sort_inplace_direction(
     _stable: bool,
     descending: bool,
 ) -> Result<()> {
+    sort_inplace_direction_order(arr, axis, _stable, descending, None)
+}
+
+/// Direction-aware structured sort with NumPy's `order=` field precedence.
+/// Fields omitted from `order` remain trailing tie breakers in declaration
+/// order, matching `PyArray_OrderConverter` plus `VOID_compare`.
+pub fn sort_inplace_direction_order(
+    arr: &mut NdArray,
+    axis: usize,
+    _stable: bool,
+    descending: bool,
+    order: Option<&[String]>,
+) -> Result<()> {
     check_axis(arr, axis)?;
     if arr.dtype().is_object() {
         return Err(Error::NotImplemented("sort on object arrays".into()));
@@ -261,7 +302,7 @@ pub fn sort_inplace_direction(
         ));
     }
     let isz = arr.itemsize();
-    let plan = key_plan(arr);
+    let plan = key_plan_order(arr, order)?;
     // One scratch buffer for the whole sort, reused per lane: a `Vec` per
     // element turns a 1e6-element sort into a million allocations.
     let mut scratch: Vec<u8> = Vec::new();
@@ -298,6 +339,17 @@ pub fn argsort_direction(
     _stable: bool,
     descending: bool,
 ) -> Result<NdArray> {
+    argsort_direction_order(arr, axis, _stable, descending, None)
+}
+
+/// Direction-aware argsort with NumPy's structured `order=` semantics.
+pub fn argsort_direction_order(
+    arr: &NdArray,
+    axis: usize,
+    _stable: bool,
+    descending: bool,
+    order: Option<&[String]>,
+) -> Result<NdArray> {
     check_axis(arr, axis)?;
     if arr.dtype().is_object() {
         return Err(Error::NotImplemented("argsort on object arrays".into()));
@@ -310,7 +362,7 @@ pub fn argsort_direction(
     let out_step = strides[axis];
     strides.remove(axis);
     let out_bases: Vec<isize> = crate::iter::offsets(&shape, &strides, out.byte_offset).collect();
-    let plan = key_plan(arr);
+    let plan = key_plan_order(arr, order)?;
     for (lane, &base) in lanes(arr, axis).iter().zip(out_bases.iter()) {
         let keys: Vec<Key> = lane.iter().map(|&o| key_at(&plan, o)).collect();
         let mut order: Vec<usize> = (0..lane.len()).collect();
@@ -564,7 +616,38 @@ pub fn searchsorted(a: &NdArray, v: &NdArray, right: bool) -> Result<NdArray> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descr::{make_struct, Descr, FieldSpec};
     use crate::dtype::DType;
+
+    fn ordered_record_array() -> NdArray {
+        let descr = make_struct(
+            ["a", "b", "tag"]
+                .into_iter()
+                .map(|name| FieldSpec {
+                    name: name.into(),
+                    descr: Descr::native(DType::I32),
+                    title: None,
+                    offset: None,
+                })
+                .collect(),
+            None,
+            false,
+        )
+        .unwrap();
+        let array = NdArray::zeros_descr(vec![5], descr).unwrap();
+        for (name, values) in [
+            ("a", [2, 1, 1, 1, 0]),
+            ("b", [1, 2, 1, 1, 1]),
+            ("tag", [0, 1, 2, 1, 9]),
+        ] {
+            let (field_descr, offset) = descr.field(name).unwrap();
+            let mut field = array.field_view(field_descr, offset);
+            for (index, value) in values.into_iter().enumerate() {
+                field.set_flat(index, Scalar::Int(value));
+            }
+        }
+        array
+    }
 
     #[test]
     fn sort_puts_nan_last() {
@@ -600,6 +683,18 @@ mod tests {
         let o = argsort(&a, 0, false).unwrap();
         let got: Vec<i64> = (0..4).map(|i| o.get_flat(i).as_f64() as i64).collect();
         assert_eq!(got, vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn structured_order_reorders_fields_and_keeps_omitted_tie_breakers() {
+        let array = ordered_record_array();
+        let fields = vec!["b".to_string(), "a".to_string()];
+        let indices = argsort_direction_order(&array, 0, true, false, Some(&fields)).unwrap();
+        let got: Vec<i64> = (0..5)
+            .map(|index| indices.get_flat(index).as_f64() as i64)
+            .collect();
+        // `tag`, though omitted, breaks the two `(a=1, b=1)` records' tie.
+        assert_eq!(got, vec![4, 3, 2, 0, 1]);
     }
 
     #[test]

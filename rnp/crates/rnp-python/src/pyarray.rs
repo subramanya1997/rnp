@@ -711,6 +711,57 @@ fn sort_stable(kind: Option<&Bound<'_, PyAny>>, stable: Option<bool>) -> PyResul
     }
 }
 
+/// Normalize structured sorting's `order=` argument.
+///
+/// NumPy accepts a field-name string or a list/tuple of field names. Items in
+/// a sequence are stringified for the error path (`["a", 1]` reports unknown
+/// field `1`), while other containers are rejected as unsupported order
+/// values. Only declared names count; dtype titles are not sort field names.
+fn structured_sort_order(
+    arr: &NdArray,
+    order: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<Vec<String>>> {
+    let Some(value) = order.filter(|value| !value.is_none()) else {
+        return Ok(None);
+    };
+    let Some(field_names) = arr.descr.field_names() else {
+        return Err(PyValueError::new_err(
+            "Cannot specify order when the array has no fields.",
+        ));
+    };
+
+    let mut requested = Vec::new();
+    if let Ok(name) = value.cast::<pyo3::types::PyString>() {
+        requested.push(name.to_cow()?.into_owned());
+    } else if let Ok(items) = value.cast::<PyList>() {
+        for item in items.iter() {
+            requested.push(item.str()?.to_cow()?.into_owned());
+        }
+    } else if let Ok(items) = value.cast::<PyTuple>() {
+        for item in items.iter() {
+            requested.push(item.str()?.to_cow()?.into_owned());
+        }
+    } else {
+        return Err(PyValueError::new_err(format!(
+            "unsupported order value: {}",
+            kind_repr(value),
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for name in &requested {
+        if !field_names.iter().any(|field| field == name) {
+            return Err(PyValueError::new_err(format!("unknown field name: {name}")));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "duplicate field name: {name}",
+            )));
+        }
+    }
+    Ok(Some(requested))
+}
+
 /// `partition`/`argpartition` accept only the exact string `'introselect'`
 /// — no prefix matching, case-sensitive, and `None` is a `TypeError` (unlike
 /// `sort`, whose `kind=None` means "default"). Probed from numpy 2.5.2.
@@ -1060,11 +1111,7 @@ impl PyNdArray {
         stable: Option<bool>,
         descending: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        if order.is_some_and(|o| !o.is_none()) {
-            return Err(PyNotImplementedError::new_err(
-                "sort(order=) is not implemented yet",
-            ));
-        }
+        let order = structured_sort_order(&self.arr, order)?;
         let stable = sort_stable(kind, stable)?;
         let descending = match descending {
             Some(value) if !value.is_none() => value.is_truthy()?,
@@ -1074,8 +1121,14 @@ impl PyNdArray {
         if self.arr.dtype().is_object() {
             return crate::objects::sort_inplace(py, &self.arr, ax, descending);
         }
-        rnp_core::sort::sort_inplace_direction(&mut self.arr, ax, stable, descending)
-            .map_err(crate::err)
+        rnp_core::sort::sort_inplace_direction_order(
+            &mut self.arr,
+            ax,
+            stable,
+            descending,
+            order.as_deref(),
+        )
+        .map_err(crate::err)
     }
 
     #[pyo3(signature = (axis = Some(-1), kind = None, order = None, *, stable = None, descending = None))]
@@ -1088,11 +1141,7 @@ impl PyNdArray {
         stable: Option<bool>,
         descending: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyNdArray>> {
-        if order.is_some_and(|o| !o.is_none()) {
-            return Err(PyNotImplementedError::new_err(
-                "argsort(order=) is not implemented yet",
-            ));
-        }
+        let order = structured_sort_order(&self.arr, order)?;
         let stable = sort_stable(kind, stable)?;
         let descending = match descending {
             Some(value) if !value.is_none() => value.is_truthy()?,
@@ -1112,8 +1161,10 @@ impl PyNdArray {
             let out = crate::objects::argsort(py, &arr, ax, descending)?;
             return PyNdArray::into_py_any(out, py);
         }
-        let out = rnp_core::sort::argsort_direction(&arr, ax, stable, descending)
-            .map_err(crate::err)?;
+        let out = rnp_core::sort::argsort_direction_order(
+            &arr, ax, stable, descending, order.as_deref(),
+        )
+        .map_err(crate::err)?;
         PyNdArray::into_py_any(out, py)
     }
 
