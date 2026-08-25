@@ -1430,6 +1430,9 @@ impl PyNdArray {
     }
 
     fn __reduce_ex__<'py>(slf: &Bound<'py, Self>, protocol: i32) -> PyResult<Bound<'py, PyTuple>> {
+        if !slf.get_type().is(&slf.py().get_type::<PyNdArray>()) {
+            return Ok(slf.call_method0("__reduce__")?.cast_into::<PyTuple>()?);
+        }
         crate::straggler::reduce_ex_impl(slf, protocol)
     }
 
@@ -2365,45 +2368,44 @@ impl PyNdArray {
         crate::linalgops::matmul_operator(py, &self.arr, other, true)
     }
 
-    fn __add__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Add, false)
+    fn __add__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Add, false)
     }
-    fn __radd__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Add, true)
+    fn __radd__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Add, true)
     }
-    fn __sub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Sub, false)
+    fn __sub__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Sub, false)
     }
-    fn __rsub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Sub, true)
+    fn __rsub__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Sub, true)
     }
-    fn __mul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Mul, false)
+    fn __mul__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Mul, false)
     }
-    fn __rmul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Mul, true)
+    fn __rmul__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Mul, true)
     }
-    fn __truediv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Div, false)
+    fn __truediv__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Div, false)
     }
-    fn __rtruediv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Div, true)
+    fn __rtruediv__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Div, true)
     }
-    fn __floordiv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::FloorDiv, false)
+    fn __floordiv__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::FloorDiv, false)
     }
-    fn __rfloordiv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::FloorDiv, true)
+    fn __rfloordiv__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::FloorDiv, true)
     }
-    fn __mod__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Mod, false)
+    fn __mod__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Mod, false)
     }
-    fn __rmod__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::Mod, true)
+    fn __rmod__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::Mod, true)
     }
     fn __pow__(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         other: &Bound<'_, PyAny>,
         modulo: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
@@ -2412,46 +2414,45 @@ impl PyNdArray {
                 "pow() with a modulus is not supported for arrays",
             ));
         }
-        self.binop(py, other, BinOp::Pow, false)
+        Self::binop(slf, other, BinOp::Pow, false)
     }
     fn __rpow__(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         other: &Bound<'_, PyAny>,
         modulo: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = modulo;
-        self.binop(py, other, BinOp::Pow, true)
+        Self::binop(slf, other, BinOp::Pow, true)
     }
-    fn __and__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::BitAnd, false)
+    fn __and__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::BitAnd, false)
     }
-    fn __rand__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::BitAnd, true)
+    fn __rand__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::BitAnd, true)
     }
-    fn __or__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::BitOr, false)
+    fn __or__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::BitOr, false)
     }
-    fn __ror__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::BitOr, true)
+    fn __ror__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::BitOr, true)
     }
-    fn __xor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::BitXor, false)
+    fn __xor__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::BitXor, false)
     }
-    fn __rxor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::BitXor, true)
+    fn __rxor__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::BitXor, true)
     }
-    fn __lshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::LShift, false)
+    fn __lshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::LShift, false)
     }
-    fn __rlshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::LShift, true)
+    fn __rlshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::LShift, true)
     }
-    fn __rshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::RShift, false)
+    fn __rshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::RShift, false)
     }
-    fn __rrshift__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.binop(py, other, BinOp::RShift, true)
+    fn __rrshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::binop(slf, other, BinOp::RShift, true)
     }
     fn __divmod__<'py>(
         slf: &Bound<'py, Self>,
@@ -2468,17 +2469,17 @@ impl PyNdArray {
 
     // ---- unary operators -----------------------------------------------
 
-    fn __neg__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.unop(py, rnp_core::UnOp::Negative)
+    fn __neg__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::unop(slf, rnp_core::UnOp::Negative)
     }
-    fn __pos__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.unop(py, rnp_core::UnOp::Positive)
+    fn __pos__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::unop(slf, rnp_core::UnOp::Positive)
     }
-    fn __abs__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.unop(py, rnp_core::UnOp::Absolute)
+    fn __abs__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::unop(slf, rnp_core::UnOp::Absolute)
     }
-    fn __invert__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.unop(py, rnp_core::UnOp::Invert)
+    fn __invert__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        Self::unop(slf, rnp_core::UnOp::Invert)
     }
 
     // ---- in-place operators ---------------------------------------------
@@ -2531,13 +2532,11 @@ impl PyNdArray {
 
     fn __richcmp__(
         slf: &Bound<'_, Self>,
-        py: Python<'_>,
         other: &Bound<'_, PyAny>,
         op: CompareOp,
     ) -> PyResult<Py<PyAny>> {
         // Structured/void comparison has its own rules; see `fields.rs`.
         crate::fields::check_comparable(slf, other)?;
-        let this = slf.borrow();
         let bop = match op {
             CompareOp::Eq => BinOp::Eq,
             CompareOp::Ne => BinOp::Ne,
@@ -2546,7 +2545,7 @@ impl PyNdArray {
             CompareOp::Gt => BinOp::Gt,
             CompareOp::Ge => BinOp::Ge,
         };
-        this.binop(py, other, bop, false)
+        Self::binop(slf, other, bop, false)
     }
 
     // ---- buffer protocol -----------------------------------------------
@@ -3018,33 +3017,77 @@ impl PyNdArray {
         PyNdArray::view_of(v, slf)
     }
 
+    fn wrap_subclass_result(
+        slf: &Bound<'_, Self>,
+        out: NdArray,
+        opname: &str,
+        other: Option<&Bound<'_, PyAny>>,
+        reflected: bool,
+        output_index: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        if slf.get_type().is(&py.get_type::<PyNdArray>()) {
+            return Ok(PyNdArray::into_py_any(out, py)?.into_any());
+        }
+
+        let ty = slf.get_type();
+        let result = crate::adopt::new_of_type(
+            py,
+            &ty,
+            out,
+            None,
+            Some(slf.as_any()),
+        )?;
+        let operands = match other {
+            Some(rhs) if reflected => PyTuple::new(py, [rhs, slf.as_any()])?,
+            Some(rhs) => PyTuple::new(py, [slf.as_any(), rhs])?,
+            None => PyTuple::new(py, [slf.as_any()])?,
+        };
+        let ufunc = py.import("rnp_numpy")?.getattr(opname)?;
+        let context = PyTuple::new(
+            py,
+            [
+                ufunc.into_any().unbind(),
+                operands.into_any().unbind(),
+                output_index.into_pyobject(py)?.into_any().unbind(),
+            ],
+        )?;
+        let wrapped = slf.as_any().call_method1(
+            "__array_wrap__",
+            (result.bind(py), context, false),
+        )?;
+        Ok(wrapped.unbind())
+    }
+
     fn binop(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         other: &Bound<'_, PyAny>,
         op: BinOp,
         reflected: bool,
     ) -> PyResult<Py<PyAny>> {
-        let rhs = match operand_for(other, self.arr.dtype(), op.is_comparison())? {
+        let py = slf.py();
+        let me = slf.borrow().arr.clone();
+        let rhs = match operand_for(other, me.dtype(), op.is_comparison())? {
             Some(a) => a,
             None => return Ok(py.NotImplemented()),
         };
         let (a, b) = if reflected {
-            (&rhs, &self.arr)
+            (&rhs, &me)
         } else {
-            (&self.arr, &rhs)
+            (&me, &rhs)
         };
         rnp_core::fpe::clear();
         let out = binary(a, b, op).map_err(crate::err)?;
         crate::ufuncs::report_fpe(py, op.name())?;
-        Ok(PyNdArray::into_py_any(out, py)?.into_any())
+        Self::wrap_subclass_result(slf, out, op.name(), Some(other), reflected, 0)
     }
 
-    fn unop(&self, py: Python<'_>, op: rnp_core::UnOp) -> PyResult<Py<PyAny>> {
+    fn unop(slf: &Bound<'_, Self>, op: rnp_core::UnOp) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
         rnp_core::fpe::clear();
-        let out = rnp_core::unary(&self.arr, op).map_err(crate::err)?;
+        let out = rnp_core::unary(&slf.borrow().arr, op).map_err(crate::err)?;
         crate::ufuncs::report_fpe(py, op.name())?;
-        Ok(PyNdArray::into_py_any(out, py)?.into_any())
+        Self::wrap_subclass_result(slf, out, op.name(), None, false, 0)
     }
 
     /// `divmod(a, b)` on arrays: one pass, two outputs.

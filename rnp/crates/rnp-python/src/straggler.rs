@@ -470,7 +470,9 @@ pub fn _reconstruct<'py>(
     shape: &Bound<'py, PyAny>,
     dtype: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let _ = subtype;
+    let subtype = subtype
+        .cast::<pyo3::types::PyType>()
+        .map_err(|_| PyTypeError::new_err("subtype must be a type"))?;
     let want = crate::pyarray::shape_from_any(shape)?;
     let d = match dtype {
         Some(o) if !o.is_none() => {
@@ -485,7 +487,8 @@ pub fn _reconstruct<'py>(
         _ => Descr::native(DType::U8),
     };
     let arr = NdArray::zeros_descr(want, d).map_err(crate::err)?;
-    Ok(PyNdArray::into_py_any(arr, py)?.into_bound(py).into_any())
+    Ok(crate::adopt::new_of_type(py, subtype, arr, None, None)?
+        .into_bound(py))
 }
 
 /// The 5-tuple numpy stores as an array's pickle state:

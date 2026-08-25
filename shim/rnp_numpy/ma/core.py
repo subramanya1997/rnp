@@ -3212,17 +3212,21 @@ class MaskedArray(ndarray):
                 return NotImplemented
 
         operation = globals().get(getattr(ufunc, '__name__', ''))
-        if not isinstance(operation, _MaskedUFunc):
-            return NotImplemented
-
         outputs = kwargs.pop('out', None)
-        if method == '__call__':
+        if isinstance(operation, _MaskedUFunc) and method == '__call__':
             result = operation(*inputs, **kwargs)
-        else:
+        elif isinstance(operation, _MaskedUFunc):
             implementation = getattr(operation, method, None)
             if implementation is None:
                 return NotImplemented
             result = implementation(*inputs, **kwargs)
+        elif method == '__call__' and len(inputs) == 1:
+            source = inputs[0]
+            result = masked_array(
+                ufunc(getdata(source), **kwargs),
+                mask=getmask(source), copy=False)
+        else:
+            return NotImplemented
 
         if outputs is None:
             return result

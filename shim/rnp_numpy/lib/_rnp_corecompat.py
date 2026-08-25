@@ -1248,24 +1248,32 @@ def _install_reductions(namespace):
 # `*_like` constructors gain numpy's `shape=` override.
 # ---------------------------------------------------------------------------
 
-def _make_like(alloc):
+def _make_like(alloc, fill_value):
     def like(a, dtype=None, order='K', subok=True, shape=None, *, device=None):
         a = np.asanyarray(a)
-        return alloc(a.shape if shape is None else shape,
-                     a.dtype if dtype is None else dtype)
+        shape = a.shape if shape is None else shape
+        dtype = a.dtype if dtype is None else dtype
+        if subok and type(a) is not np.ndarray:
+            return np._new_like_subclass(
+                a, dtype, fill_value, shape=shape)
+        return alloc(shape, dtype)
     return like
 
 
 def _install_likes(namespace):
-    namespace["zeros_like"] = _make_like(np.zeros)
-    namespace["ones_like"] = _make_like(np.ones)
-    namespace["empty_like"] = _make_like(np.empty)
+    namespace["zeros_like"] = _make_like(np.zeros, 0)
+    namespace["ones_like"] = _make_like(np.ones, 1)
+    namespace["empty_like"] = _make_like(np.empty, np._LIKE_EMPTY)
 
     def full_like(a, fill_value, dtype=None, order='K', subok=True,
                   shape=None, *, device=None):
         a = np.asanyarray(a)
-        return np.full(a.shape if shape is None else shape, fill_value,
-                       a.dtype if dtype is None else dtype)
+        shape = a.shape if shape is None else shape
+        dtype = a.dtype if dtype is None else dtype
+        if subok and type(a) is not np.ndarray:
+            return np._new_like_subclass(
+                a, dtype, fill_value, shape=shape)
+        return np.full(shape, fill_value, dtype)
 
     namespace["full_like"] = full_like
 
