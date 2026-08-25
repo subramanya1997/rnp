@@ -826,3 +826,19 @@ benchmark run, Fable review, git commit.
   m5/dt-fix2 (datetime cluster), m5/struct-fix (struct cluster), m5/msgs
   (nep50 messages + object text + straggler + vecmat). Full-suite scoreboard
   baseline running in parallel.
+
+## M9 (2026-08-25): cross-platform parity + perf round 2 + playbook
+
+- Linux x86_64: 123 -> 0 divergences (36,510 comparisons). dlopens numpy's
+  bundled scipy-openblas64; software F80/C160 longdouble (rnp-core/src/f80.rs)
+  gives Linux its real 16-byte x87 float128 while macOS keeps f64. Verified on
+  the 96-core image-compression box; harness/LINUX_PARITY.md documents scope.
+- Perf round 2: dot 0.99x, matvec 1.05x, small matmul 1.19-1.25x, bitwise at
+  noise. Remaining >1 rows are sub-us PyO3/scalar-class construction costs;
+  parity there needs native extension scalar types (future architecture).
+- 'import rnp as np' package with process-wide numpy-namespace takeover +
+  mixing guard; 10-workload example playbook as executed notebooks, 10/10
+  PASS/MATCH under both engines; KNOWN_GAPS all four closed (structured
+  sort(order=), join_by, polyfit, lazy np.testing).
+- Repo public at github.com/subramanya1997/rnp (README scorecard, numpy-adapted
+  issue templates, benchmarks REPORT/docs).

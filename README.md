@@ -4,7 +4,7 @@ A from-scratch Rust port of NumPy, validated against **NumPy v2.5.2's own unmodi
 test suite** and benchmarked against the real NumPy wheel on the same machine.
 
 - **95.5% of NumPy's entire test suite passing** — 46,330 / 48,511 tests
-- **Bit-for-bit identical to real NumPy** across 73,879 differential byte-level checks (0 divergences)
+- **Bit-for-bit identical to real NumPy** — 0 divergences across 73,879 differential byte-level checks on macOS arm64 **and** 36,510 on Linux x86_64
 - **Faster than NumPy** on most large-array operations (transcendentals 4–6.5×, integer matmul up to 8.6×, boolean masking ~2.5×), at parity on BLAS paths
 
 Measured 2026-08-24 on macOS arm64 against `numpy==2.5.2` (Accelerate BLAS).
@@ -91,11 +91,12 @@ third-party code:
   append-only slab (deliberate correctness-first trade); long-running churn of object
   arrays leaks memory until per-element refcounting lands.
 - **Threading unaudited.** The multithreading test file does not collect yet.
-- **Linux x86_64: 99.975% bit-exact.** The Linux build (dlopening numpy's own
-  bundled OpenBLAS) passes the differential harness at 36,506 comparisons with
-  9 remaining divergences — all 80-bit x87 `longdouble` storage items,
-  documented in [`harness/LINUX_PARITY.md`](harness/LINUX_PARITY.md). macOS
-  arm64 remains fully bit-exact.
+- ~~One platform proven~~ **Both platforms bit-exact.** Linux x86_64 (dlopening
+  numpy's own bundled OpenBLAS, with a software 80-bit x87 `float128`) now
+  passes the differential harness at **36,510 comparisons, 0 divergences**,
+  alongside fully-exact macOS arm64. Details in
+  [`harness/LINUX_PARITY.md`](harness/LINUX_PARITY.md). The full Linux
+  test-suite scoreboard is still pending.
 
 ## Layout
 
