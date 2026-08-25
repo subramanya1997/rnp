@@ -949,15 +949,20 @@ impl PyNdArray {
         PyNdArray::into_py_any(c.reshape(&[n]).map_err(crate::err)?, py)
     }
 
-    #[pyo3(signature = (dtype, copy = true))]
+    #[pyo3(signature = (dtype, copy = true, casting = "unsafe"))]
     fn astype(
         &self,
         py: Python<'_>,
         dtype: &Bound<'_, PyAny>,
         copy: bool,
+        casting: &str,
     ) -> PyResult<Py<PyNdArray>> {
         let d = descr_from_any(dtype)?;
-        let out = if d == self.arr.descr && d.alias == self.arr.descr.alias {
+        let out = if casting == "same_value" {
+            self.arr
+                .try_astype_same_value_descr(d)
+                .map_err(crate::err)?
+        } else if d == self.arr.descr && d.alias == self.arr.descr.alias {
             if copy {
                 // A real copy adopts the requested dtype decoration.  With
                 // copy=False NumPy may return `self`, so its existing

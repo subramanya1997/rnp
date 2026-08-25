@@ -85,14 +85,16 @@ def _invert(perm):
     return tuple(out)
 
 
-def _ordered_copy(a, dt, order):
+def _ordered_copy(a, dt, order, casting="unsafe"):
     """A fresh array with dtype `dt` and the memory order `order`."""
     if a.ndim < 2:
-        return _orig_astype(a, dt, copy=True)
+        return _orig_astype(a, dt, copy=True, casting=casting)
     perm = _perm_for(a, order)
     if perm == tuple(_b.range(a.ndim)):
-        return _orig_astype(a, dt, copy=True)
-    return _orig_astype(a.transpose(perm), dt, copy=True).transpose(_invert(perm))
+        return _orig_astype(a, dt, copy=True, casting=casting)
+    return _orig_astype(
+        a.transpose(perm), dt, copy=True, casting=casting
+    ).transpose(_invert(perm))
 
 
 def _order_ok(a, order):
@@ -258,6 +260,13 @@ def _check_copy_flag(copy):
 def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
            copy=True):
     _check_copy_flag(copy)
+    if not isinstance(casting, str):
+        raise TypeError(f"casting must be str, not {type(casting).__name__}")
+    if casting not in ("no", "equiv", "safe", "same_kind", "unsafe",
+                       "same_value"):
+        raise ValueError(
+            "casting must be one of 'no', 'equiv', 'safe', 'same_kind', "
+            f"'unsafe', 'same_value' (got {casting!r})")
     dt = _dtype(dtype)
     order = _norm_order(order, "K")
     src = self.dtype
@@ -266,7 +275,11 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
         raise TypeError(
             f"Cannot cast array data from {src!r} to {dt!r} "
             f"according to the rule {casting!r}")
-    if not can_cast(src, dt, casting):
+    if casting == "same_value":
+        cast_ok = src.kind in "biufc" and dt.kind in "biufc"
+    else:
+        cast_ok = can_cast(src, dt, casting)
+    if not cast_ok:
         raise TypeError(
             f"Cannot cast array data from {src!r} to {dt!r} "
             f"according to the rule {casting!r}")
@@ -423,7 +436,7 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
         return _strcast.restring(self, dt)
     if dt.kind in "SU" and dt.itemsize == 0:
         dt = _dtype(f"{dt.char}{_b.max(src.itemsize, 1)}")
-    return _ordered_copy(self, dt, order)
+    return _ordered_copy(self, dt, order, casting)
 
 
 # ---------------------------------------------------------------------------

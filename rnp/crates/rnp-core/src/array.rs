@@ -78,6 +78,30 @@ pub fn shape_size(shape: &[isize]) -> usize {
     shape.iter().map(|&d| d.max(0) as usize).product()
 }
 
+fn same_value_type_name(descr: Descr) -> &'static str {
+    match descr.char_code() {
+        '?' => "bool",
+        'b' => "byte",
+        'h' => "short",
+        'i' => "int",
+        'l' => "long",
+        'q' => "longlong",
+        'B' => "ubyte",
+        'H' => "ushort",
+        'I' => "uint",
+        'L' => "ulong",
+        'Q' => "ulonglong",
+        'e' => "half",
+        'f' => "float",
+        'd' => "double",
+        'g' => "longdouble",
+        'F' => "cfloat",
+        'D' => "cdouble",
+        'G' => "clongdouble",
+        _ => "unknown",
+    }
+}
+
 /// The element count, or `None` when the product overflows.
 ///
 /// The unchecked [`shape_size`] is what every in-bounds walk uses; this one
@@ -911,6 +935,41 @@ impl NdArray {
         let mut out = src.try_astype(d.dt)?;
         out.descr = Descr::native(d.dt);
         Ok(out.into_descr(d))
+    }
+
+    /// Value-sensitive numeric cast used by `casting='same_value'`.
+    ///
+    /// NumPy exposes this rule only on `ndarray.astype`. The check belongs
+    /// beside the engine cast loop so strided and byte-swapped arrays inspect
+    /// the actual source element before the ordinary conversion executes.
+    pub fn try_astype_same_value_descr(&self, d: Descr) -> Result<NdArray> {
+        if !self.dtype().is_numeric() || !d.dt.is_numeric() {
+            return Err(Error::TypeError(format!(
+                "Cannot cast array data from {} to {} according to the rule 'same_value'",
+                self.descr.repr_string(), d.repr_string()
+            )));
+        }
+        let src = self.to_native();
+        for off in crate::iter::offsets(&src.shape, &src.strides, src.byte_offset) {
+            if let Err(reason) = crate::casting::same_value_preserved(
+                src.read_at(off),
+                src.dtype(),
+                d.dt,
+            ) {
+                let suffix = if reason == crate::casting::SameValueError::Imaginary {
+                    ": imag is not 0"
+                } else {
+                    ""
+                };
+                return Err(Error::ValueError(format!(
+                    "could not cast 'same_value' {} to {}{}",
+                    same_value_type_name(src.descr),
+                    same_value_type_name(d),
+                    suffix,
+                )));
+            }
+        }
+        src.try_astype_descr(d)
     }
 
     /// `astype` to a full descriptor: cast the values through the native

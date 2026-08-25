@@ -483,6 +483,13 @@ class ufunc:
                  axes=None, axis=None, keepdims=None):
         if not self._ok:
             self._nope()
+        if not isinstance(casting, str):
+            raise TypeError(
+                f"casting must be str, not {type(casting).__name__}")
+        if casting not in ("no", "equiv", "safe", "same_kind", "unsafe"):
+            raise ValueError(
+                "casting must be one of 'no', 'equiv', 'safe', "
+                f"'same_kind', 'unsafe' (got {casting!r})")
         if self.signature is not None:
             # A gufunc has no `where=`: numpy's argument parser does not even
             # define the keyword for it.

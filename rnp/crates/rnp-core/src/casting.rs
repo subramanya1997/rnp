@@ -9,6 +9,203 @@ use crate::descr::Descr;
 use crate::dtype::{DType, Kind};
 use crate::element::Scalar;
 
+/// Why a concrete value cannot be preserved by a `same_value` cast.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SameValueError {
+    /// The real value changes through the destination representation.
+    Changed,
+    /// A complex-to-real cast would discard a non-zero imaginary component.
+    Imaginary,
+}
+
+/// Check NumPy's value-sensitive `casting='same_value'` rule for one element.
+///
+/// This is the policy in `lowlevel_strided_loops.c.src`: casts to bool are
+/// accepted unconditionally, non-finite values survive only through floating
+/// components, integer destinations are range checked, and every remaining
+/// conversion must round-trip exactly.
+pub fn same_value_preserved(
+    value: Scalar,
+    from: DType,
+    to: DType,
+) -> std::result::Result<(), SameValueError> {
+    if to == DType::Bool {
+        // NumPy deliberately exposes bool as a non-zero test, even in
+        // same-value mode (the generated C loop omits the check for bool2).
+        return Ok(());
+    }
+
+    let from_component = component_dtype(from);
+    let to_component = component_dtype(to);
+    match value {
+        Scalar::Complex(value) => {
+            if real_value_preserved(value.re, from_component, to_component).is_err() {
+                return Err(SameValueError::Changed);
+            }
+            if to.is_complex() {
+                real_value_preserved(value.im, from_component, to_component)
+            } else if value.im == 0.0 {
+                Ok(())
+            } else {
+                Err(SameValueError::Imaginary)
+            }
+        }
+        Scalar::Float(value) => real_value_preserved(value, from_component, to_component),
+        Scalar::Int(value) => integer_value_preserved(value as i128, to_component),
+        Scalar::Uint(value) => unsigned_value_preserved(value as u128, to_component),
+        Scalar::Bool(_) => Ok(()),
+    }
+}
+
+fn component_dtype(dtype: DType) -> DType {
+    match dtype {
+        DType::C64 => DType::F32,
+        DType::C128 => DType::F64,
+        other => other,
+    }
+}
+
+fn integer_value_preserved(
+    value: i128,
+    to: DType,
+) -> std::result::Result<(), SameValueError> {
+    if let Some((min, max)) = signed_bounds(to) {
+        return if (min..=max).contains(&value) {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if let Some(max) = unsigned_max(to) {
+        return if value >= 0 && (value as u128) <= max {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if to.is_float() {
+        let Scalar::Float(cast) = Scalar::Int(value as i64).cast(to) else {
+            unreachable!()
+        };
+        return if cast.is_finite() && cast as i128 == value {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    Err(SameValueError::Changed)
+}
+
+fn unsigned_value_preserved(
+    value: u128,
+    to: DType,
+) -> std::result::Result<(), SameValueError> {
+    if let Some((_, max)) = signed_bounds(to) {
+        return if value <= max as u128 {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if let Some(max) = unsigned_max(to) {
+        return if value <= max {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if to.is_float() {
+        let Scalar::Float(cast) = Scalar::Uint(value as u64).cast(to) else {
+            unreachable!()
+        };
+        return if cast.is_finite() && cast as u128 == value {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    Err(SameValueError::Changed)
+}
+
+fn real_value_preserved(
+    value: f64,
+    from: DType,
+    to: DType,
+) -> std::result::Result<(), SameValueError> {
+    if !value.is_finite() {
+        return if to.is_float() {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if let Some((min, max)) = signed_bounds(to) {
+        // The upper bound is exclusive because `i64::MAX as f64` rounds to
+        // 2**63. Expressing the range as powers of two avoids that trap.
+        let bits = to.itemsize() * 8;
+        let lower = -(2.0f64).powi(bits as i32 - 1);
+        let upper = (2.0f64).powi(bits as i32 - 1);
+        if value < lower || value >= upper {
+            return Err(SameValueError::Changed);
+        }
+        let cast = value as i128;
+        return if (min..=max).contains(&cast) && cast as f64 == value {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if let Some(max) = unsigned_max(to) {
+        let upper = (2.0f64).powi((to.itemsize() * 8) as i32);
+        if value < 0.0 || value >= upper {
+            return Err(SameValueError::Changed);
+        }
+        let cast = value as u128;
+        return if cast <= max && cast as f64 == value {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    if to.is_float() {
+        let Scalar::Float(cast) = Scalar::Float(value).cast(to) else {
+            unreachable!()
+        };
+        let Scalar::Float(round_trip) = Scalar::Float(cast).cast(from) else {
+            unreachable!()
+        };
+        return if round_trip == value {
+            Ok(())
+        } else {
+            Err(SameValueError::Changed)
+        };
+    }
+    Err(SameValueError::Changed)
+}
+
+fn signed_bounds(dtype: DType) -> Option<(i128, i128)> {
+    let bits = match dtype {
+        DType::I8 => 8,
+        DType::I16 => 16,
+        DType::I32 => 32,
+        DType::I64 => 64,
+        _ => return None,
+    };
+    let upper = 1i128 << (bits - 1);
+    Some((-upper, upper - 1))
+}
+
+fn unsigned_max(dtype: DType) -> Option<u128> {
+    let bits = match dtype {
+        DType::U8 => 8,
+        DType::U16 => 16,
+        DType::U32 => 32,
+        DType::U64 => 64,
+        _ => return None,
+    };
+    Some((1u128 << bits) - 1)
+}
+
 /// numpy's `casting=` keyword.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Casting {
@@ -633,6 +830,25 @@ mod tests {
             assert_eq!(can_cast(da, db, Casting::No), a == b);
             assert_eq!(can_cast(da, db, Casting::Equiv), a == b);
         }
+    }
+
+    #[test]
+    fn same_value_checks_bounds_round_trip_and_complex_parts() {
+        use num_complex::Complex;
+        use SameValueError::*;
+
+        assert_eq!(same_value_preserved(Scalar::Int(1), DType::I64, DType::U8), Ok(()));
+        assert_eq!(same_value_preserved(Scalar::Int(-1), DType::I64, DType::U64), Err(Changed));
+        assert_eq!(same_value_preserved(Scalar::Uint(u64::MAX), DType::U64, DType::F64), Err(Changed));
+        assert_eq!(same_value_preserved(Scalar::Int(1 << 24), DType::I64, DType::F32), Ok(()));
+        assert_eq!(same_value_preserved(Scalar::Int((1 << 24) + 1), DType::I64, DType::F32), Err(Changed));
+        assert_eq!(same_value_preserved(Scalar::Float(10.0), DType::F64, DType::I8), Ok(()));
+        assert_eq!(same_value_preserved(Scalar::Float(10.5), DType::F64, DType::I8), Err(Changed));
+        assert_eq!(same_value_preserved(Scalar::Float(f64::NAN), DType::F64, DType::F32), Ok(()));
+        assert_eq!(same_value_preserved(Scalar::Float(f64::INFINITY), DType::F64, DType::I64), Err(Changed));
+        assert_eq!(same_value_preserved(Scalar::Complex(Complex::new(1.0, 0.0)), DType::C128, DType::F64), Ok(()));
+        assert_eq!(same_value_preserved(Scalar::Complex(Complex::new(1.0, 2.0)), DType::C128, DType::F64), Err(Imaginary));
+        assert_eq!(same_value_preserved(Scalar::Complex(Complex::new(1.0, 2.0)), DType::C128, DType::Bool), Ok(()));
     }
 
     #[test]
