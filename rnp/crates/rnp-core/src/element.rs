@@ -106,8 +106,8 @@ impl Scalar {
             DType::U8 => Scalar::Uint(self.as_narrow() as u8 as u64),
             DType::U16 => Scalar::Uint(self.as_narrow() as u16 as u64),
             DType::U32 => Scalar::Uint(match self {
-                Scalar::Float(f) => f as u32 as u64,
-                Scalar::Complex(c) => c.re as u32 as u64,
+                Scalar::Float(f) => f2u32(f) as u64,
+                Scalar::Complex(c) => f2u32(c.re) as u64,
                 other => other.as_u64() as u32 as u64,
             }),
             DType::U64 => Scalar::Uint(self.as_u64()),
@@ -178,11 +178,51 @@ impl Scalar {
     }
 }
 
-fn f2i64(f: f64) -> i64 {
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub(crate) fn f2i64(f: f64) -> i64 {
     f as i64
 }
+
+/// The x86-64 conversion instruction used by NumPy's manylinux loops returns
+/// `INT64_MIN` for NaN and every out-of-range input. Rust's `as` conversion is
+/// deliberately saturating, so reproduce the hardware/C-loop result here.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn f2i64(f: f64) -> i64 {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_finite() && (-TWO63..TWO63).contains(&f) {
+        f as i64
+    } else {
+        i64::MIN
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn f2u32(f: f64) -> u32 {
+    f as u32
+}
+
+/// GCC lowers a float-to-u32 cast through a signed 64-bit truncation on
+/// x86-64, then keeps the low word. This makes finite negative values wrap.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn f2u32(f: f64) -> u32 {
+    f2i64(f) as u32
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn f2u64(f: f64) -> u64 {
     f as u64
+}
+
+/// GCC's x86-64 unsigned conversion splits at 2**63, converts through a
+/// signed lane, then restores the high bit. Match that generated loop exactly.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn f2u64(f: f64) -> u64 {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO63 {
+        (f2i64(f - TWO63) as u64) ^ (1u64 << 63)
+    } else {
+        f2i64(f) as u64
+    }
 }
 
 /// IEEE-754 binary16, stored as its raw bits.
@@ -578,7 +618,24 @@ mod tests {
             255,
             256,
         ];
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let want_u32: [u64; 12] = [0, 0, 0, 3, 300, 4294967295, 0, 0, 4294967295, 0, 255, 256];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let want_u32: [u64; 12] = [
+            4_294_967_295,
+            0,
+            4_294_966_996,
+            3,
+            300,
+            0,
+            0,
+            0,
+            0,
+            0,
+            255,
+            256,
+        ];
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let want_i64: [i64; 12] = [
             -1,
             0,
@@ -593,7 +650,38 @@ mod tests {
             255,
             256,
         ];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let want_i64: [i64; 12] = [
+            -1,
+            0,
+            -300,
+            3,
+            300,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            255,
+            256,
+        ];
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let want_u64: [u64; 12] = [0, 0, 0, 3, 300, u64::MAX, 0, 0, u64::MAX, 0, 255, 256];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let want_u64: [u64; 12] = [
+            u64::MAX,
+            0,
+            u64::MAX - 299,
+            3,
+            300,
+            0,
+            1u64 << 63,
+            1u64 << 63,
+            0,
+            1u64 << 63,
+            255,
+            256,
+        ];
 
         for (i, &v) in vals.iter().enumerate() {
             let s = Scalar::Float(v);

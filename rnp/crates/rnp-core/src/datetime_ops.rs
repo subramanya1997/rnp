@@ -465,7 +465,7 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<Nd
                 } else {
                     let r = td as f64 * f;
                     if r.is_finite() {
-                        r as i64
+                        crate::element::f2i64(r)
                     } else {
                         NAT
                     }
@@ -495,7 +495,7 @@ pub fn binary(a: &NdArray, b: &NdArray, op: BinOp) -> Result<(NdArray, Option<Nd
                 } else {
                     let r = x as f64 / f;
                     if r.is_finite() {
-                        r as i64
+                        crate::element::f2i64(r)
                     } else {
                         NAT
                     }
@@ -849,6 +849,15 @@ mod tests {
     fn datetime_plus_datetime_is_a_type_error() {
         let a = dt(&[1], UNIT_D);
         assert!(binary(&a, &a, BinOp::Add).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn float_timedelta_overflow_becomes_nat_on_manylinux() {
+        let a = td(&[1i64 << 62], UNIT_S);
+        let f = NdArray::from_scalars(&[Scalar::Float(2.5)], DType::F64).unwrap();
+        let (r, _) = binary(&a, &f, BinOp::Mul).unwrap();
+        assert_eq!(ints(&r), vec![NAT]);
     }
 }
 
