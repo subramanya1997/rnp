@@ -9,6 +9,7 @@ use rnp_core::reduce::ReduceOp;
 use rnp_core::{BinOp, DType, Descr, NdArray, Scalar};
 
 mod adopt;
+mod busday;
 mod einsum;
 mod convert;
 mod dlpack;
@@ -1372,6 +1373,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_register_scalar_types, m)?)?;
     m.add_function(wrap_pyfunction!(_register_scalar_wraps, m)?)?;
     m.add_function(wrap_pyfunction!(_register_datetime_factory, m)?)?;
+    busday::register(m)?;
     ufuncs::register(m)?;
     fftops::register(m)?;
     linalgops::register(m)?;

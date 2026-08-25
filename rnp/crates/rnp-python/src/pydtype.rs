@@ -328,7 +328,8 @@ pub fn descr_from_any_aligned(obj: &Bound<'_, PyAny>, align: bool) -> PyResult<D
     }
     if let Ok(s) = obj.cast::<PyString>() {
         let name = s.to_str()?;
-        return Descr::parse(name)
+        let normalized = normalize_datetime_divisor_spec(name)?;
+        return Descr::parse(normalized.as_deref().unwrap_or(name))
             .ok_or_else(|| PyTypeError::new_err(format!("data type '{}' not understood", name)));
     }
     if let Ok(b) = obj.cast::<PyBytes>() {
@@ -399,6 +400,68 @@ pub fn descr_from_any_aligned(obj: &Bound<'_, PyAny>, align: bool) -> PyResult<D
     Err(PyTypeError::new_err(format!(
         "Cannot interpret '{}' as a data type",
         obj.repr()?.to_str()?
+    )))
+}
+
+/// Normalize NumPy's legacy divisor metadata (`M8[3Y/73]` -> `M8[15D]`)
+/// before the ordinary descriptor parser sees it.
+fn normalize_datetime_divisor_spec(name: &str) -> PyResult<Option<String>> {
+    let Some(open) = name.find('[') else {
+        return Ok(None);
+    };
+    let Some(close) = name.rfind(']') else {
+        return Ok(None);
+    };
+    if close + 1 != name.len() || !name[open + 1..close].contains('/') {
+        return Ok(None);
+    }
+    let prefix = &name[..open];
+    if !(prefix.ends_with("M8")
+        || prefix.ends_with("m8")
+        || prefix.ends_with("datetime64")
+        || prefix.ends_with("timedelta64"))
+    {
+        return Ok(None);
+    }
+    let inner = &name[open + 1..close];
+    let (numerator, denominator) = inner.split_once('/').ok_or_else(|| {
+        PyTypeError::new_err(format!(
+            "Invalid datetime metadata string \"{}\"",
+            &name[open..]
+        ))
+    })?;
+    let digits = numerator.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let num = if digits == 0 {
+        1
+    } else {
+        numerator[..digits].parse::<u32>().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "Invalid datetime metadata string \"{}\"",
+                &name[open..]
+            ))
+        })?
+    };
+    let unit = &numerator[digits..];
+    let base = rnp_core::datetime::parse_unit(unit).ok_or_else(|| {
+        PyTypeError::new_err(format!(
+            "Invalid datetime unit in metadata string \"{}\"",
+            &name[open..]
+        ))
+    })?;
+    let den = denominator.parse::<u32>().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "Invalid datetime metadata string \"{}\"",
+            &name[open..]
+        ))
+    })?;
+    let meta =
+        rnp_core::datetime::divisor_to_multiple(rnp_core::datetime::DtMeta::new(base, num), den)
+            .map_err(crate::err)?;
+    Ok(Some(format!(
+        "{}[{}{}]",
+        prefix,
+        meta.num,
+        rnp_core::datetime::UNIT_NAMES[meta.base as usize]
     )))
 }
 

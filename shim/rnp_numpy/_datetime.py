@@ -1,10 +1,9 @@
 """datetime64 / timedelta64 helpers that live above the engine.
 
 `datetime_data` and `datetime_as_string` are thin wrappers over the Rust
-entry points (`np.isnat` is a real ufunc, so it lives in the ufunc table);
-the business-day family is a documented gap that raises
-`NotImplementedError` while still existing, so that code (and numpy's own
-test module) can import it.
+entry points (`np.isnat` is a real ufunc, so it lives in the ufunc table).
+The business-day family performs Python argument parsing and broadcasting
+here, then calls the direct Rust ports of NumPy's scalar calendar kernels.
 """
 
 import _rnp
@@ -39,25 +38,222 @@ def datetime_as_string(arr, unit=None, timezone="naive", casting="same_kind"):
     return out.reshape(a.shape)
 
 
+_DEFAULT_WEEKMASK = (True, True, True, True, True, False, False)
+_UNSET = object()
+_DAY_DTYPE = dtype("M8[D]")
+
+
+def _parse_weekmask(value):
+    if isinstance(value, bytes):
+        value = value.decode()
+    if isinstance(value, str):
+        if len(value) == 7 and all(c in "01" for c in value):
+            return tuple(c == "1" for c in value)
+        names = {
+            "Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3,
+            "Fri": 4, "Sat": 5, "Sun": 6,
+        }
+        mask = [False] * 7
+        i = 0
+        while i < len(value):
+            while i < len(value) and value[i].isspace():
+                i += 1
+            if i == len(value):
+                break
+            token = value[i:i + 3]
+            if len(token) != 3 or token not in names:
+                raise ValueError(
+                    f'Invalid business day weekmask string "{value}"')
+            mask[names[token]] = True
+            i += 3
+        return tuple(mask)
+    if isinstance(value, ndarray):
+        if value.ndim != 1:
+            raise ValueError(
+                "A business day weekmask array must have length 7")
+        value = value.tolist()
+    try:
+        values = list(value)
+    except TypeError:
+        raise ValueError(
+            "Couldn't convert object into a business day weekmask") from None
+    if len(values) != 7:
+        raise ValueError("A business day weekmask array must have length 7")
+    return tuple(bool(v) for v in values)
+
+
+def _date_array(value):
+    return _rnp.array(value, dtype=_DAY_DTYPE)
+
+
+def _flat_ints(value):
+    return value.astype("int64").reshape((-1,)).tolist()
+
+
+def _holiday_values(value, weekmask):
+    if value is None:
+        return ()
+    holidays = _date_array(value)
+    if holidays.ndim != 1:
+        raise ValueError("holidays must be a provided as a one-dimensional array")
+    return tuple(_rnp._busday_normalize(
+        list(weekmask), _flat_ints(holidays)))
+
+
 class busdaycalendar:
-    """numpy's `busdaycalendar` — present so `test_datetime.py` collects."""
+    """A normalized, immutable business-day calendar."""
+
+    __slots__ = ("_weekmask", "_holidays")
 
     def __init__(self, weekmask="1111100", holidays=None):
-        raise NotImplementedError(
-            "rnp does not implement numpy.busdaycalendar yet")
+        parsed = _parse_weekmask(weekmask)
+        if not any(parsed):
+            raise ValueError(
+                "Cannot construct a numpy.busdaycal with a weekmask of all zeros")
+        self._weekmask = parsed
+        self._holidays = _holiday_values(holidays, parsed)
+
+    @property
+    def weekmask(self):
+        return _rnp.array(list(self._weekmask), dtype="bool")
+
+    @property
+    def holidays(self):
+        return _rnp.array(list(self._holidays), dtype="int64").astype(_DAY_DTYPE)
 
 
-def _busday_gap(name):
-    def fn(*args, **kwargs):
-        raise NotImplementedError(
-            f"rnp does not implement numpy.{name} yet")
-    fn.__name__ = name
-    return fn
+def _calendar_args(name, weekmask, holidays, busdaycal):
+    if busdaycal is not None:
+        if not isinstance(busdaycal, globals()["busdaycalendar"]):
+            raise TypeError(
+                f"busdaycal must be a numpy.busdaycalendar object, got {type(busdaycal)!r}")
+        if weekmask is not _UNSET or holidays is not _UNSET:
+            raise ValueError(
+                "Cannot supply both the weekmask/holidays and the "
+                f"busdaycal parameters to {name}()")
+        return busdaycal._weekmask, busdaycal._holidays
+    parsed = (_DEFAULT_WEEKMASK if weekmask is _UNSET
+              else _parse_weekmask(weekmask))
+    if not any(parsed):
+        raise ValueError(
+            "the business day weekmask must have at least one valid business day")
+    normalized = _holiday_values(
+        None if holidays is _UNSET else holidays, parsed)
+    return parsed, normalized
 
 
-is_busday = _busday_gap("is_busday")
-busday_offset = _busday_gap("busday_offset")
-busday_count = _busday_gap("busday_count")
+def _broadcast(*arrays):
+    shape = _rnp.broadcast_shapes(*[a.shape for a in arrays])
+    return shape, tuple(_rnp.broadcast_to(a, shape) for a in arrays)
+
+
+def _finish_busday(values, shape, result_dtype, out, name):
+    result = _rnp.array(values, dtype=result_dtype).reshape(shape)
+    if out is not None:
+        if not isinstance(out, ndarray):
+            raise ValueError(f"{name}: must provide a NumPy array for 'out'")
+        out[...] = result
+        return out
+    return result[()] if shape == () else result
+
+
+def busday_offset(dates, offsets, roll="raise", weekmask=_UNSET,
+                  holidays=_UNSET, busdaycal=None, out=None):
+    mask, days_off = _calendar_args(
+        "busday_offset", weekmask, holidays, busdaycal)
+    date_arr = _date_array(dates)
+    offset_arr = _rnp.array(offsets, dtype="int64")
+    shape, (date_arr, offset_arr) = _broadcast(date_arr, offset_arr)
+    values = _rnp._busday_offset(
+        _flat_ints(date_arr), _flat_ints(offset_arr),
+        roll.decode() if isinstance(roll, bytes) else roll,
+        list(mask), list(days_off))
+    return _finish_busday(values, shape, _DAY_DTYPE, out, "busday_offset")
+
+
+def busday_count(begindates, enddates, weekmask=_UNSET, holidays=_UNSET,
+                 busdaycal=None, out=None):
+    mask, days_off = _calendar_args(
+        "busday_count", weekmask, holidays, busdaycal)
+    begin = _date_array(begindates)
+    end = _date_array(enddates)
+    shape, (begin, end) = _broadcast(begin, end)
+    values = _rnp._busday_count(
+        _flat_ints(begin), _flat_ints(end), list(mask), list(days_off))
+    return _finish_busday(values, shape, "int64", out, "busday_count")
+
+
+def is_busday(dates, weekmask=_UNSET, holidays=_UNSET,
+              busdaycal=None, out=None):
+    mask, days_off = _calendar_args(
+        "is_busday", weekmask, holidays, busdaycal)
+    dates = _date_array(dates)
+    values = _rnp._is_busday(
+        _flat_ints(dates), list(mask), list(days_off))
+    return _finish_busday(values, dates.shape, "bool", out, "is_busday")
+
+
+# ---------------------------------------------------------------------------
+# Scalar metadata and Python datetime conversion
+# ---------------------------------------------------------------------------
+
+# These patches live in the datetime-only shim module so the shared scalar
+# module stays outside this lane. NumPy accepts bracketed and byte metadata in
+# scalar constructors even though dtype strings use the unbracketed Unicode
+# spelling internally.
+from ._scalars import datetime64 as _datetime64, timedelta64 as _timedelta64
+
+
+def _normalize_scalar_unit(unit):
+    if isinstance(unit, bytes):
+        unit = unit.decode()
+    elif isinstance(unit, tuple) and len(unit) == 2:
+        base, number = unit
+        if isinstance(base, bytes):
+            base = base.decode()
+        unit = (base, number)
+    if isinstance(unit, str) and len(unit) >= 2 \
+            and unit[0] == "[" and unit[-1] == "]":
+        unit = unit[1:-1]
+    return unit
+
+
+_datetime64_new = _datetime64.__new__
+_timedelta64_new = _timedelta64.__new__
+_datetime64_astype = _datetime64.astype
+_timedelta64_astype = _timedelta64.astype
+
+
+def _new_datetime64(cls, value=None, unit=None):
+    if isinstance(value, int) and not -(2 ** 63) <= value < 2 ** 63:
+        raise OverflowError("int too big to convert")
+    return _datetime64_new(cls, value, _normalize_scalar_unit(unit))
+
+
+def _new_timedelta64(cls, value=None, unit=None):
+    if isinstance(value, int) and not -(2 ** 63) <= value < 2 ** 63:
+        raise OverflowError("int too big to convert")
+    return _timedelta64_new(cls, value, _normalize_scalar_unit(unit))
+
+
+def _astype_datetime64(self, target, *args, **kwargs):
+    import datetime as _pydatetime
+    if target in (_pydatetime.date, _pydatetime.datetime, object):
+        return self.item()
+    return _datetime64_astype(self, target, *args, **kwargs)
+
+
+def _astype_timedelta64(self, target, *args, **kwargs):
+    import datetime as _pydatetime
+    if target in (_pydatetime.timedelta, object):
+        return self.item()
+    return _timedelta64_astype(self, target, *args, **kwargs)
+
+
+_datetime64.__new__ = _new_datetime64
+_timedelta64.__new__ = _new_timedelta64
+_datetime64.astype = _astype_datetime64
+_timedelta64.astype = _astype_timedelta64
 
 
 # ---------------------------------------------------------------------------
