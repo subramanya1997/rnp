@@ -5,6 +5,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::element::{C64v, C32};
+
 type Sdot = unsafe extern "C" fn(i32, *const f32, i32, *const f32, i32) -> f32;
 type Ddot = unsafe extern "C" fn(i32, *const f64, i32, *const f64, i32) -> f64;
 type Cdot = unsafe extern "C" fn(i32, *const c_void, i32, *const c_void, i32, *mut c_void);
@@ -101,6 +103,180 @@ type Cgemm = unsafe extern "C" fn(
     i32,
 );
 
+macro_rules! lapack_api {
+    ($(
+        $field:ident: $function_type:ident = $symbol:literal (
+            $($argument:ident: $argument_type:ty),* $(,)?
+        );
+    )*) => {
+        $(type $function_type = unsafe extern "C" fn($($argument_type),*);)*
+
+        struct LapackApi {
+            $($field: $function_type,)*
+        }
+
+        impl LapackApi {
+            unsafe fn load(handle: *mut c_void) -> Result<Self, String> {
+                Ok(Self {
+                    $($field: {
+                        // SAFETY: each entry lists the exact ILP64 Fortran
+                        // signature exported by NumPy's scipy OpenBLAS build.
+                        unsafe {
+                            symbol::<$function_type>(
+                                handle,
+                                concat!($symbol, "\0").as_bytes(),
+                            )
+                        }?
+                    },)*
+                })
+            }
+        }
+
+        $(
+            pub unsafe fn $field($($argument: $argument_type),*) {
+                // SAFETY: the caller guarantees the LAPACK dimensions and
+                // pointer extents documented at the kernel call site.
+                unsafe { (api().lapack.$field)($($argument),*) }
+            }
+        )*
+    };
+}
+
+lapack_api! {
+    sgesv: Sgesv = "scipy_sgesv_64_" (
+        n: *const i64, nrhs: *const i64, a: *mut f32, lda: *const i64,
+        ipiv: *mut i64, b: *mut f32, ldb: *const i64, info: *mut i64
+    );
+    dgesv: Dgesv = "scipy_dgesv_64_" (
+        n: *const i64, nrhs: *const i64, a: *mut f64, lda: *const i64,
+        ipiv: *mut i64, b: *mut f64, ldb: *const i64, info: *mut i64
+    );
+    cgesv: Cgesv = "scipy_cgesv_64_" (
+        n: *const i64, nrhs: *const i64, a: *mut C32, lda: *const i64,
+        ipiv: *mut i64, b: *mut C32, ldb: *const i64, info: *mut i64
+    );
+    zgesv: Zgesv = "scipy_zgesv_64_" (
+        n: *const i64, nrhs: *const i64, a: *mut C64v, lda: *const i64,
+        ipiv: *mut i64, b: *mut C64v, ldb: *const i64, info: *mut i64
+    );
+
+    sgetrf: Sgetrf = "scipy_sgetrf_64_" (
+        m: *const i64, n: *const i64, a: *mut f32, lda: *const i64,
+        ipiv: *mut i64, info: *mut i64
+    );
+    dgetrf: Dgetrf = "scipy_dgetrf_64_" (
+        m: *const i64, n: *const i64, a: *mut f64, lda: *const i64,
+        ipiv: *mut i64, info: *mut i64
+    );
+    cgetrf: Cgetrf = "scipy_cgetrf_64_" (
+        m: *const i64, n: *const i64, a: *mut C32, lda: *const i64,
+        ipiv: *mut i64, info: *mut i64
+    );
+    zgetrf: Zgetrf = "scipy_zgetrf_64_" (
+        m: *const i64, n: *const i64, a: *mut C64v, lda: *const i64,
+        ipiv: *mut i64, info: *mut i64
+    );
+
+    spotrf: Spotrf = "scipy_spotrf_64_" (
+        uplo: *const u8, n: *const i64, a: *mut f32, lda: *const i64,
+        info: *mut i64
+    );
+    dpotrf: Dpotrf = "scipy_dpotrf_64_" (
+        uplo: *const u8, n: *const i64, a: *mut f64, lda: *const i64,
+        info: *mut i64
+    );
+    cpotrf: Cpotrf = "scipy_cpotrf_64_" (
+        uplo: *const u8, n: *const i64, a: *mut C32, lda: *const i64,
+        info: *mut i64
+    );
+    zpotrf: Zpotrf = "scipy_zpotrf_64_" (
+        uplo: *const u8, n: *const i64, a: *mut C64v, lda: *const i64,
+        info: *mut i64
+    );
+
+    sgelsd: Sgelsd = "scipy_sgelsd_64_" (
+        m: *const i64, n: *const i64, nrhs: *const i64, a: *mut f32,
+        lda: *const i64, b: *mut f32, ldb: *const i64, s: *mut f32,
+        rcond: *const f32, rank: *mut i64, work: *mut f32,
+        lwork: *const i64, iwork: *mut i64, info: *mut i64
+    );
+    dgelsd: Dgelsd = "scipy_dgelsd_64_" (
+        m: *const i64, n: *const i64, nrhs: *const i64, a: *mut f64,
+        lda: *const i64, b: *mut f64, ldb: *const i64, s: *mut f64,
+        rcond: *const f64, rank: *mut i64, work: *mut f64,
+        lwork: *const i64, iwork: *mut i64, info: *mut i64
+    );
+    cgelsd: Cgelsd = "scipy_cgelsd_64_" (
+        m: *const i64, n: *const i64, nrhs: *const i64, a: *mut C32,
+        lda: *const i64, b: *mut C32, ldb: *const i64, s: *mut f32,
+        rcond: *const f32, rank: *mut i64, work: *mut C32,
+        lwork: *const i64, rwork: *mut f32, iwork: *mut i64, info: *mut i64
+    );
+    zgelsd: Zgelsd = "scipy_zgelsd_64_" (
+        m: *const i64, n: *const i64, nrhs: *const i64, a: *mut C64v,
+        lda: *const i64, b: *mut C64v, ldb: *const i64, s: *mut f64,
+        rcond: *const f64, rank: *mut i64, work: *mut C64v,
+        lwork: *const i64, rwork: *mut f64, iwork: *mut i64, info: *mut i64
+    );
+
+    dgesdd: Dgesdd = "scipy_dgesdd_64_" (
+        jobz: *const u8, m: *const i64, n: *const i64, a: *mut f64,
+        lda: *const i64, s: *mut f64, u: *mut f64, ldu: *const i64,
+        vt: *mut f64, ldvt: *const i64, work: *mut f64,
+        lwork: *const i64, iwork: *mut i64, info: *mut i64
+    );
+    zgesdd: Zgesdd = "scipy_zgesdd_64_" (
+        jobz: *const u8, m: *const i64, n: *const i64, a: *mut C64v,
+        lda: *const i64, s: *mut f64, u: *mut C64v, ldu: *const i64,
+        vt: *mut C64v, ldvt: *const i64, work: *mut C64v,
+        lwork: *const i64, rwork: *mut f64, iwork: *mut i64, info: *mut i64
+    );
+
+    dsyevd: Dsyevd = "scipy_dsyevd_64_" (
+        jobz: *const u8, uplo: *const u8, n: *const i64, a: *mut f64,
+        lda: *const i64, w: *mut f64, work: *mut f64, lwork: *const i64,
+        iwork: *mut i64, liwork: *const i64, info: *mut i64
+    );
+    zheevd: Zheevd = "scipy_zheevd_64_" (
+        jobz: *const u8, uplo: *const u8, n: *const i64, a: *mut C64v,
+        lda: *const i64, w: *mut f64, work: *mut C64v, lwork: *const i64,
+        rwork: *mut f64, lrwork: *const i64, iwork: *mut i64,
+        liwork: *const i64, info: *mut i64
+    );
+
+    dgeev: Dgeev = "scipy_dgeev_64_" (
+        jobvl: *const u8, jobvr: *const u8, n: *const i64, a: *mut f64,
+        lda: *const i64, wr: *mut f64, wi: *mut f64, vl: *mut f64,
+        ldvl: *const i64, vr: *mut f64, ldvr: *const i64, work: *mut f64,
+        lwork: *const i64, info: *mut i64
+    );
+    zgeev: Zgeev = "scipy_zgeev_64_" (
+        jobvl: *const u8, jobvr: *const u8, n: *const i64, a: *mut C64v,
+        lda: *const i64, w: *mut C64v, vl: *mut C64v, ldvl: *const i64,
+        vr: *mut C64v, ldvr: *const i64, work: *mut C64v,
+        lwork: *const i64, rwork: *mut f64, info: *mut i64
+    );
+
+    dgeqrf: Dgeqrf = "scipy_dgeqrf_64_" (
+        m: *const i64, n: *const i64, a: *mut f64, lda: *const i64,
+        tau: *mut f64, work: *mut f64, lwork: *const i64, info: *mut i64
+    );
+    zgeqrf: Zgeqrf = "scipy_zgeqrf_64_" (
+        m: *const i64, n: *const i64, a: *mut C64v, lda: *const i64,
+        tau: *mut C64v, work: *mut C64v, lwork: *const i64, info: *mut i64
+    );
+    dorgqr: Dorgqr = "scipy_dorgqr_64_" (
+        m: *const i64, n: *const i64, k: *const i64, a: *mut f64,
+        lda: *const i64, tau: *mut f64, work: *mut f64,
+        lwork: *const i64, info: *mut i64
+    );
+    zungqr: Zungqr = "scipy_zungqr_64_" (
+        m: *const i64, n: *const i64, k: *const i64, a: *mut C64v,
+        lda: *const i64, tau: *mut C64v, work: *mut C64v,
+        lwork: *const i64, info: *mut i64
+    );
+}
+
 struct Api {
     handle: usize,
     sdot: Sdot,
@@ -117,6 +293,7 @@ struct Api {
     dgemm: Dgemm,
     cgemm: Cgemm,
     zgemm: Cgemm,
+    lapack: LapackApi,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
@@ -186,6 +363,11 @@ impl Api {
             dgemm: get!("scipy_cblas_dgemm", Dgemm),
             cgemm: get!("scipy_cblas_cgemm", Cgemm),
             zgemm: get!("scipy_cblas_zgemm", Cgemm),
+            lapack: {
+                // SAFETY: `handle` is live and `LapackApi::load` validates
+                // every required ILP64 symbol before returning.
+                unsafe { LapackApi::load(handle) }?
+            },
         })
     }
 }

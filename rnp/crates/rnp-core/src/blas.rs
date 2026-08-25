@@ -302,7 +302,7 @@ mod sys {
 
 #[cfg(target_os = "linux")]
 #[path = "blas_linux.rs"]
-mod sys;
+pub(crate) mod sys;
 
 /// `FLOAT_dot`'s CBLAS branch, including numpy's double chunk accumulator.
 ///

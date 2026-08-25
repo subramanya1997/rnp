@@ -1,10 +1,10 @@
-//! Apple Accelerate LAPACK kernels used by `numpy.linalg`.
+//! LAPACK kernels used by `numpy.linalg`.
 //!
-//! NumPy 2.5.2's wheel on this host imports the `$NEWLAPACK$ILP64`
-//! variants, so every Fortran integer below is an `i64`.  Matrices are copied
-//! into column-major scratch buffers before crossing the FFI boundary; this
-//! also handles arbitrary and byte-swapped ndarray inputs without exposing
-//! their storage directly to LAPACK.
+//! macOS uses Accelerate's `$NEWLAPACK$ILP64` symbols. Linux resolves the
+//! matching ILP64 Fortran ABI from NumPy's bundled scipy OpenBLAS object at
+//! runtime. Matrices are copied into column-major scratch buffers before
+//! crossing the FFI boundary; this also handles arbitrary and byte-swapped
+//! ndarray inputs without exposing their storage directly to LAPACK.
 
 use num_complex::Complex;
 
@@ -15,7 +15,24 @@ use crate::error::{Error, Result};
 use crate::iter::{broadcast_shapes, broadcast_to, offsets};
 
 /// True when this build can call Accelerate LAPACK.
+#[cfg(all(target_os = "macos", target_vendor = "apple"))]
 pub const HAVE_LAPACK: bool = cfg!(all(target_os = "macos", target_vendor = "apple"));
+
+/// Whether the active platform LAPACK backend is ready for calls.
+#[inline]
+pub fn have_lapack() -> bool {
+    #[cfg(all(target_os = "macos", target_vendor = "apple"))]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::blas::have_cblas()
+    }
+}
+
+#[cfg(target_os = "linux")]
+use crate::blas::sys;
 
 #[cfg(all(target_os = "macos", target_vendor = "apple"))]
 mod sys {
@@ -270,13 +287,13 @@ macro_rules! impl_complex_lapack {
     };
 }
 
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_real_lapack!(f32, DType::F32, sys::sgesv, sys::sgetrf, sys::spotrf);
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_real_lapack!(f64, DType::F64, sys::dgesv, sys::dgetrf, sys::dpotrf);
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_complex_lapack!(C32, f32, DType::C64, sys::cgesv, sys::cgetrf, sys::cpotrf);
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_complex_lapack!(C64v, f64, DType::C128, sys::zgesv, sys::zgetrf, sys::zpotrf);
 
 trait GelsdScalar: LapackScalar {
@@ -361,13 +378,13 @@ macro_rules! impl_complex_gelsd {
     };
 }
 
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_real_gelsd!(f32, sys::sgelsd);
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_real_gelsd!(f64, sys::dgelsd);
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_complex_gelsd!(C32, f32, sys::cgelsd);
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl_complex_gelsd!(C64v, f64, sys::zgelsd);
 
 trait QrScalar: LapackScalar {
@@ -375,7 +392,7 @@ trait QrScalar: LapackScalar {
     fn gqr(m: i64, n: i64, k: i64, a: &mut [Self], tau: &mut [Self]) -> i64;
 }
 
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl QrScalar for f64 {
     fn geqrf(m: i64, n: i64, a: &mut [Self], tau: &mut [Self]) -> i64 {
         let lda=m.max(1);let mut query=0.0;let q=-1i64;let mut info=0i64;
@@ -395,7 +412,7 @@ impl QrScalar for f64 {
     }
 }
 
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "macos", target_vendor = "apple"), target_os = "linux"))]
 impl QrScalar for C64v {
     fn geqrf(m:i64,n:i64,a:&mut[Self],tau:&mut[Self])->i64{
         let lda=m.max(1);let mut query=C64v::new(0.0,0.0);let q=-1i64;let mut info=0i64;
@@ -416,7 +433,7 @@ impl QrScalar for C64v {
 }
 
 fn unavailable() -> Error {
-    Error::NotImplemented("numpy.linalg requires Apple Accelerate LAPACK".into())
+    Error::NotImplemented("numpy.linalg requires an initialized LAPACK backend".into())
 }
 
 fn matrix_to_col_major<T: LapackScalar>(a: &NdArray, base: isize, rows: usize, cols: usize) -> Vec<T> {
@@ -499,7 +516,7 @@ fn solve_impl<T: LapackScalar>(
 
 /// Solve `a @ x = b`, including gufunc-style broadcasting over matrix stacks.
 pub fn solve(a: &NdArray, b: &NdArray, vector: bool, dtype: DType) -> Result<NdArray> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     match dtype {
         DType::F32 => solve_impl::<f32>(a, b, vector, false),
         DType::F64 => solve_impl::<f64>(a, b, vector, false),
@@ -514,7 +531,7 @@ pub fn inv(a: &NdArray, dtype: DType, singular_nan: bool) -> Result<NdArray> {
     let n = a.shape[a.ndim() - 1];
     let mut identity = NdArray::zeros(vec![n, n], dtype)?;
     for i in 0..n as usize { identity.set_flat(i * n as usize + i, Scalar::Int(1)); }
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     match dtype {
         DType::F32 => solve_impl::<f32>(a, &identity, false, singular_nan),
         DType::F64 => solve_impl::<f64>(a, &identity, false, singular_nan),
@@ -550,7 +567,7 @@ fn slogdet_impl<T: LapackScalar>(a: &NdArray) -> Result<(NdArray, NdArray)> {
 }
 
 pub fn slogdet(a: &NdArray, dtype: DType) -> Result<(NdArray, NdArray)> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     match dtype {
         DType::F32 => slogdet_impl::<f32>(a), DType::F64 => slogdet_impl::<f64>(a),
         DType::C64 => slogdet_impl::<C32>(a), DType::C128 => slogdet_impl::<C64v>(a),
@@ -569,7 +586,7 @@ fn det_impl<T: LapackScalar>(a: &NdArray) -> Result<NdArray> {
 }
 
 pub fn det(a: &NdArray, dtype: DType) -> Result<NdArray> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     match dtype {
         DType::F32 => det_impl::<f32>(a), DType::F64 => det_impl::<f64>(a),
         DType::C64 => det_impl::<C32>(a), DType::C128 => det_impl::<C64v>(a),
@@ -601,7 +618,7 @@ fn cholesky_impl<T: LapackScalar>(a: &NdArray, upper: bool) -> Result<NdArray> {
 }
 
 pub fn cholesky(a: &NdArray, upper: bool, dtype: DType) -> Result<NdArray> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     match dtype {
         DType::F32 => cholesky_impl::<f32>(a, upper), DType::F64 => cholesky_impl::<f64>(a, upper),
         DType::C64 => cholesky_impl::<C32>(a, upper), DType::C128 => cholesky_impl::<C64v>(a, upper),
@@ -658,7 +675,7 @@ fn lstsq_impl<T: GelsdScalar>(a: &NdArray, b: &NdArray, rcond: f64) -> Result<Ls
 }
 
 pub fn lstsq(a: &NdArray, b: &NdArray, rcond: f64, dtype: DType) -> Result<LstsqResult> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     match dtype {
         DType::F32 => lstsq_impl::<f32>(a, b, rcond), DType::F64 => lstsq_impl::<f64>(a, b, rcond),
         DType::C64 => lstsq_impl::<C32>(a, b, rcond), DType::C128 => lstsq_impl::<C64v>(a, b, rcond),
@@ -768,7 +785,7 @@ fn write_col_major<T: LapackScalar>(out: &mut NdArray, batch_i: usize,
 }
 
 pub fn svd(a: &NdArray, full: bool, vectors: bool, complex: bool) -> Result<SvdResult> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     let m = a.shape[a.ndim() - 2] as usize;
     let n = a.shape[a.ndim() - 1] as usize;
     let k = m.min(n);
@@ -841,7 +858,7 @@ fn eig_complex_one(mut a: Vec<C64v>, n: usize, vectors: bool) -> Result<(Vec<C64
 }
 
 pub fn eig(a: &NdArray, vectors: bool, complex_input: bool) -> Result<EigResult> {
-    if !HAVE_LAPACK { return Err(unavailable()); }
+    if !have_lapack() { return Err(unavailable()); }
     let n=a.shape[a.ndim()-1] as usize; let batch=a.shape[..a.ndim()-2].to_vec();
     let mut vshape=batch.clone(); vshape.push(n as isize); let mut values=NdArray::zeros(vshape,DType::C128)?;
     let mut vectors_out=if vectors { let mut sh=batch.clone(); sh.extend([n as isize,n as isize]); Some(NdArray::zeros(sh,DType::C128)?) } else {None};
@@ -877,7 +894,7 @@ fn eigh_complex_one(mut a: Vec<C64v>, n: usize, upper: bool, vectors: bool) -> R
 }
 
 pub fn eigh(a:&NdArray,upper:bool,vectors:bool,complex:bool)->Result<EigResult>{
-    if !HAVE_LAPACK{return Err(unavailable());}let n=a.shape[a.ndim()-1] as usize;let batch=a.shape[..a.ndim()-2].to_vec();let mut sh=batch.clone();sh.push(n as isize);let mut values=NdArray::zeros(sh,DType::F64)?;
+    if !have_lapack(){return Err(unavailable());}let n=a.shape[a.ndim()-1] as usize;let batch=a.shape[..a.ndim()-2].to_vec();let mut sh=batch.clone();sh.push(n as isize);let mut values=NdArray::zeros(sh,DType::F64)?;
     let mut vo=if vectors{let mut s=batch.clone();s.extend([n as isize,n as isize]);Some(NdArray::zeros(s,if complex{DType::C128}else{DType::F64})?)}else{None};
     for(bi,base)in offsets(&batch,&a.strides[..batch.len()],a.byte_offset).enumerate(){if complex{let(w,v)=eigh_complex_one(matrix_to_col_major::<C64v>(a,base,n,n),n,upper,vectors)?;for(i,x)in w.into_iter().enumerate(){values.set_flat(bi*n+i,Scalar::Float(x));}if let Some(out)=&mut vo{write_col_major(out,bi,&v,n,n);}}else{let(w,v)=eigh_real_one(matrix_to_col_major::<f64>(a,base,n,n),n,upper,vectors)?;for(i,x)in w.into_iter().enumerate(){values.set_flat(bi*n+i,Scalar::Float(x));}if let Some(out)=&mut vo{write_col_major(out,bi,&v,n,n);}}}
     Ok(EigResult{values,vectors:vo})
@@ -890,7 +907,7 @@ fn qr_raw_impl<T:QrScalar>(a:&NdArray)->Result<NdArray>{
     Ok(tau_out)
 }
 
-pub fn qr_raw(a:&NdArray,complex:bool)->Result<NdArray>{if !HAVE_LAPACK{return Err(unavailable());}if complex{qr_raw_impl::<C64v>(a)}else{qr_raw_impl::<f64>(a)}}
+pub fn qr_raw(a:&NdArray,complex:bool)->Result<NdArray>{if !have_lapack(){return Err(unavailable());}if complex{qr_raw_impl::<C64v>(a)}else{qr_raw_impl::<f64>(a)}}
 
 fn qr_q_impl<T:QrScalar>(a:&NdArray,tau:&NdArray,complete:bool)->Result<NdArray>{
     let m=a.shape[a.ndim()-2] as usize;let n=a.shape[a.ndim()-1] as usize;let k=m.min(n);let mc=if complete{m}else{k};let batch=a.shape[..a.ndim()-2].to_vec();let mut shape=batch.clone();shape.extend([m as isize,mc as isize]);let mut out=NdArray::zeros(shape,T::DTYPE)?;
@@ -899,4 +916,4 @@ fn qr_q_impl<T:QrScalar>(a:&NdArray,tau:&NdArray,complete:bool)->Result<NdArray>
     Ok(out)
 }
 
-pub fn qr_q(a:&NdArray,tau:&NdArray,complete:bool,complex:bool)->Result<NdArray>{if !HAVE_LAPACK{return Err(unavailable());}if complex{qr_q_impl::<C64v>(a,tau,complete)}else{qr_q_impl::<f64>(a,tau,complete)}}
+pub fn qr_q(a:&NdArray,tau:&NdArray,complete:bool,complex:bool)->Result<NdArray>{if !have_lapack(){return Err(unavailable());}if complex{qr_q_impl::<C64v>(a,tau,complete)}else{qr_q_impl::<f64>(a,tau,complete)}}

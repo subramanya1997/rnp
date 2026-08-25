@@ -20,7 +20,9 @@ pub mod indexing;
 pub mod iter;
 #[cfg(target_os = "macos")]
 pub mod lapack;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub mod lapack;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[path = "lapack_fallback.rs"]
 pub mod lapack;
 #[cfg(all(test, target_os = "macos"))]
