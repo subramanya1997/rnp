@@ -962,7 +962,15 @@ impl RealFloat for f64 {
                 0
             };
         }
-        self.r_remainder_flags(o)
+        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            && self.is_finite()
+            && o.is_finite()
+            && ((self - self % o) / o).is_infinite()
+        {
+            fpe::OVER | fpe::INVALID
+        } else {
+            self.r_remainder_flags(o)
+        }
     }
     #[inline]
     fn r_remainder_flags(self, o: Self) -> u8 {
@@ -1112,7 +1120,15 @@ impl RealFloat for f32 {
                 0
             };
         }
-        self.r_remainder_flags(o)
+        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            && self.is_finite()
+            && o.is_finite()
+            && ((self - self % o) / o).is_infinite()
+        {
+            fpe::OVER | fpe::INVALID
+        } else {
+            self.r_remainder_flags(o)
+        }
     }
     #[inline]
     fn r_remainder_flags(self, o: Self) -> u8 {
