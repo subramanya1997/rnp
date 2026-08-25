@@ -291,7 +291,7 @@ pub fn scalar_class<'py>(py: Python<'py>, dt: DType) -> Option<Bound<'py, PyAny>
         .and_then(|m| m.bind(py).get_item(key).ok().flatten())
 }
 
-#[pyclass(name = "dtype", module = "_rnp", frozen, from_py_object)]
+#[pyclass(name = "dtype", module = "_rnp", frozen, subclass, from_py_object)]
 #[derive(Clone, Copy)]
 pub struct PyDType {
     pub d: Descr,

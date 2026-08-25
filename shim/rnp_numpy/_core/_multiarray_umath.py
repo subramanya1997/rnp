@@ -57,7 +57,10 @@ def _discover_array_parameters(obj, dtype=None):
     if dtype is not None and isinstance(dtype, type):
         # Callers pass a DType *class* (``type(np.dtype("f8"))``); numpy
         # accepts that and discovers the concrete descriptor from it.
-        dtype = dtype()
+        if issubclass(dtype, np.dtype):
+            dtype = np.dtypes._default_for_discovery(dtype)
+        else:
+            dtype = dtype()
     arr = np.asarray(obj, dtype=dtype)
     return arr.dtype, arr.shape
 

@@ -1302,7 +1302,7 @@ class void(flexible, metaclass=_FlexMeta, char="V"):
     def dtype(self):
         if self._arr is not None:
             return self._arr.dtype
-        return _rnp.dtype(f"V{len(self._b)}")
+        return dtype(f"V{len(self._b)}")
 
     @property
     def base(self):
@@ -1872,7 +1872,7 @@ def _datetime_scalar_factory(raw, dt):
     Python int.
     """
     cls = datetime64 if dt.kind == "M" else timedelta64
-    return cls._from_parts(raw, dt)
+    return cls._from_parts(raw, dtype(dt))
 
 
 _rnp._register_datetime_factory(_datetime_scalar_factory)

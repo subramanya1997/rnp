@@ -1224,6 +1224,39 @@ from ._datetime import (  # noqa: E402,F401
 from ._datetime import arange  # noqa: E402,F401
 from ._core import multiarray  # noqa: E402,F401
 from . import dtypes  # noqa: E402,F401
+
+# The extension's ``dtype`` is the descriptor storage base. Once the scalar
+# registry exists, publish NumPy's abstract base and concrete subclasses and
+# ensure the common descriptor-producing boundaries expose them.
+dtype = dtypes.dtype
+_sc.dtype = dtype
+
+_raw_ndarray_dtype_descriptor = _rnp.ndarray.dtype
+_rnp.ndarray.dtype = property(
+    lambda self: dtypes._concrete(
+        _raw_ndarray_dtype_descriptor.__get__(self, _rnp.ndarray)))
+
+for _scalar_cls in set(_sc.registry().values()):
+    _scalar_dtype = _scalar_cls.__dict__.get("dtype")
+    if isinstance(_scalar_dtype, _rnp.dtype):
+        setattr(_scalar_cls, "dtype", dtypes._concrete(_scalar_dtype))
+
+_raw_result_type_dtype = result_type
+_raw_min_scalar_type_dtype = min_scalar_type
+_raw_common_type_dtype = common_type
+
+
+def result_type(*args):
+    return dtypes._concrete(_raw_result_type_dtype(*args))
+
+
+def min_scalar_type(value):
+    return dtypes._concrete(_raw_min_scalar_type_dtype(value))
+
+
+def common_type(*arrays):
+    return dtypes._concrete(_raw_common_type_dtype(*arrays))
+
 from ._stubs import inert_class as _inert_class  # noqa: E402
 from ._stubs import not_implemented as _not_implemented  # noqa: E402
 from ._printing import (  # noqa: E402,F401
@@ -1654,7 +1687,7 @@ _can_cast_scalar = can_cast
 
 def promote_types(type1, type2):
     """Delegate descriptor-aware promotion to the Rust dtype engine."""
-    return _promote_types_scalar(type1, type2)
+    return dtypes._concrete(_promote_types_scalar(type1, type2))
 
 
 def can_cast(from_, to, casting="safe"):
