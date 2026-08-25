@@ -402,6 +402,12 @@ pub fn can_cast(from: Descr, to: Descr, casting: Casting) -> bool {
         to.dt,
         DType::Bytes(0) | DType::Str(0) | DType::Void(0)
     ) && from.dt.category() == to.dt.category();
+    if unsized_target {
+        // The target descriptor is resolved from the source before the
+        // structured/subarray resolver runs. In particular every casting
+        // level accepts `np.can_cast('d,i', 'V', ...)`.
+        return true;
+    }
     if let Some(result) = compound_can_cast(from, to, casting) {
         return result;
     }
@@ -888,6 +894,15 @@ mod tests {
         assert!(can_cast(d("S3"), d("S"), Casting::No));
         assert!(can_cast(d("V8"), d("V"), Casting::Equiv));
         assert!(!can_cast(d("i4"), d("S"), Casting::No));
+        for casting in [
+            Casting::No,
+            Casting::Equiv,
+            Casting::Safe,
+            Casting::SameKind,
+            Casting::Unsafe,
+        ] {
+            assert!(can_cast(d("d,i"), d("V"), casting));
+        }
     }
 
     #[test]

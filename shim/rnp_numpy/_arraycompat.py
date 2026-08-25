@@ -420,6 +420,17 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
     if src.kind in "SU" and dt.kind in "mM":
         # text -> datetime: the array constructor already parses ISO strings.
         return _pkg().array(self.tolist(), dtype=dt)
+    if (src.kind == "V" and src.names is None and src.subdtype is None
+            and dt.kind in "SU"):
+        # NumPy's void-to-parametric-string resolver is an odd empty-array
+        # special case. An unsized target inherits the void byte width (U
+        # counts it as code points); any non-empty execution fails while
+        # trying to treat the void scalar as a sequence.
+        if dt.itemsize == 0:
+            dt = _dtype(f"{dt.char}{src.itemsize}")
+        if self.size == 0:
+            return _empty(self.shape, dt)
+        raise ValueError("setting an array element with a sequence")
     if dt.kind in "SU" and src.kind in "biufc":
         # Numbers rendered as text.  Note this must come before the
         # `itemsize == 0` branch below: that one sizes the result from the
@@ -790,6 +801,18 @@ def setitem(self, key, value):
             raise
         fill = _NAN if self.dtype.kind == "f" else _CNAN
         result = _orig_setitem(self, key, _replace_none(value, fill))
+    is_generic_time = (self.dtype.kind in "mM" and
+                       str(self.dtype) in ("datetime64", "timedelta64"))
+    warn_generic = (
+        is_generic_time and
+        ((self.dtype.kind == "M" and
+          (value is None or (isinstance(value, str) and
+                             value.lower() == "nat"))) or
+         (self.dtype.kind == "m" and isinstance(value, str)))
+    )
+    if warn_generic:
+        from ._scalars import _warn_generic
+        _warn_generic(stacklevel=3)
     from . import _errstate
     _errstate.drain("cast", stacklevel=3)
     return result
