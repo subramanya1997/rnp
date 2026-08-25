@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-25T03:06:27.263884+00:00",
-  "overall_passed": 4181,
+  "timestamp": "2026-08-25T05:18:20.051324+00:00",
+  "overall_passed": 4219,
   "overall_total": 4376,
   "files": [
     {
@@ -13,8 +13,8 @@
     },
     {
       "file": "ma/test_core.py",
-      "passed": 4072,
-      "failed": 97,
+      "passed": 4085,
+      "failed": 84,
       "errors": 0,
       "skipped": 3,
       "total": 4172
@@ -29,8 +29,8 @@
     },
     {
       "file": "ma/test_extras.py",
-      "passed": 68,
-      "failed": 35,
+      "passed": 70,
+      "failed": 33,
       "errors": 0,
       "skipped": 0,
       "total": 103
@@ -45,8 +45,8 @@
     },
     {
       "file": "ma/test_old_ma.py",
-      "passed": 10,
-      "failed": 31,
+      "passed": 33,
+      "failed": 8,
       "errors": 0,
       "skipped": 0,
       "total": 41

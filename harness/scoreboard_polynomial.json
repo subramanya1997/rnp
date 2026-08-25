@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-08-25T03:14:15.331072+00:00",
-  "overall_passed": 596,
+  "timestamp": "2026-08-25T05:28:39.664954+00:00",
+  "overall_passed": 609,
   "overall_total": 610,
   "files": [
     {
       "file": "polynomial/test_chebyshev.py",
-      "passed": 40,
-      "failed": 2,
+      "passed": 42,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 42
@@ -21,40 +21,40 @@
     },
     {
       "file": "polynomial/test_hermite.py",
-      "passed": 33,
-      "failed": 2,
+      "passed": 35,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 35
     },
     {
       "file": "polynomial/test_hermite_e.py",
-      "passed": 33,
-      "failed": 2,
+      "passed": 35,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 35
     },
     {
       "file": "polynomial/test_laguerre.py",
-      "passed": 33,
-      "failed": 2,
+      "passed": 35,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 35
     },
     {
       "file": "polynomial/test_legendre.py",
-      "passed": 37,
-      "failed": 2,
+      "passed": 39,
+      "failed": 0,
       "errors": 0,
       "skipped": 0,
       "total": 39
     },
     {
       "file": "polynomial/test_polynomial.py",
-      "passed": 37,
-      "failed": 4,
+      "passed": 40,
+      "failed": 1,
       "errors": 0,
       "skipped": 0,
       "total": 41

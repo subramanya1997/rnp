@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-25T02:51:06.113575+00:00",
-  "overall_passed": 34837,
+  "timestamp": "2026-08-25T05:13:33.367178+00:00",
+  "overall_passed": 34924,
   "overall_total": 36357,
   "files": [
     {
@@ -141,8 +141,8 @@
     },
     {
       "file": "test_datetime.py",
-      "passed": 458,
-      "failed": 32,
+      "passed": 466,
+      "failed": 24,
       "errors": 0,
       "skipped": 4,
       "total": 494
@@ -229,8 +229,8 @@
     },
     {
       "file": "test_half.py",
-      "passed": 36,
-      "failed": 3,
+      "passed": 37,
+      "failed": 2,
       "errors": 0,
       "skipped": 0,
       "total": 39
@@ -301,16 +301,16 @@
     },
     {
       "file": "test_memmap.py",
-      "passed": 21,
-      "failed": 3,
+      "passed": 19,
+      "failed": 5,
       "errors": 0,
       "skipped": 0,
       "total": 24
     },
     {
       "file": "test_multiarray.py",
-      "passed": 13654,
-      "failed": 613,
+      "passed": 13688,
+      "failed": 579,
       "errors": 0,
       "skipped": 5,
       "total": 14272,
@@ -350,8 +350,8 @@
     },
     {
       "file": "test_numeric.py",
-      "passed": 1645,
-      "failed": 61,
+      "passed": 1646,
+      "failed": 60,
       "errors": 0,
       "skipped": 2,
       "total": 1708
@@ -398,8 +398,8 @@
     },
     {
       "file": "test_regression.py",
-      "passed": 342,
-      "failed": 77,
+      "passed": 343,
+      "failed": 76,
       "errors": 0,
       "skipped": 3,
       "total": 422
@@ -494,16 +494,16 @@
     },
     {
       "file": "test_ufunc.py",
-      "passed": 671,
-      "failed": 196,
+      "passed": 673,
+      "failed": 194,
       "errors": 0,
       "skipped": 8,
       "total": 875
     },
     {
       "file": "test_umath.py",
-      "passed": 5148,
-      "failed": 81,
+      "passed": 5190,
+      "failed": 39,
       "errors": 0,
       "skipped": 86,
       "total": 5315

@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-25T03:14:18.116243+00:00",
-  "overall_passed": 188,
+  "timestamp": "2026-08-25T05:28:42.076878+00:00",
+  "overall_passed": 189,
   "overall_total": 209,
   "files": [
     {
@@ -21,8 +21,8 @@
     },
     {
       "file": "matrixlib/test_masked_matrix.py",
-      "passed": 11,
-      "failed": 3,
+      "passed": 12,
+      "failed": 2,
       "errors": 0,
       "skipped": 0,
       "total": 14
