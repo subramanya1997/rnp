@@ -102,6 +102,7 @@ rnp/                Rust workspace
 shim/               Python package presenting the numpy API, backed by the engine
 harness/            runs numpy's unmodified tests against the shim + differential checkers
 benchmarks/         paired port-vs-NumPy timings (see benchmarks/README.md)
+examples/           runnable real-world NumPy workloads (see examples/README.md)
 upstream/           shallow clone of numpy v2.5.2 — the read-only oracle (not committed)
 PLAN.md             the full milestone log (M0–M8)
 ```
