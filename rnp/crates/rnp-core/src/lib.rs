@@ -17,7 +17,15 @@ pub mod fft;
 mod fft_single;
 pub mod indexing;
 pub mod iter;
+#[cfg(target_os = "macos")]
 pub mod lapack;
+#[cfg(not(target_os = "macos"))]
+#[path = "lapack_fallback.rs"]
+pub mod lapack;
+#[cfg(all(test, target_os = "macos"))]
+#[allow(dead_code)]
+#[path = "lapack_fallback.rs"]
+mod lapack_fallback_compile_check;
 pub mod loops;
 pub mod matmul;
 pub mod ops;

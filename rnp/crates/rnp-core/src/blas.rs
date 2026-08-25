@@ -1,5 +1,5 @@
-//! The Accelerate CBLAS entry points numpy's `matmul.c.src` reaches for
-//! complex `vecdot` and `vecmat`, bound to the same library and ABI as numpy.
+//! The CBLAS entry points numpy's `matmul.c.src` reaches for complex `vecdot`
+//! and `vecmat`, bound to the same library and ABI as numpy.
 //!
 //! Everything else in this crate is from-scratch Rust, and deliberately so.
 //! This module is the one exception, for a reason that is not a shortcut:
@@ -10,12 +10,18 @@
 //! stride zero even when the source ndarray reports an item-sized stride, so
 //! that case stays in numpy's scalar fallback.
 //!
-//! Which symbol: the numpy wheel in `.venv` links
+//! On macOS, the numpy wheel in `.venv` links
 //! `_cblas_zdotc_sub$NEWLAPACK$ILP64` (checked with `nm -u` on
 //! `_multiarray_umath`), i.e. Accelerate's *new* LAPACK interface in its
 //! ILP64 flavour, so `CBLAS_INT` is 64 bits wide. `npy_cblas.h` then makes
 //! `CBLAS_INT_MAX` `NPY_MAX_INT64` and `NPY_CBLAS_CHUNK` `NPY_MAX_INTP`, which
-//! is why the chunking loop in `dotc` never actually splits a call here.
+//! is why the chunking loop in `dotc` never actually splits a call there.
+//!
+//! On Linux x86-64, [`initialize_linux_openblas`] must be called with the exact
+//! `numpy.libs/libscipy_openblas*.so` bundled beside the imported manylinux
+//! wheel. The loader resolves that wheel's LP64 `scipy_cblas_*` symbols and
+//! only publishes the backend after every symbol used below is present. Until
+//! then, [`have_cblas`] is false and `matmul` uses its transcribed Rust paths.
 
 use crate::element::{C64v, C32};
 
@@ -25,9 +31,23 @@ const CBLAS_NO_TRANS: i32 = 111;
 const CBLAS_TRANS: i32 = 112;
 const CBLAS_CONJ_TRANS: i32 = 113;
 
-/// numpy's `NPY_CBLAS_CHUNK`. With ILP64 `CBLAS_INT_MAX == NPY_MAX_INTP`, so
-/// `npy_cblas.h` takes the `#else` branch and the chunk is the whole range.
+/// numpy's `NPY_CBLAS_CHUNK` for the selected ABI. Accelerate uses ILP64;
+/// the manylinux backend requested by the runtime initializer uses LP64.
+#[cfg(target_os = "macos")]
 pub const NPY_CBLAS_CHUNK: usize = isize::MAX as usize;
+#[cfg(target_os = "linux")]
+pub const NPY_CBLAS_CHUNK: usize = 1usize << 30;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub const NPY_CBLAS_CHUNK: usize = 0;
+
+/// Largest matrix dimension/leading dimension accepted by the active ABI.
+/// NumPy subtracts one from the ILP64 maximum on 64-bit platforms.
+#[cfg(target_os = "macos")]
+pub const CBLAS_MAX_SIZE: isize = isize::MAX - 1;
+#[cfg(target_os = "linux")]
+pub const CBLAS_MAX_SIZE: isize = i32::MAX as isize;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub const CBLAS_MAX_SIZE: isize = 0;
 
 /// numpy's `blas_stride`: a byte stride converted to an *element* stride, or
 /// `None` when CBLAS cannot be used (BLAS will not walk a zero or negative
@@ -35,16 +55,52 @@ pub const NPY_CBLAS_CHUNK: usize = isize::MAX as usize;
 #[inline]
 pub fn blas_stride(byte_stride: isize, itemsize: usize) -> Option<i64> {
     if byte_stride > 0 && byte_stride % itemsize as isize == 0 {
-        // `stride <= CBLAS_INT_MAX` is vacuous at 64-bit CBLAS_INT.
-        return Some((byte_stride / itemsize as isize) as i64);
+        let stride = (byte_stride / itemsize as isize) as i64;
+        if !cfg!(target_os = "linux") || stride <= i32::MAX as i64 {
+            return Some(stride);
+        }
     }
     None
 }
 
-/// True when this build can call Accelerate at all.
-pub const HAVE_CBLAS: bool = cfg!(all(target_os = "macos", target_vendor = "apple"));
+/// Whether the process currently has a usable CBLAS backend.
+///
+/// This is always true for the linked Accelerate backend. On Linux it becomes
+/// true only after [`initialize_linux_openblas`] has loaded and validated all
+/// required LP64 symbols. Other platforms remain on the Rust fallback.
+#[inline]
+pub fn have_cblas() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        sys::is_loaded()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
 
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+/// Load NumPy's bundled manylinux OpenBLAS by exact filesystem path.
+///
+/// The Linux Python shim calls this once during import after scanning each
+/// `sys.path` entry for `numpy.libs/libscipy_openblas*.so`. A failed load does
+/// not poison the initializer, so another candidate can be tried. On success,
+/// the library remains loaded for the process lifetime.
+#[cfg(target_os = "linux")]
+pub fn initialize_linux_openblas(path: &std::path::Path) -> Result<(), String> {
+    sys::initialize(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn initialize_linux_openblas(_path: &std::path::Path) -> Result<(), String> {
+    Err("the NumPy OpenBLAS runtime backend is Linux-only".into())
+}
+
+#[cfg(target_os = "macos")]
 mod sys {
     use std::ffi::c_void;
 
@@ -244,12 +300,16 @@ mod sys {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[path = "blas_linux.rs"]
+mod sys;
+
 /// `FLOAT_dot`'s CBLAS branch, including numpy's double chunk accumulator.
 ///
 /// # Safety
 /// `x` and `y` must each address `n` in-bounds `f32` elements spaced by the
 /// positive element strides `incx` and `incy`.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn sdot(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> f32 {
     let mut sum = 0.0f64;
     let (mut xp, mut yp, mut left) = (x, y, n);
@@ -276,7 +336,7 @@ pub unsafe fn sdot(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -
 ///
 /// # Safety
 /// As [`sdot`], for `f64` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn ddot(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> f64 {
     let mut sum = 0.0f64;
     let (mut xp, mut yp, mut left) = (x, y, n);
@@ -302,7 +362,7 @@ pub unsafe fn ddot(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -
 ///
 /// # Safety
 /// As [`sdot`], for `npy_cfloat` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn cdotu(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> C32 {
     let mut sum = [0.0f64, 0.0f64];
     let (mut xp, mut yp, mut left) = (x, y, n);
@@ -339,7 +399,7 @@ pub unsafe fn cdotu(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) 
 ///
 /// # Safety
 /// As [`sdot`], for `npy_cdouble` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn zdotu(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> C64v {
     let mut sum = [0.0f64, 0.0f64];
     let (mut xp, mut yp, mut left) = (x, y, n);
@@ -378,7 +438,7 @@ pub unsafe fn zdotu(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) 
 /// # Safety
 /// `x` and `y` must each address `n` in-bounds `npy_cdouble` elements spaced
 /// `incx`/`incy` elements apart, and `incx`/`incy` must be positive.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn zdotc(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> C64v {
     let mut sum = [0.0f64, 0.0f64];
     let (mut xp, mut yp, mut left) = (x, y, n);
@@ -419,7 +479,7 @@ pub unsafe fn zdotc(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) 
 ///
 /// # Safety
 /// As [`zdotc`], for `npy_cfloat` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn cdotc(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> C32 {
     let mut sum = [0.0f64, 0.0f64];
     let (mut xp, mut yp, mut left) = (x, y, n);
@@ -459,7 +519,7 @@ pub unsafe fn cdotc(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) 
 /// # Safety
 /// `matrix`, `vector`, and `out` must describe the complete BLAS extents
 /// encoded by the dimensions, leading dimension, and positive increments.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn sgemv(
     matrix: *const u8,
     matrix_col_major: bool,
@@ -499,7 +559,7 @@ pub unsafe fn sgemv(
 ///
 /// # Safety
 /// As [`sgemv`], for `f64` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn dgemv(
     matrix: *const u8,
     matrix_col_major: bool,
@@ -538,7 +598,7 @@ pub unsafe fn dgemv(
 ///
 /// # Safety
 /// As [`sgemv`], for `npy_cfloat` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn cgemv(
     matrix: *const u8,
     matrix_col_major: bool,
@@ -579,7 +639,7 @@ pub unsafe fn cgemv(
 ///
 /// # Safety
 /// As [`sgemv`], for `npy_cdouble` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn zgemv(
     matrix: *const u8,
     matrix_col_major: bool,
@@ -622,7 +682,7 @@ pub unsafe fn zgemv(
 /// # Safety
 /// `a`, `b`, and `out` must describe the complete BLAS matrix extents encoded
 /// by `m`, `n`, `k`, the transpose flags, and the leading dimensions.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn sgemm(
     a: *const u8,
     transpose_a: bool,
@@ -670,7 +730,7 @@ pub unsafe fn sgemm(
 ///
 /// # Safety
 /// As [`sgemm`], for `f64` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn dgemm(
     a: *const u8,
     transpose_a: bool,
@@ -717,7 +777,7 @@ pub unsafe fn dgemm(
 ///
 /// # Safety
 /// As [`sgemm`], for `npy_cfloat` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn cgemm(
     a: *const u8,
     transpose_a: bool,
@@ -766,7 +826,7 @@ pub unsafe fn cgemm(
 ///
 /// # Safety
 /// As [`sgemm`], for `npy_cdouble` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn zgemm(
     a: *const u8,
     transpose_a: bool,
@@ -817,7 +877,7 @@ pub unsafe fn zgemm(
 /// # Safety
 /// `x`, `y`, and `out` must satisfy the CBLAS matrix extents described by
 /// `n`, `m`, `lda`, and `ldb`; `out` must hold `m` writable `npy_cfloat`s.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn cgemm_vecmat(
     x: *const u8,
     lda: i64,
@@ -861,7 +921,7 @@ pub unsafe fn cgemm_vecmat(
 ///
 /// # Safety
 /// As [`cgemm_vecmat`], for `npy_cdouble` elements.
-#[cfg(all(target_os = "macos", target_vendor = "apple"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub unsafe fn zgemm_vecmat(
     x: *const u8,
     lda: i64,
@@ -900,7 +960,7 @@ pub unsafe fn zgemm_vecmat(
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -909,7 +969,7 @@ pub unsafe fn sdot(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: usi
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -918,7 +978,7 @@ pub unsafe fn ddot(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: usi
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -927,7 +987,7 @@ pub unsafe fn cdotu(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: us
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -936,17 +996,17 @@ pub unsafe fn zdotu(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: us
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub unsafe fn zdotc(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: usize) -> C64v {
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub unsafe fn cdotc(_x: *const u8, _incx: i64, _y: *const u8, _incy: i64, _n: usize) -> C32 {
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -965,7 +1025,7 @@ pub unsafe fn sgemv(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -984,7 +1044,7 @@ pub unsafe fn dgemv(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -1003,7 +1063,7 @@ pub unsafe fn cgemv(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -1022,7 +1082,7 @@ pub unsafe fn zgemv(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -1043,7 +1103,7 @@ pub unsafe fn sgemm(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -1064,7 +1124,7 @@ pub unsafe fn dgemm(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -1085,7 +1145,7 @@ pub unsafe fn cgemm(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 /// Unavailable off Apple platforms.
 ///
 /// # Safety
@@ -1106,7 +1166,7 @@ pub unsafe fn zgemm(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub unsafe fn cgemm_vecmat(
     _x: *const u8,
     _lda: i64,
@@ -1120,7 +1180,7 @@ pub unsafe fn cgemm_vecmat(
     unreachable!("HAVE_CBLAS is false off Apple platforms")
 }
 
-#[cfg(not(all(target_os = "macos", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub unsafe fn zgemm_vecmat(
     _x: *const u8,
     _lda: i64,

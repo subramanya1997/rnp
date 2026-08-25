@@ -181,6 +181,7 @@ dependencies = [
 name = "rnp-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "num-complex",
  "rayon",
 ]

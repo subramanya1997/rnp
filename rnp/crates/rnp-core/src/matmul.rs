@@ -702,7 +702,7 @@ macro_rules! float_elem {
                 incy: i64,
                 n: usize,
             ) -> Option<Self> {
-                if !crate::blas::HAVE_CBLAS {
+                if !crate::blas::have_cblas() {
                     return None;
                 }
                 // SAFETY: forwarded from this method's own strided-run
@@ -722,7 +722,7 @@ macro_rules! float_elem {
                 m: usize,
                 n: usize,
             ) -> Option<()> {
-                if !crate::blas::HAVE_CBLAS {
+                if !crate::blas::have_cblas() {
                     return None;
                 }
                 // SAFETY: forwarded from this method's own matrix/vector
@@ -747,7 +747,7 @@ macro_rules! float_elem {
                 n: usize,
                 k: usize,
             ) -> Option<()> {
-                if !crate::blas::HAVE_CBLAS {
+                if !crate::blas::have_cblas() {
                     return None;
                 }
                 // SAFETY: forwarded from this method's own matrix-extent
@@ -881,7 +881,7 @@ impl MatElem for C32 {
 
     #[inline]
     unsafe fn dot_blas(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> Option<C32> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own strided-run contract.
@@ -900,7 +900,7 @@ impl MatElem for C32 {
         m: usize,
         n: usize,
     ) -> Option<()> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own matrix/vector contract.
@@ -922,7 +922,7 @@ impl MatElem for C32 {
         n: usize,
         k: usize,
     ) -> Option<()> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own matrix-extent contract.
@@ -938,7 +938,7 @@ impl MatElem for C32 {
         incy: i64,
         n: usize,
     ) -> Option<C32> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own contract.
@@ -956,7 +956,7 @@ impl MatElem for C32 {
         n: usize,
         m: usize,
     ) -> Option<()> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own matrix-extent contract.
@@ -1005,7 +1005,7 @@ impl MatElem for C64v {
 
     #[inline]
     unsafe fn dot_blas(x: *const u8, incx: i64, y: *const u8, incy: i64, n: usize) -> Option<C64v> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own strided-run contract.
@@ -1024,7 +1024,7 @@ impl MatElem for C64v {
         m: usize,
         n: usize,
     ) -> Option<()> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own matrix/vector contract.
@@ -1046,7 +1046,7 @@ impl MatElem for C64v {
         n: usize,
         k: usize,
     ) -> Option<()> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own matrix-extent contract.
@@ -1062,7 +1062,7 @@ impl MatElem for C64v {
         incy: i64,
         n: usize,
     ) -> Option<C64v> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own contract.
@@ -1080,7 +1080,7 @@ impl MatElem for C64v {
         n: usize,
         m: usize,
     ) -> Option<()> {
-        if !crate::blas::HAVE_CBLAS {
+        if !crate::blas::have_cblas() {
             return None;
         }
         // SAFETY: forwarded from this method's own matrix-extent contract.
@@ -1105,8 +1105,8 @@ unsafe fn read<T: Copy>(base: *const u8, off: isize) -> T {
 /// The blocked inner loop. `a` has shape `loop ++ [rows, inner]`, `b` has
 /// `loop ++ [inner, cols]`, and `out` is a freshly allocated C-contiguous
 /// array whose element count is `nbatch * rows * cols`.
-/// `is_blasable2d` from `matmul.c.src`, verbatim. `BLAS_MAXSIZE` is
-/// `NPY_MAX_INT64 - 1` under ILP64, so the upper bound never bites here.
+/// `is_blasable2d` from `matmul.c.src`, using the selected platform ABI's
+/// `BLAS_MAXSIZE` (ILP64 on macOS and LP64 on Linux).
 fn is_blasable2d(
     byte_stride1: isize,
     byte_stride2: isize,
@@ -1115,11 +1115,7 @@ fn is_blasable2d(
     itemsize: usize,
 ) -> bool {
     let isz = itemsize as isize;
-    let blas_max = if isize::BITS == 64 {
-        isize::MAX - 1
-    } else {
-        isize::MAX
-    };
+    let blas_max = crate::blas::CBLAS_MAX_SIZE;
     if byte_stride2 != isz {
         return false;
     }
@@ -1169,11 +1165,7 @@ fn conjugating_route(
             let i1 = is_blasable2d(is1_n, itemsize as isize, dn, 1, itemsize);
             let i2c = is_blasable2d(is2_n, is2_m, dn, dm, itemsize);
             let i2f = is_blasable2d(is2_m, is2_n, dm, dn, itemsize);
-            let blas_max = if isize::BITS == 64 {
-                isize::MAX - 1
-            } else {
-                isize::MAX
-            };
+            let blas_max = crate::blas::CBLAS_MAX_SIZE;
             let too_big = dn > blas_max || dm > blas_max;
             if i1 && (i2c || i2f) && !too_big && dn > 1 && dm > 1 {
                 let isz = itemsize as isize;
@@ -1464,7 +1456,7 @@ fn try_plain_blas_single<T: MatElem>(
     bo: isize,
     dst: &mut [T],
 ) -> bool {
-    if !crate::blas::HAVE_CBLAS || !T::HAS_BLAS {
+    if !crate::blas::have_cblas() || !T::HAS_BLAS {
         return false;
     }
     let (r, k, c) = (p.rows as usize, p.inner as usize, p.cols as usize);
@@ -1477,11 +1469,7 @@ fn try_plain_blas_single<T: MatElem>(
     let a_base = a.buffer.as_ptr();
     let b_base = b.buffer.as_ptr();
     let out = dst.as_mut_ptr() as *mut u8;
-    let blas_max = if isize::BITS == 64 {
-        isize::MAX - 1
-    } else {
-        isize::MAX
-    };
+    let blas_max = crate::blas::CBLAS_MAX_SIZE;
 
     match kind {
         MatKind::VecDot => try_plain_dot_grid(

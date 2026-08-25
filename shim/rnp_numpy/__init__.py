@@ -63,6 +63,33 @@ from _rnp import where_ as where
 from _rnp import _dtype_table as _dtype_table
 import _rnp
 
+
+def _initialize_linux_blas():
+    """Load the OpenBLAS shared object bundled by the active NumPy wheel."""
+    if not _sys.platform.startswith("linux"):
+        return
+    from pathlib import Path as _Path
+
+    for _entry in _sys.path:
+        _library_dir = _Path(_entry or ".") / "numpy.libs"
+        try:
+            _candidates = sorted(
+                _library_dir.glob("libscipy_openblas*.so*"))
+        except OSError:
+            continue
+        for _library in _candidates:
+            try:
+                if _rnp._init_linux_blas(str(_library)):
+                    return
+            except RuntimeError:
+                # An absent library or symbol is a supported configuration:
+                # matmul remains on the transcribed pure-Rust implementation.
+                continue
+
+
+_initialize_linux_blas()
+del _initialize_linux_blas
+
 from . import exceptions
 from .exceptions import AxisError, ComplexWarning, DTypePromotionError, VisibleDeprecationWarning
 

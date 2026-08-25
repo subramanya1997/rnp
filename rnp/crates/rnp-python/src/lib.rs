@@ -51,6 +51,18 @@ fn _set_error_factories(d: Py<PyDict>) {
     let _ = ERROR_FACTORIES.set(d);
 }
 
+/// Initialize the Linux CBLAS backend from an exact NumPy wheel library path.
+///
+/// The Python shim discovers `numpy.libs/libscipy_openblas*.so` on `sys.path`
+/// and passes the selected candidate here during import. Loading remains
+/// explicit at the core boundary so bare `_rnp` users can do the same.
+#[pyfunction]
+fn _init_linux_blas(path: &str) -> PyResult<bool> {
+    rnp_core::blas::initialize_linux_openblas(std::path::Path::new(path))
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Ok(rnp_core::blas::have_cblas())
+}
+
 /// Build numpy's `_UFuncNoLoopError` through the shim's factory, falling back
 /// to the engine's own message when the shim has not registered one (which
 /// happens only if `_rnp` is used without the shim).
@@ -1326,6 +1338,7 @@ fn _rnp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(straggler::_c_concat, m)?)?;
 
     m.add_function(wrap_pyfunction!(_set_error_factories, m)?)?;
+    m.add_function(wrap_pyfunction!(_init_linux_blas, m)?)?;
 
     m.add_function(wrap_pyfunction!(zeros, m)?)?;
     m.add_function(wrap_pyfunction!(ones, m)?)?;
