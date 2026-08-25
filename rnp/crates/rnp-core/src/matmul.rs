@@ -849,19 +849,11 @@ impl MatElem for C32 {
     #[inline]
     fn acc_add(acc: C32, x: C32, y: C32) -> C32 {
         // The same real/imaginary split numpy's inner loop writes out.
-        let mut im = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let im = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             x.im * y.re + x.re * y.im
         } else {
             x.re * y.im + x.im * y.re
         };
-        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
-            && x.re.is_infinite()
-            && y.re.is_nan()
-            && x.im == 0.0
-            && y.im == 0.0
-        {
-            im = im.abs();
-        }
         C32::new(
             acc.re + (x.re * y.re - x.im * y.im),
             acc.im + im,
@@ -988,19 +980,11 @@ impl MatElem for C64v {
     }
     #[inline]
     fn acc_add(acc: C64v, x: C64v, y: C64v) -> C64v {
-        let mut im = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let im = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             x.im * y.re + x.re * y.im
         } else {
             x.re * y.im + x.im * y.re
         };
-        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
-            && x.re.is_infinite()
-            && y.re.is_nan()
-            && x.im == 0.0
-            && y.im == 0.0
-        {
-            im = im.abs();
-        }
         C64v::new(
             acc.re + (x.re * y.re - x.im * y.im),
             acc.im + im,
@@ -2366,6 +2350,34 @@ mod tests {
         }
         assert_eq!(gufunc_core_stride(16, 1), 0);
         assert_eq!(gufunc_core_stride(-16, 2), -16);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn length_one_complex_core_keeps_x86_nan_operand_order() {
+        for (lhs, rhs, imag_negative) in [
+            (
+                C64v::new(f64::NAN, 0.0),
+                C64v::new(f64::INFINITY, 0.0),
+                false,
+            ),
+            (
+                C64v::new(f64::INFINITY, 0.0),
+                C64v::new(f64::NAN, 0.0),
+                true,
+            ),
+        ] {
+            let mut a = NdArray::zeros(vec![1, 1], DType::C128).unwrap();
+            let mut b = NdArray::zeros(vec![1, 1], DType::C128).unwrap();
+            a.set_flat(0, Scalar::Complex(lhs));
+            b.set_flat(0, Scalar::Complex(rhs));
+            let result = matmul(MatKind::MatMul, &a, &b, None, None).unwrap();
+            let Scalar::Complex(got) = result.get_flat(0) else {
+                panic!("expected a complex result")
+            };
+            assert!(got.re.is_nan() && got.im.is_nan());
+            assert_eq!(got.im.is_sign_negative(), imag_negative);
+        }
     }
 
     /// float16 always reports. The BLAS-backed dtypes report as well on Linux,
