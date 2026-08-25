@@ -570,9 +570,15 @@ macro_rules! extreme_by_intrinsic {
     ($($t:ty),*) => {$(
         impl Extreme for $t {
             #[inline]
-            fn omax(self, o: Self) -> Self { <$t>::max(self, o) }
+            fn omax(self, o: Self) -> Self {
+                if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                    && self == 0.0 && o == 0.0 { o } else { <$t>::max(self, o) }
+            }
             #[inline]
-            fn omin(self, o: Self) -> Self { <$t>::min(self, o) }
+            fn omin(self, o: Self) -> Self {
+                if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                    && self == 0.0 && o == 0.0 { o } else { <$t>::min(self, o) }
+            }
         }
     )*};
 }
@@ -666,7 +672,9 @@ where
     }
     // numpy reduces min/max with the SIMD fmin/fmax, which prefer `-0.0` for
     // a minimum and `+0.0` for a maximum.
-    if (want_max && acc.is_neg_zero()) || (!want_max && acc.is_pos_zero()) {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && ((want_max && acc.is_neg_zero()) || (!want_max && acc.is_pos_zero()))
+    {
         for &v in s {
             if (want_max && v.is_pos_zero()) || (!want_max && v.is_neg_zero()) {
                 return v;
@@ -826,11 +834,21 @@ unsafe fn extreme_run(
                     } else if want_max {
                         v.elem_is_nan()
                             || !crate::ops::Cmp::c_le(v, b)
-                            || (b.is_neg_zero() && v.is_pos_zero())
+                            || if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                                (b.is_neg_zero() || b.is_pos_zero())
+                                    && (v.is_neg_zero() || v.is_pos_zero())
+                            } else {
+                                b.is_neg_zero() && v.is_pos_zero()
+                            }
                     } else {
                         v.elem_is_nan()
                             || !crate::ops::Cmp::c_le(b, v)
-                            || (b.is_pos_zero() && v.is_neg_zero())
+                            || if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                                (b.is_neg_zero() || b.is_pos_zero())
+                                    && (v.is_neg_zero() || v.is_pos_zero())
+                            } else {
+                                b.is_pos_zero() && v.is_neg_zero()
+                            }
                     };
                     if take {
                         cur = Some((v, i));
@@ -1704,16 +1722,23 @@ mod tests {
 
     #[test]
     fn signed_zero_extremes_match_numpy() {
-        // np.array([-0., 0.]).max() is +0.0 and .min() is -0.0, in either
-        // order, because numpy reduces with the SIMD fmin/fmax.
+        // macOS resolves zero ties by sign; Linux x86 keeps the later value.
         for v in [[-0.0, 0.0], [0.0, -0.0]] {
             let a = arr(&v, DType::F64);
             match reduce_all(&a, ReduceOp::Max).unwrap() {
-                Scalar::Float(f) => assert!(f == 0.0 && f.is_sign_positive()),
+                Scalar::Float(f) => {
+                    let negative = cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                        && v[1].is_sign_negative();
+                    assert!(f == 0.0 && f.is_sign_negative() == negative)
+                }
                 other => panic!("{other:?}"),
             }
             match reduce_all(&a, ReduceOp::Min).unwrap() {
-                Scalar::Float(f) => assert!(f == 0.0 && f.is_sign_negative()),
+                Scalar::Float(f) => {
+                    let negative = !cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                        || v[1].is_sign_negative();
+                    assert!(f == 0.0 && f.is_sign_negative() == negative)
+                }
                 other => panic!("{other:?}"),
             }
             // argmin/argmax still keep the first element.

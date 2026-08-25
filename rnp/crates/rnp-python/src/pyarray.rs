@@ -2028,9 +2028,10 @@ impl PyNdArray {
                 // numpy warns and yields NaN (NaN+NaNj for complex).
                 return match acc_dt {
                     DType::C64 | DType::C128 => {
-                        Scalar::Complex(num_complex::Complex::new(f64::NAN, f64::NAN))
+                        let nan = rnp_core::element::invalid_nan();
+                        Scalar::Complex(num_complex::Complex::new(nan, nan))
                     }
-                    d => Scalar::Float(f64::NAN).cast(d),
+                    d => Scalar::Float(rnp_core::element::invalid_nan()).cast(d),
                 };
             }
             #[allow(unused_assignments)]

@@ -525,6 +525,7 @@ macro_rules! impl_float_ops {
                 else if o.is_nan() { o }
                 else if self < o { self }
                 else if o < self { o }
+                else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { o }
                 else if self.is_sign_negative() { self } else { o }
             }
             #[inline] fn m_max(self, o: Self) -> Self {
@@ -532,6 +533,7 @@ macro_rules! impl_float_ops {
                 else if o.is_nan() { o }
                 else if self > o { self }
                 else if o > self { o }
+                else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { o }
                 else if self.is_sign_negative() { o } else { self }
             }
             #[inline] fn m_fmin(self, o: Self) -> Self {
@@ -539,6 +541,7 @@ macro_rules! impl_float_ops {
                 else if o.is_nan() { self }
                 else if self < o { self }
                 else if o < self { o }
+                else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { o }
                 else if self.is_sign_negative() { self } else { o }
             }
             #[inline] fn m_fmax(self, o: Self) -> Self {
@@ -546,6 +549,7 @@ macro_rules! impl_float_ops {
                 else if o.is_nan() { self }
                 else if self > o { self }
                 else if o > self { o }
+                else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { o }
                 else if self.is_sign_negative() { o } else { self }
             }
         }
@@ -2221,6 +2225,7 @@ where
     }
 }
 
+
 /// Complex `power`, transcribed from numpy's `npy_cpow`.
 pub trait CplxPow: Copy {
     fn c_pow(self, o: Self) -> Self;
@@ -2637,10 +2642,17 @@ mod tests {
         assert_eq!(MinMax::m_min(nz, z).0, 0x8000);
         assert_eq!(MinMax::m_fmax(nz, z).0, 0x8000);
         assert_eq!(MinMax::m_fmin(z, nz).0, 0x0000);
-        // The wider types keep numpy's sign-based rule.
+        // Wider Linux array loops keep the second operand on a zero tie;
+        // macOS resolves the tie by sign.
         assert!(MinMax::m_max(-0.0f64, 0.0f64).is_sign_positive());
-        assert!(MinMax::m_max(0.0f64, -0.0f64).is_sign_positive());
-        assert!(MinMax::m_min(-0.0f64, 0.0f64).is_sign_negative());
+        assert_eq!(
+            MinMax::m_max(0.0f64, -0.0f64).is_sign_negative(),
+            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        );
+        assert_eq!(
+            MinMax::m_min(-0.0f64, 0.0f64).is_sign_positive(),
+            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        );
         assert!(MinMax::m_min(0.0f64, -0.0f64).is_sign_negative());
     }
 
@@ -3090,4 +3102,3 @@ where
         other => panic!("complex has no loop for {}", other.name()),
     }
 }
-

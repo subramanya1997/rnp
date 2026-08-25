@@ -7,6 +7,19 @@ use num_complex::Complex;
 pub type C32 = Complex<f32>;
 pub type C64v = Complex<f64>;
 
+/// Canonical invalid-result NaN produced by NumPy's platform loops.
+#[inline]
+pub fn invalid_nan() -> f64 {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        f64::from_bits(0xfff8_0000_0000_0000)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        f64::NAN
+    }
+}
+
 /// A single element value, held losslessly in the widest representation of
 /// its category.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -727,6 +740,15 @@ mod tests {
     #[test]
     fn float_downcast_overflows_to_infinity() {
         assert_eq!(f32::from_scalar(Scalar::Float(1e300)), f32::INFINITY);
+    }
+
+    #[test]
+    fn invalid_nan_has_the_platform_sign() {
+        assert!(invalid_nan().is_nan());
+        assert_eq!(
+            invalid_nan().is_sign_negative(),
+            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        );
     }
 }
 

@@ -509,7 +509,7 @@ pub trait FloatUn: Element + FpClass {
 }
 
 macro_rules! impl_float_un {
-    ($t:ty, $pi:expr, $sin:path, $cos:path) => {
+    ($t:ty, $pi:expr, $sin:path, $cos:path, $invalid_nan:expr) => {
         impl FloatUn for $t {
             #[inline]
             fn fu(self, op: UnOp) -> Self {
@@ -548,8 +548,14 @@ macro_rules! impl_float_un {
                     Sin => $sin(x),
                     Cos => $cos(x),
                     Tan => x.tan(),
-                    Arcsin => x.asin(),
-                    Arccos => x.acos(),
+                    Arcsin => {
+                        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                            && x.abs() > 1.0 { $invalid_nan } else { x.asin() }
+                    }
+                    Arccos => {
+                        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                            && x.abs() > 1.0 { $invalid_nan } else { x.acos() }
+                    }
                     Arctan => x.atan(),
                     Sinh => x.sinh(),
                     Cosh => x.cosh(),
@@ -588,9 +594,21 @@ macro_rules! impl_float_un {
     };
 }
 
-impl_float_un!(f64, std::f64::consts::PI, f64::sin, f64::cos);
+impl_float_un!(
+    f64,
+    std::f64::consts::PI,
+    f64::sin,
+    f64::cos,
+    f64::from_bits(0xfff8_0000_0000_0000)
+);
 // numpy's float32 `sin`/`cos` are its own vectorised polynomial, not `sinf`.
-impl_float_un!(f32, std::f32::consts::PI, np_sin_f32, np_cos_f32);
+impl_float_un!(
+    f32,
+    std::f32::consts::PI,
+    np_sin_f32,
+    np_cos_f32,
+    f32::from_bits(0xffc0_0000)
+);
 
 impl FloatUn for F16 {
     #[inline]
@@ -1331,6 +1349,16 @@ mod tests {
         assert!(get_f(&l, 0) == f64::NEG_INFINITY);
         assert!(get_f(&l, 1).is_nan());
         assert_eq!(get_f(&l, 2), 0.0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn inverse_trig_domain_nan_is_negative_on_manylinux() {
+        assert_eq!(
+            FloatUn::fu(2.0f64, UnOp::Arcsin).to_bits(),
+            0xfff8_0000_0000_0000
+        );
+        assert_eq!(FloatUn::fu(2.0f32, UnOp::Arccos).to_bits(), 0xffc0_0000);
     }
 
     #[test]
