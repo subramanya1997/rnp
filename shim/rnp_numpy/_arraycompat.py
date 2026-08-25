@@ -893,6 +893,16 @@ def array_wrap(self, array, context=None, return_scalar=False):
 
 
 def setitem(self, key, value):
+    # Plain numeric scalar scatter needs none of the structured, datetime,
+    # overlap, string, or object compatibility handling below.  Keep cast
+    # status reporting, but otherwise stay on the native indexing path.
+    if (type(self) is ndarray and type(key) is ndarray
+            and self.dtype.kind in "biufc" and key.dtype.kind in "biu"
+            and type(value) in (int, float, complex, _b.bool)):
+        result = _orig_setitem(self, key, value)
+        from . import _errstate
+        _errstate.drain("cast", stacklevel=3)
+        return result
     _check_advanced_index_size(key)
     if (getattr(type(value), "_rnp_unavailable_user_dtype", False)
             and self.dtype.kind != "O"):
