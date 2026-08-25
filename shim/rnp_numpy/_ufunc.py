@@ -520,6 +520,27 @@ class ufunc:
                 if isinstance(res, ndarray) and res.ndim == 0:
                     return res[()]
                 return res
+        # The matching ordinary-ufunc hot path.  Exact ndarrays and builtin
+        # numeric scalars cannot request an __array_ufunc__ override, and the
+        # default call needs no output wrapping or option resolution.  Object
+        # and string loops reject the native route and fall through.
+        if (self.signature is None and self.nin == 2 and len(args) == 2
+                and out is None and where is _UNSET
+                and casting == "same_kind" and order == "K"
+                and dtype is None and subok is True and signature is None
+                and axes is None and axis is None and keepdims is None
+                and (type(args[0]) is ndarray or type(args[1]) is ndarray)
+                and type(args[0]) in (ndarray, int, float, complex, bool)
+                and type(args[1]) in (ndarray, int, float, complex, bool)):
+            try:
+                res = _rnp._ufunc_call(
+                    self.__name__, args, out=None, where_=True,
+                    casting="same_kind", dtype=None)
+            except NotImplementedError:
+                pass
+            else:
+                _errstate.drain(self.__name__)
+                return res
         if not isinstance(casting, str):
             raise TypeError(
                 f"casting must be str, not {type(casting).__name__}")
