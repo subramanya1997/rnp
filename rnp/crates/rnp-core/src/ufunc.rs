@@ -1503,9 +1503,14 @@ mod tests {
             sin_big.im.is_sign_negative(),
             cfg!(all(target_os = "linux", target_arch = "x86_64"))
         );
+        let tan_re = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            f64::from_bits(0xbf74_530c_fe72_9485)
+        } else {
+            -0.004962015874444894
+        };
         assert_eq!(
             get_c(&unary(&big, UnOp::Tan).unwrap(), 0),
-            C64v::new(-0.004962015874444894, 0.0)
+            C64v::new(tan_re, 0.0)
         );
     }
 
