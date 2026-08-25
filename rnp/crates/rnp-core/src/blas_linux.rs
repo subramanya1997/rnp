@@ -7,100 +7,100 @@ use std::sync::OnceLock;
 
 use crate::element::{C64v, C32};
 
-type Sdot = unsafe extern "C" fn(i32, *const f32, i32, *const f32, i32) -> f32;
-type Ddot = unsafe extern "C" fn(i32, *const f64, i32, *const f64, i32) -> f64;
-type Cdot = unsafe extern "C" fn(i32, *const c_void, i32, *const c_void, i32, *mut c_void);
+type Sdot = unsafe extern "C" fn(i64, *const f32, i64, *const f32, i64) -> f32;
+type Ddot = unsafe extern "C" fn(i64, *const f64, i64, *const f64, i64) -> f64;
+type Cdot = unsafe extern "C" fn(i64, *const c_void, i64, *const c_void, i64, *mut c_void);
 
 type Sgemv = unsafe extern "C" fn(
     i32,
     i32,
-    i32,
-    i32,
+    i64,
+    i64,
     f32,
     *const f32,
-    i32,
+    i64,
     *const f32,
-    i32,
+    i64,
     f32,
     *mut f32,
-    i32,
+    i64,
 );
 type Dgemv = unsafe extern "C" fn(
     i32,
     i32,
-    i32,
-    i32,
+    i64,
+    i64,
     f64,
     *const f64,
-    i32,
+    i64,
     *const f64,
-    i32,
+    i64,
     f64,
     *mut f64,
-    i32,
+    i64,
 );
 type Cgemv = unsafe extern "C" fn(
     i32,
     i32,
-    i32,
-    i32,
+    i64,
+    i64,
     *const c_void,
     *const c_void,
-    i32,
+    i64,
     *const c_void,
-    i32,
+    i64,
     *const c_void,
     *mut c_void,
-    i32,
+    i64,
 );
 
 type Sgemm = unsafe extern "C" fn(
     i32,
     i32,
     i32,
-    i32,
-    i32,
-    i32,
+    i64,
+    i64,
+    i64,
     f32,
     *const f32,
-    i32,
+    i64,
     *const f32,
-    i32,
+    i64,
     f32,
     *mut f32,
-    i32,
+    i64,
 );
 type Dgemm = unsafe extern "C" fn(
     i32,
     i32,
     i32,
-    i32,
-    i32,
-    i32,
+    i64,
+    i64,
+    i64,
     f64,
     *const f64,
-    i32,
+    i64,
     *const f64,
-    i32,
+    i64,
     f64,
     *mut f64,
-    i32,
+    i64,
 );
 type Cgemm = unsafe extern "C" fn(
     i32,
     i32,
     i32,
-    i32,
-    i32,
-    i32,
+    i64,
+    i64,
+    i64,
     *const c_void,
     *const c_void,
-    i32,
+    i64,
     *const c_void,
-    i32,
+    i64,
     *const c_void,
     *mut c_void,
-    i32,
+    i64,
 );
 
 macro_rules! lapack_api {
@@ -331,8 +331,8 @@ unsafe fn symbol<T: Copy>(handle: *mut c_void, name: &'static [u8]) -> Result<T,
             dlerror_message()
         ));
     }
-    // SAFETY: every caller supplies the exact C signature for the named LP64
-    // CBLAS function. POSIX specifies that a `dlsym` result for a function can
+    // SAFETY: every caller supplies the exact C signature for the named ILP64
+    // BLAS/LAPACK function. POSIX specifies that a `dlsym` result can
     // be converted to the corresponding function pointer and invoked.
     Ok(unsafe { std::mem::transmute_copy(&pointer) })
 }
@@ -349,20 +349,20 @@ impl Api {
 
         Ok(Self {
             handle: handle as usize,
-            sdot: get!("scipy_cblas_sdot", Sdot),
-            ddot: get!("scipy_cblas_ddot", Ddot),
-            cdotu: get!("scipy_cblas_cdotu_sub", Cdot),
-            zdotu: get!("scipy_cblas_zdotu_sub", Cdot),
-            cdotc: get!("scipy_cblas_cdotc_sub", Cdot),
-            zdotc: get!("scipy_cblas_zdotc_sub", Cdot),
-            sgemv: get!("scipy_cblas_sgemv", Sgemv),
-            dgemv: get!("scipy_cblas_dgemv", Dgemv),
-            cgemv: get!("scipy_cblas_cgemv", Cgemv),
-            zgemv: get!("scipy_cblas_zgemv", Cgemv),
-            sgemm: get!("scipy_cblas_sgemm", Sgemm),
-            dgemm: get!("scipy_cblas_dgemm", Dgemm),
-            cgemm: get!("scipy_cblas_cgemm", Cgemm),
-            zgemm: get!("scipy_cblas_zgemm", Cgemm),
+            sdot: get!("scipy_cblas_sdot64_", Sdot),
+            ddot: get!("scipy_cblas_ddot64_", Ddot),
+            cdotu: get!("scipy_cblas_cdotu_sub64_", Cdot),
+            zdotu: get!("scipy_cblas_zdotu_sub64_", Cdot),
+            cdotc: get!("scipy_cblas_cdotc_sub64_", Cdot),
+            zdotc: get!("scipy_cblas_zdotc_sub64_", Cdot),
+            sgemv: get!("scipy_cblas_sgemv64_", Sgemv),
+            dgemv: get!("scipy_cblas_dgemv64_", Dgemv),
+            cgemv: get!("scipy_cblas_cgemv64_", Cgemv),
+            zgemv: get!("scipy_cblas_zgemv64_", Cgemv),
+            sgemm: get!("scipy_cblas_sgemm64_", Sgemm),
+            dgemm: get!("scipy_cblas_dgemm64_", Dgemm),
+            cgemm: get!("scipy_cblas_cgemm64_", Cgemm),
+            zgemm: get!("scipy_cblas_zgemm64_", Cgemm),
             lapack: {
                 // SAFETY: `handle` is live and `LapackApi::load` validates
                 // every required ILP64 symbol before returning.
@@ -422,21 +422,15 @@ fn api() -> &'static Api {
         .expect("Linux CBLAS call requires initialize_linux_openblas")
 }
 
-#[inline]
-fn lp64(value: i64) -> i32 {
-    debug_assert!((0..=i32::MAX as i64).contains(&value));
-    value as i32
-}
-
 pub unsafe fn cblas_sdot(n: i64, x: *const f32, incx: i64, y: *const f32, incy: i64) -> f32 {
-    // SAFETY: the public BLAS wrapper guarantees the pointer extents; LP64
-    // chunking and stride validation keep every integer representable.
-    unsafe { (api().sdot)(lp64(n), x, lp64(incx), y, lp64(incy)) }
+    // SAFETY: the public BLAS wrapper guarantees the pointer extents and all
+    // dimensions use the loaded ILP64 interface.
+    unsafe { (api().sdot)(n, x, incx, y, incy) }
 }
 
 pub unsafe fn cblas_ddot(n: i64, x: *const f64, incx: i64, y: *const f64, incy: i64) -> f64 {
     // SAFETY: as `cblas_sdot`, for f64 elements.
-    unsafe { (api().ddot)(lp64(n), x, lp64(incx), y, lp64(incy)) }
+    unsafe { (api().ddot)(n, x, incx, y, incy) }
 }
 
 macro_rules! complex_dot {
@@ -450,8 +444,8 @@ macro_rules! complex_dot {
             out: *mut c_void,
         ) {
             // SAFETY: the public BLAS wrapper guarantees both strided inputs
-            // and one writable complex output; LP64 values were validated.
-            unsafe { (api().$field)(lp64(n), x, lp64(incx), y, lp64(incy), out) }
+            // and one writable complex output; the ABI uses i64 dimensions.
+            unsafe { (api().$field)(n, x, incx, y, incy, out) }
         }
     };
 }
@@ -479,21 +473,21 @@ macro_rules! real_gemv {
             incy: i64,
         ) {
             // SAFETY: the public wrapper guarantees the BLAS extents and
-            // writable output; every integer fits the LP64 ABI.
+            // writable output; every dimension uses the ILP64 ABI.
             unsafe {
                 (api().$field)(
                     order,
                     trans,
-                    lp64(m),
-                    lp64(n),
+                    m,
+                    n,
                     alpha,
                     a,
-                    lp64(lda),
+                    lda,
                     x,
-                    lp64(incx),
+                    incx,
                     beta,
                     y,
-                    lp64(incy),
+                    incy,
                 )
             }
         }
@@ -521,21 +515,21 @@ macro_rules! complex_gemv {
             incy: i64,
         ) {
             // SAFETY: the public wrapper guarantees all buffers and live
-            // complex scalars; every integer fits the LP64 ABI.
+            // complex scalars; every dimension uses the ILP64 ABI.
             unsafe {
                 (api().$field)(
                     order,
                     trans,
-                    lp64(m),
-                    lp64(n),
+                    m,
+                    n,
                     alpha,
                     a,
-                    lp64(lda),
+                    lda,
                     x,
-                    lp64(incx),
+                    incx,
                     beta,
                     y,
-                    lp64(incy),
+                    incy,
                 )
             }
         }
@@ -565,23 +559,23 @@ macro_rules! real_gemm {
             ldc: i64,
         ) {
             // SAFETY: the public wrapper guarantees all matrix extents and
-            // writable output; every integer fits the LP64 ABI.
+            // writable output; every dimension uses the ILP64 ABI.
             unsafe {
                 (api().$field)(
                     order,
                     trans_a,
                     trans_b,
-                    lp64(m),
-                    lp64(n),
-                    lp64(k),
+                    m,
+                    n,
+                    k,
                     alpha,
                     a,
-                    lp64(lda),
+                    lda,
                     b,
-                    lp64(ldb),
+                    ldb,
                     beta,
                     c,
-                    lp64(ldc),
+                    ldc,
                 )
             }
         }
@@ -611,23 +605,23 @@ macro_rules! complex_gemm {
             ldc: i64,
         ) {
             // SAFETY: the public wrapper guarantees matrix and scalar pointer
-            // validity; every integer fits the LP64 ABI.
+            // validity; every dimension uses the ILP64 ABI.
             unsafe {
                 (api().$field)(
                     order,
                     trans_a,
                     trans_b,
-                    lp64(m),
-                    lp64(n),
-                    lp64(k),
+                    m,
+                    n,
+                    k,
                     alpha,
                     a,
-                    lp64(lda),
+                    lda,
                     b,
-                    lp64(ldb),
+                    ldb,
                     beta,
                     c,
-                    lp64(ldc),
+                    ldc,
                 )
             }
         }

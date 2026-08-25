@@ -19,7 +19,7 @@
 //!
 //! On Linux x86-64, [`initialize_linux_openblas`] must be called with the exact
 //! `numpy.libs/libscipy_openblas*.so` bundled beside the imported manylinux
-//! wheel. The loader resolves that wheel's LP64 `scipy_cblas_*` symbols and
+//! wheel. The loader resolves that wheel's ILP64 `scipy_cblas_*64_` symbols and
 //! only publishes the backend after every symbol used below is present. Until
 //! then, [`have_cblas`] is false and `matmul` uses its transcribed Rust paths.
 
@@ -31,12 +31,11 @@ const CBLAS_NO_TRANS: i32 = 111;
 const CBLAS_TRANS: i32 = 112;
 const CBLAS_CONJ_TRANS: i32 = 113;
 
-/// numpy's `NPY_CBLAS_CHUNK` for the selected ABI. Accelerate uses ILP64;
-/// the manylinux backend requested by the runtime initializer uses LP64.
+/// numpy's `NPY_CBLAS_CHUNK` for the selected ILP64 ABI.
 #[cfg(target_os = "macos")]
 pub const NPY_CBLAS_CHUNK: usize = isize::MAX as usize;
 #[cfg(target_os = "linux")]
-pub const NPY_CBLAS_CHUNK: usize = 1usize << 30;
+pub const NPY_CBLAS_CHUNK: usize = isize::MAX as usize;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub const NPY_CBLAS_CHUNK: usize = 0;
 
@@ -45,7 +44,7 @@ pub const NPY_CBLAS_CHUNK: usize = 0;
 #[cfg(target_os = "macos")]
 pub const CBLAS_MAX_SIZE: isize = isize::MAX - 1;
 #[cfg(target_os = "linux")]
-pub const CBLAS_MAX_SIZE: isize = i32::MAX as isize;
+pub const CBLAS_MAX_SIZE: isize = isize::MAX - 1;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub const CBLAS_MAX_SIZE: isize = 0;
 
@@ -56,9 +55,7 @@ pub const CBLAS_MAX_SIZE: isize = 0;
 pub fn blas_stride(byte_stride: isize, itemsize: usize) -> Option<i64> {
     if byte_stride > 0 && byte_stride % itemsize as isize == 0 {
         let stride = (byte_stride / itemsize as isize) as i64;
-        if !cfg!(target_os = "linux") || stride <= i32::MAX as i64 {
-            return Some(stride);
-        }
+        return Some(stride);
     }
     None
 }
@@ -67,7 +64,7 @@ pub fn blas_stride(byte_stride: isize, itemsize: usize) -> Option<i64> {
 ///
 /// This is always true for the linked Accelerate backend. On Linux it becomes
 /// true only after [`initialize_linux_openblas`] has loaded and validated all
-/// required LP64 symbols. Other platforms remain on the Rust fallback.
+/// required ILP64 symbols. Other platforms remain on the Rust fallback.
 #[inline]
 pub fn have_cblas() -> bool {
     #[cfg(target_os = "macos")]
