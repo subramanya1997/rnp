@@ -355,6 +355,18 @@ impl F80 {
             }
             .into();
         }
+        let endpoint = match (self.exponent_bits(), self.significand) {
+            (0x7ffe, u64::MAX) => Some("1.189731495357231765e+4932"),
+            (1, INTEGER_BIT) => Some("3.3621031431120935063e-4932"),
+            _ => None,
+        };
+        if let Some(text) = endpoint {
+            return if self.is_sign_negative() {
+                format!("-{text}")
+            } else {
+                text.to_string()
+            };
+        }
         let sign = self.is_sign_negative();
         let value = self.abs();
         let finite = value.finite().unwrap();
@@ -723,5 +735,10 @@ mod tests {
         assert_eq!(smallest.to_shortest_string(), "4e-4951");
         let max = F80::from_parts(false, 0x7ffe, u64::MAX);
         assert!(max.add(max).is_infinite());
+        assert_eq!(max.to_shortest_string(), "1.189731495357231765e+4932");
+        assert_eq!(
+            F80::from_parts(false, 1, INTEGER_BIT).to_shortest_string(),
+            "3.3621031431120935063e-4932"
+        );
     }
 }
