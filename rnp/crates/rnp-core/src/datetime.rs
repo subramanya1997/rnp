@@ -73,6 +73,47 @@ pub fn parse_unit(s: &str) -> Option<u8> {
     }
 }
 
+/// NumPy's `convert_datetime_divisor_to_multiple`: translate metadata such
+/// as `Y/4` into an integral multiple of a smaller unit (`3M`).
+pub fn divisor_to_multiple(meta: DtMeta, den: u32) -> Result<DtMeta> {
+    if den == 0 {
+        return Err(Error::ValueError(
+            "divisor (0) is not a multiple of a lower-unit in datetime metadata".into(),
+        ));
+    }
+    if meta.is_generic() {
+        return Err(Error::ValueError(
+            "Can't use 'den' divisor with generic units".into(),
+        ));
+    }
+    let choices: &[(u32, u8)] = match meta.base {
+        UNIT_Y => &[(12, UNIT_M), (52, UNIT_W), (365, UNIT_D)],
+        UNIT_M => &[(4, UNIT_W), (30, UNIT_D), (720, UNIT_H)],
+        UNIT_W => &[(7, UNIT_D), (168, UNIT_H), (10_080, UNIT_MIN)],
+        UNIT_D => &[(24, UNIT_H), (1_440, UNIT_MIN), (86_400, UNIT_S)],
+        UNIT_H => &[(60, UNIT_MIN), (3_600, UNIT_S)],
+        UNIT_MIN => &[(60, UNIT_S), (60_000, UNIT_MS)],
+        UNIT_S => &[(1_000, UNIT_MS), (1_000_000, UNIT_US)],
+        UNIT_MS => &[(1_000, UNIT_US), (1_000_000, UNIT_NS)],
+        UNIT_US => &[(1_000, UNIT_NS), (1_000_000, UNIT_PS)],
+        UNIT_NS => &[(1_000, UNIT_PS), (1_000_000, UNIT_FS)],
+        UNIT_PS => &[(1_000, UNIT_FS), (1_000_000, UNIT_AS)],
+        UNIT_FS => &[(1_000, UNIT_AS)],
+        UNIT_AS | _ => &[],
+    };
+    for &(factor, base) in choices {
+        if factor % den == 0 {
+            let num = meta.num.checked_mul(factor / den).ok_or_else(|| {
+                Error::OverflowError("datetime metadata multiplier overflow".into())
+            })?;
+            return Ok(DtMeta::new(base, num));
+        }
+    }
+    Err(Error::ValueError(format!(
+        "divisor ({den}) is not a multiple of a lower-unit in datetime metadata"
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------

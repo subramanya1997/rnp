@@ -4,6 +4,7 @@
 pub mod array;
 pub mod blas;
 pub mod buffer;
+pub mod busday;
 pub mod casting;
 pub mod datetime;
 pub mod datetime_ops;
