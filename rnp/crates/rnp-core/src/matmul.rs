@@ -849,9 +849,22 @@ impl MatElem for C32 {
     #[inline]
     fn acc_add(acc: C32, x: C32, y: C32) -> C32 {
         // The same real/imaginary split numpy's inner loop writes out.
+        let mut im = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            x.im * y.re + x.re * y.im
+        } else {
+            x.re * y.im + x.im * y.re
+        };
+        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            && x.re.is_infinite()
+            && y.re.is_nan()
+            && x.im == 0.0
+            && y.im == 0.0
+        {
+            im = im.abs();
+        }
         C32::new(
             acc.re + (x.re * y.re - x.im * y.im),
-            acc.im + (x.re * y.im + x.im * y.re),
+            acc.im + im,
         )
     }
     #[inline]
@@ -975,9 +988,22 @@ impl MatElem for C64v {
     }
     #[inline]
     fn acc_add(acc: C64v, x: C64v, y: C64v) -> C64v {
+        let mut im = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            x.im * y.re + x.re * y.im
+        } else {
+            x.re * y.im + x.im * y.re
+        };
+        if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            && x.re.is_infinite()
+            && y.re.is_nan()
+            && x.im == 0.0
+            && y.im == 0.0
+        {
+            im = im.abs();
+        }
         C64v::new(
             acc.re + (x.re * y.re - x.im * y.im),
-            acc.im + (x.re * y.im + x.im * y.re),
+            acc.im + im,
         )
     }
     #[inline]
@@ -1846,6 +1872,15 @@ pub fn matmul(
     } else {
         ConjRoute::Scalar
     };
+    // NumPy's x86 OpenBLAS kernels preserve the calling thread's IEEE status
+    // register; Apple Accelerate explicitly does not. Bracket the Linux
+    // floating BLAS family exactly where NumPy's gufunc loop does so Python's
+    // errstate layer receives invalid/overflow from matmul and vecmat.
+    let collect_hw_fpe = cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && matches!(dt, DType::F32 | DType::F64 | DType::C64 | DType::C128);
+    if collect_hw_fpe {
+        crate::fpe::hw_clear();
+    }
     match dt {
         DType::Bool => kernel::<NpBool>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
         DType::I8 => kernel::<i8>(kind, &av, &bv, &mut out, false, ConjRoute::Scalar, &p),
@@ -1883,6 +1918,9 @@ pub fn matmul(
                 &[&a.dtype().name(), &b.dtype().name()],
             ))
         }
+    }
+    if collect_hw_fpe {
+        crate::fpe::raise(crate::fpe::hw_take());
     }
     out.update_flags();
     Ok(out)
@@ -2330,9 +2368,9 @@ mod tests {
         assert_eq!(gufunc_core_stride(-16, 2), -16);
     }
 
-    /// float16 is the only dtype whose matmul loop numpy leaves the FP status
-    /// of (every other floating loop is compiled with `USEBLAS` and ends by
-    /// clearing the status when the platform BLAS does not preserve it).
+    /// float16 always reports. The BLAS-backed dtypes report as well on Linux,
+    /// whose OpenBLAS preserves the floating-point environment, but stay
+    /// silent with Apple Accelerate.
     #[test]
     fn float16_reports_fp_status() {
         let mut a = NdArray::zeros(vec![1, 2], DType::F16).unwrap();
@@ -2359,11 +2397,23 @@ mod tests {
         assert_eq!(crate::fpe::take() & crate::fpe::OVER, crate::fpe::OVER);
         assert!(r.get_flat(0).as_f64().is_infinite());
 
-        // The other dtypes stay silent, because numpy's do.
-        let x = NdArray::ones(vec![2, 2], DType::F64).unwrap();
+        let mut x = NdArray::zeros(vec![1, 1], DType::F64).unwrap();
+        let mut y = NdArray::zeros(vec![1, 1], DType::F64).unwrap();
+        x.set_flat(0, Scalar::Float(f64::INFINITY));
         crate::fpe::clear();
-        let _ = matmul(MatKind::MatMul, &x, &x, None, None).unwrap();
-        assert_eq!(crate::fpe::take(), 0);
+        let _ = matmul(MatKind::MatMul, &x, &y, None, None).unwrap();
+        let invalid = crate::fpe::take() & crate::fpe::INVALID;
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert_eq!(invalid, crate::fpe::INVALID);
+
+            x.set_flat(0, Scalar::Float(f64::MAX));
+            y.set_flat(0, Scalar::Float(2.0));
+            crate::fpe::clear();
+            let _ = matmul(MatKind::MatMul, &x, &y, None, None).unwrap();
+            assert_eq!(crate::fpe::take() & crate::fpe::OVER, crate::fpe::OVER);
+        } else {
+            assert_eq!(invalid, 0);
+        }
     }
 
     #[test]

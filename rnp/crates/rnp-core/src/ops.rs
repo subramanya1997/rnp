@@ -1300,10 +1300,20 @@ macro_rules! impl_complex_ops {
             // while NumPy's x86-64 loop keeps separate multiply/add rounding.
             #[inline] fn a_mul(self, o: Self) -> Self {
                 if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-                    <$t>::new(
-                        self.re * o.re - self.im * o.im,
-                        self.im * o.re + self.re * o.im,
-                    )
+                    let mut im = self.im * o.re + self.re * o.im;
+                    // GCC's x86 loop leaves this one invalid-product family
+                    // with a positive NaN. Reordering the sum fixes the
+                    // symmetric `nan * inf` family but not `inf * nan`, so
+                    // preserve NumPy's observed exceptional normalization
+                    // without changing the other (often negative) NaNs.
+                    if self.re.is_infinite()
+                        && o.re.is_nan()
+                        && self.im == 0.0
+                        && o.im == 0.0
+                    {
+                        im = im.abs();
+                    }
+                    <$t>::new(self.re * o.re - self.im * o.im, im)
                 } else {
                     <$t>::new(
                         self.re.mul_add(o.re, -(self.im * o.im)),
@@ -2839,6 +2849,13 @@ mod tests {
             );
             assert!(nan_inf.re.is_nan() && nan_inf.im.is_nan());
             assert!(nan_inf.im.is_sign_positive());
+
+            let inf_nan = Arith::a_mul(
+                C64v::new(f64::INFINITY, 0.0),
+                C64v::new(f64::NAN, 0.0),
+            );
+            assert!(inf_nan.re.is_nan() && inf_nan.im.is_nan());
+            assert!(inf_nan.im.is_sign_positive());
         }
     }
 
