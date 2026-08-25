@@ -17,6 +17,7 @@ abc module from the stdlib, hence it is only available for Python >= 2.6.
 import abc
 import numbers
 import os
+import warnings
 from collections.abc import Callable
 
 import rnp_numpy as np
@@ -78,8 +79,15 @@ class ABCPolyBase(abc.ABC):
     # Not hashable
     __hash__ = None
 
-    # Opt out of numpy ufuncs and Python ops with ndarray subclasses.
-    __array_ufunc__ = None
+    # Opt out of numpy ufuncs and Python ops with ndarray subclasses.  NumPy
+    # uses ``__array_ufunc__ = None`` for this, but rnp's ufunc dispatcher
+    # currently treats that sentinel as if no override were present.  A
+    # callable hard opt-out preserves the public behavior in this shim.
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        raise TypeError(
+            f"operand '{type(self).__name__}' does not support ufuncs "
+            f"(__array_ufunc__=None)"
+        )
 
     # Limit runaway size. T_n^m has degree n*m
     maxpower = 100
@@ -563,6 +571,16 @@ class ABCPolyBase(abc.ABC):
         # there is no true divide if the rhs is not a Number, although it
         # could return the first n elements of an infinite series.
         # It is hard to see where n would come from, though.
+        if isinstance(other, np.timedelta64):
+            warnings.warn(
+                "The 'generic' unit for NumPy timedelta is deprecated, and "
+                "will raise an error in the future. This includes implicit "
+                "conversion of bare integers (e.g. `+ 1`).Please use a "
+                "specific unit instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            other = other.astype(float)
         if not isinstance(other, numbers.Number) or isinstance(other, bool):
             raise TypeError(
                 f"unsupported types for true division: "

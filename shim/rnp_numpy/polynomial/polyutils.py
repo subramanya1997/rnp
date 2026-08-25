@@ -357,10 +357,16 @@ def mapdomain(x, old, new):
     array([-1.0+1.j , -0.6+0.6j, -0.2+0.2j,  0.2-0.2j,  0.6-0.6j,  1.0-1.j ]) # may vary
 
     """
+    subtype = None
     if type(x) not in (int, float, complex) and not isinstance(x, np.generic):
         x = np.asanyarray(x)
+        if isinstance(x, np.ndarray) and type(x) is not np.ndarray:
+            subtype = type(x)
     off, scl = mapparms(old, new)
-    return off + scl * x
+    mapped = off + scl * x
+    if subtype is not None and type(mapped) is not subtype:
+        mapped = mapped.view(subtype)
+    return mapped
 
 
 def _nth_slice(i, ndim):
