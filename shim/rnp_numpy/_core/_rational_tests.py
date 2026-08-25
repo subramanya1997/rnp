@@ -11,6 +11,7 @@ from .. import dtype as _dtype
 class _Unavailable:
     #: Placeholder descriptor so `np.dtype(cls)` resolves during collection.
     dtype = _dtype("V8")
+    _rnp_unavailable_user_dtype = True
 
     def __init__(self, *args, **kwargs):
         # Upstream test modules construct rationals at import time; the value

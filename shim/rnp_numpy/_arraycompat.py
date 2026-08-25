@@ -148,6 +148,17 @@ def _map_nested(obj, fn):
 
 def _object_astype(self, dt):
     """`astype` out of an object array, converting element by element."""
+    if self.ndim == 0:
+        value = self.item()
+        value_dtype = getattr(value, "dtype", None)
+        if value_dtype is not None and value_dtype == dt:
+            try:
+                arr = value.__array__(dtype=dt, copy=True)
+            except (AttributeError, TypeError, NotImplementedError):
+                pass
+            else:
+                if isinstance(arr, ndarray):
+                    return arr
     values = _map_nested(self.tolist(), lambda v: _to_python(v, dt))
     if dt.kind in "SU" and dt.itemsize == 0:
         flat = []
@@ -437,6 +448,13 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
         if self.size == 0:
             return _empty(self.shape, dt)
         raise ValueError("setting an array element with a sequence")
+    if (dt.kind == "V" and dt.names is None and dt.subdtype is None
+            and src.kind not in "OV"):
+        # Numeric -> raw void copies each source element's storage bytes and
+        # zero-pads a wider destination; it is a byte-preserving cast, not a
+        # numeric conversion.
+        raw = self.view(f"V{src.itemsize}").tolist()
+        return _pkg().array(raw, dtype=dt)
     if dt.kind in "SU" and src.kind in "biufc":
         # Numbers rendered as text.  Note this must come before the
         # `itemsize == 0` branch below: that one sizes the result from the
@@ -451,6 +469,13 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
             raise TypeError("string cast exceeds maximum fixed-width itemsize")
         from ._core import _strcast
         return _strcast.restring(self, dt)
+    if dt.subdtype is not None and src.subdtype is None:
+        base, subshape = dt.subdtype
+        values = self.astype(base, order=order, casting=casting, copy=True)
+        expanded = values.reshape(values.shape + (1,) * len(subshape))
+        return _pkg().broadcast_to(
+            expanded, values.shape + tuple(subshape)
+        ).copy()
     if dt.kind in "SU" and dt.itemsize == 0:
         dt = _dtype(f"{dt.char}{_b.max(src.itemsize, 1)}")
     return _ordered_copy(self, dt, order, casting)
@@ -849,7 +874,31 @@ def array_wrap(self, array, context=None, return_scalar=False):
 
 def setitem(self, key, value):
     _check_advanced_index_size(key)
+    if (getattr(type(value), "_rnp_unavailable_user_dtype", False)
+            and self.dtype.kind != "O"):
+        raise NotImplementedError(
+            "the rational user dtype is not implemented by rnp"
+        )
+    if self.dtype.kind == "V" and isinstance(value, (_b.list, _b.tuple)):
+        dtypes = []
+        all_void, _ = _pkg()._void_scalar_tree(value, dtypes)
+        if (all_void and dtypes
+                and _b.all(dt == self.dtype for dt in dtypes)):
+            value = _pkg().array(value)
+    if (self.dtype.names is not None and not isinstance(value, ndarray)
+            and not isinstance(value, _pkg().void)
+            and getattr(value, "dtype", None) is not None
+            and hasattr(value, "item")):
+        value = value.item()
+    if (isinstance(value, _pkg().void)
+            and value.dtype == self.dtype):
+        value = value.__array__()
     value_dtype = getattr(value, "dtype", None)
+    if (self.dtype.kind == "V" and self.dtype.names is None
+            and self.dtype.subdtype is None and not isinstance(value, ndarray)
+            and value_dtype is not None and value_dtype.kind not in "OV"):
+        value = value.__array__(dtype=None, copy=True).astype(self.dtype)
+        value_dtype = value.dtype
     is_time_scalar = (not isinstance(value, ndarray)
                       and value_dtype is not None
                       and value_dtype.kind in "mM")

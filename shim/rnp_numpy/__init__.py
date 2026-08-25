@@ -9,6 +9,7 @@ Python, except for a few thin conveniences at the bottom of this file.
 import builtins as _builtins
 import enum as _enum
 import operator as _operator
+import sys as _sys
 
 from _rnp import (
     add,
@@ -220,6 +221,42 @@ def _has_nested_arraylike(obj, seen=None):
     return _builtins.any(_has_nested_arraylike(value, seen) for value in obj)
 
 
+def _void_scalar_tree(obj, dtypes):
+    if isinstance(obj, (list, tuple)):
+        values = []
+        for value in obj:
+            ok, plain = _void_scalar_tree(value, dtypes)
+            if not ok:
+                return False, obj
+            values.append(plain)
+        return True, values
+    if isinstance(obj, void):
+        dtypes.append(obj.dtype)
+        return True, obj.item() if obj.dtype.names is not None else obj.tobytes()
+    return False, obj
+
+
+def _scalar_dtype_tree(obj, dtypes):
+    if isinstance(obj, (list, tuple)):
+        return _builtins.all(_scalar_dtype_tree(value, dtypes)
+                             for value in obj)
+    if (isinstance(obj, (ndarray, type))
+            or getattr(type(obj), "_rnp_unavailable_user_dtype", False)):
+        return False
+    dt = getattr(obj, "dtype", None)
+    if dt is None:
+        return False
+    dtypes.append(dt)
+    return True
+
+
+def _contains_unavailable_user_dtype(obj):
+    if isinstance(obj, (list, tuple)):
+        return _builtins.any(_contains_unavailable_user_dtype(value)
+                             for value in obj)
+    return getattr(type(obj), "_rnp_unavailable_user_dtype", False)
+
+
 def _nested_sequence_shape(obj):
     """Infer a regular shape while retaining empty ndarray dimensions."""
     if isinstance(obj, ndarray):
@@ -338,12 +375,104 @@ def _probe_array_discovery_errors(obj):
             pass
 
 
+def _nested_identity_fingerprint(obj, seen=None):
+    if seen is None:
+        seen = set()
+    if isinstance(obj, list):
+        marker = id(obj)
+        if marker in seen:
+            return ("cycle", marker)
+        seen.add(marker)
+        values = [list.__getitem__(obj, i)
+                  for i in range(list.__len__(obj))]
+        return (marker, tuple(_nested_identity_fingerprint(v, seen)
+                              for v in values))
+    if isinstance(obj, tuple):
+        return (id(obj), tuple(_nested_identity_fingerprint(v, seen)
+                               for v in obj))
+    return id(obj)
+
+
+def _probe_nested_construction(obj, requested_dtype):
+    """Detect fatal allocation and mutation cases before Rust discovery."""
+    is_nested = isinstance(obj, (list, tuple))
+    if not is_nested:
+        values = (obj,)
+    else:
+        values = obj
+    before = _nested_identity_fingerprint(obj)
+    before_length = len(obj) if is_nested else None
+    seen = set()
+    sequence_error = False
+
+    def walk(value):
+        nonlocal sequence_error
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+        if isinstance(value, ndarray):
+            if value.size * value.dtype.itemsize > _sys.maxsize // 2:
+                raise MemoryError
+            if (requested_dtype is None and is_nested
+                    and type(value) is not ndarray and value.ndim == 0
+                    and "__float__" in vars(type(value))):
+                float(value)
+            return
+        if (requested_dtype is None and is_nested
+                and isinstance(value, memoryview) and value.ndim == 0
+                and isinstance(value.obj, ndarray)):
+            raise ValueError("invalid nested 0-D memoryview")
+        if isinstance(value, list):
+            if type(value) is not list:
+                try:
+                    len(value)
+                except Exception:
+                    sequence_error = True
+            children = [list.__getitem__(value, i)
+                        for i in range(list.__len__(value))]
+        elif isinstance(value, tuple):
+            children = value
+        else:
+            cls = type(value)
+            if hasattr(cls, "__len__") and hasattr(cls, "__getitem__"):
+                try:
+                    len(value)
+                except (RecursionError, MemoryError):
+                    raise
+                except Exception:
+                    sequence_error = True
+            return
+        for child in children:
+            walk(child)
+
+    for value in values:
+        walk(value)
+    changed = before != _nested_identity_fingerprint(obj)
+    length_changed = is_nested and len(obj) != before_length
+    if changed and (sequence_error or length_changed):
+        raise RuntimeError("sequence changed during array discovery")
+
+
+def _subarray_mixed_source(obj):
+    """Remove protocol wrappers and singleton tuple cells for subarrays."""
+    arr = _protocol_array_value(obj)
+    if arr is not None:
+        return arr.tolist()
+    if isinstance(obj, tuple) and len(obj) == 1:
+        return _subarray_mixed_source(obj[0])
+    if isinstance(obj, (list, tuple)):
+        return [_subarray_mixed_source(value) for value in obj]
+    return obj
+
+
 def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
           like=None):
     # `copy` is numpy 2.x's tri-state and the engine understands all three:
     # True always copies, False refuses to, None copies only when it must.
     _copy = copy
     _probe_array_discovery_errors(obj)
+    _probe_nested_construction(obj, dtype)
     _struct = getattr(obj, "__array_struct__", None)
     if isinstance(_struct, _arraycompat_mod()._ArrayStructProxy):
         obj = _struct.array
@@ -358,6 +487,11 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
         except (TypeError, ValueError):
             _void_dt = None
         _obj_dtype = getattr(obj, "dtype", None)
+        if (getattr(type(obj), "_rnp_unavailable_user_dtype", False)
+                and _void_dt is not None and _void_dt.kind != "O"):
+            raise NotImplementedError(
+                "the rational user dtype is not implemented by rnp"
+            )
         if (not isinstance(obj, ndarray) and _obj_dtype is not None
                 and _obj_dtype.kind in "mM" and _void_dt is not None
                 and _void_dt.kind in "SU"):
@@ -365,6 +499,28 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
             # ndarray.astype remains a cast and intentionally follows its
             # separate (stricter for datetime64) resolver.
             obj = str(obj)
+        if (_void_dt is not None and _void_dt.kind == "O"
+                and not isinstance(obj, (ndarray, list, tuple))
+                and _obj_dtype is not None):
+            if copy is False:
+                raise ValueError(
+                    "Unable to avoid copy while creating an array as requested."
+                )
+            res = _arraycompat_mod()._object_array(obj)
+            return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                    if order not in (None, "K", "k") or ndmin else res)
+        if (_void_dt is not None and _void_dt.kind == "V"
+                and _void_dt.names is None and _void_dt.subdtype is None
+                and not isinstance(obj, ndarray) and _obj_dtype is not None):
+            try:
+                scalar_array = obj.__array__(dtype=None, copy=True)
+            except TypeError:
+                scalar_array = obj.__array__()
+            if not isinstance(scalar_array, ndarray):
+                raise TypeError("object __array__ method not producing an array")
+            res = scalar_array.astype(_void_dt)
+            return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                    if order not in (None, "K", "k") or ndmin else res)
         if (isinstance(obj, ndarray) and _void_dt is not None
                 and _void_dt.kind == "T"):
             if copy is False:
@@ -387,6 +543,11 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
                     f"V{_width}")
     if (isinstance(obj, ndarray) and _void_dt is not None
             and (obj.dtype.kind in "OSUV" or _void_dt.kind in "OSUV")):
+        if (obj.dtype.kind == "O" and obj.ndim > 0
+                and _void_dt.kind in "SU" and _void_dt.itemsize == 0):
+            _void_dt = globals()["dtype"](
+                f"{_void_dt.char}{obj.dtype.itemsize}"
+            )
         if copy is False and _void_dt != obj.dtype:
             raise ValueError(
                 "Unable to avoid copy while creating an array as requested."
@@ -396,6 +557,16 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
         )
         return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
                 if ndmin else res)
+    if (_void_dt is not None and _void_dt.subdtype is not None
+            and isinstance(obj, (list, tuple))
+            and _has_nested_arraylike(obj)):
+        base, _ = _void_dt.subdtype
+        values = globals()["array"](
+            _subarray_mixed_source(obj), dtype=base, copy=copy
+        )
+        res = values.astype(_void_dt)
+        return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                if order not in (None, "K", "k") or ndmin else res)
     if (_void_dt is not None and _void_dt.kind == "O"
             and (isinstance(obj, memoryview)
                  or hasattr(obj, "__array_interface__"))):
@@ -404,7 +575,36 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
         return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
                 if ndmin else res)
     if isinstance(dtype, str) and dtype in _CHAR_TYPECODES:
-        obj, dtype = _char_typecode_elements(obj), "S1"
+        obj, dtype = _char_typecode_elements(obj), "c"
+    if (dtype is None and isinstance(obj, (list, tuple))
+            and _contains_unavailable_user_dtype(obj)):
+        raise TypeError("the rational user dtype is not implemented by rnp")
+    if dtype is None and isinstance(obj, (list, tuple)):
+        _void_dtypes = []
+        _all_void, _void_values = _void_scalar_tree(obj, _void_dtypes)
+        if (_all_void and _void_dtypes
+                and _builtins.all(dt == _void_dtypes[0]
+                                  for dt in _void_dtypes[1:])):
+            _inferred_void = _void_dtypes[0]
+            if _inferred_void.names is not None:
+                return _rnp_array(_void_values, _inferred_void, copy=_copy)
+            _width = _inferred_void.itemsize
+            return _rnp_array(
+                _void_values, f"S{_width}", copy=_copy
+            ).view(_inferred_void)
+        _scalar_dtypes = []
+        if _scalar_dtype_tree(obj, _scalar_dtypes) and _scalar_dtypes:
+            try:
+                _inferred_scalar = _scalar_dtypes[0]
+                for _next_dtype in _scalar_dtypes[1:]:
+                    _inferred_scalar = promote_types(
+                        _inferred_scalar, _next_dtype
+                    )
+            except TypeError:
+                _inferred_scalar = globals()["dtype"]("O")
+            if _inferred_scalar.kind == "O":
+                return _arraycompat_mod().object_array_discovery(obj)
+            return _rnp_array(obj, _inferred_scalar, copy=_copy)
     if (_void_dt is not None and _void_dt.kind == "O"
             and isinstance(obj, (list, tuple))):
         res = _arraycompat_mod().object_array_discovery(obj)

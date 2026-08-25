@@ -327,6 +327,12 @@ fn infer_dtype(values: &[Leaf]) -> DType {
     let mut d = dt(&values[0]);
     for v in &values[1..] {
         d = promote(d, dt(v));
+        if d == DType::Void(0) {
+            // `promote` uses unsized void as its no-common-dtype sentinel.
+            // Array discovery boxes such heterogeneous values instead of
+            // materialising a meaningless V0 array.
+            return DType::Object;
+        }
     }
     d
 }
@@ -624,8 +630,10 @@ fn array_from_text(obj: &Bound<'_, PyAny>, dtype: Option<DType>) -> PyResult<NdA
         encoded.push(bytes);
     }
     let dt = match base {
-        DType::Bytes(0) => DType::Bytes(width as u32),
-        DType::Str(0) => DType::Str(width as u32),
+        // Legacy fixed-width strings resolve an all-empty input to one code
+        // unit, not the internal S0/U0 discovery sentinel.
+        DType::Bytes(0) => DType::Bytes(width.max(1) as u32),
+        DType::Str(0) => DType::Str(width.max(1) as u32),
         other => other,
     };
     let out = NdArray::zeros(shape, dt).map_err(crate::err)?;

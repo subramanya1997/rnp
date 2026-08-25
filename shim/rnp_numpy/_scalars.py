@@ -1315,8 +1315,14 @@ class void(flexible, metaclass=_FlexMeta, char="V"):
         return _rnp.array(self._b, dtype=self.dtype).flags
 
     def __array__(self, dtype=None, copy=None):
-        a = self._arr if self._arr is not None else _rnp.array(
-            self._b, dtype=self.dtype)
+        if self._arr is not None:
+            a = self._arr
+        else:
+            # Passing bytes straight to a V dtype invokes the buffer/sequence
+            # path and produces one void element per byte. Build one fixed
+            # bytes scalar and reinterpret it so an unstructured void remains
+            # a genuine 0-D scalar.
+            a = _rnp.array(self._b, dtype=f"S{len(self._b)}").view(self.dtype)
         return a if dtype is None else a.astype(dtype)
 
     def __bytes__(self):
