@@ -523,6 +523,9 @@ impl NdArray {
                 let v = match i {
                     0 => start,
                     1 => s1,
+                    _ if cfg!(all(target_os = "linux", target_arch = "x86_64")) => {
+                        i as f64 * delta + start
+                    }
                     _ => (i as f64).mul_add(delta, start),
                 };
                 a.set_flat(i as usize, Scalar::Float(v));
@@ -1378,7 +1381,14 @@ mod tests {
         .unwrap();
         assert_eq!(a.size(), 21);
         match a.get_flat(5) {
-            Scalar::Float(f) => assert_eq!(f.to_bits(), 1.6885782266613103f64.to_bits()),
+            Scalar::Float(f) => {
+                let expected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                    f64::from_bits(0x3ffb_046a_9a43_f7d0)
+                } else {
+                    1.6885782266613103f64
+                };
+                assert_eq!(f.to_bits(), expected.to_bits())
+            }
             other => panic!("{other:?}"),
         }
     }

@@ -1296,13 +1296,20 @@ macro_rules! impl_complex_ops {
             // numpy's `@TYPE@_multiply` inner loop is
             //   out.re = a.re*b.re - a.im*b.im;
             //   out.im = a.re*b.im + a.im*b.re;
-            // which clang contracts into an FMA per statement on aarch64.
-            // Plain `*` on num_complex rounds twice and differs by an ULP.
+            // which clang contracts into an FMA per statement on aarch64,
+            // while NumPy's x86-64 loop keeps separate multiply/add rounding.
             #[inline] fn a_mul(self, o: Self) -> Self {
-                <$t>::new(
-                    self.re.mul_add(o.re, -(self.im * o.im)),
-                    self.re.mul_add(o.im, self.im * o.re),
-                )
+                if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                    <$t>::new(
+                        self.re * o.re - self.im * o.im,
+                        self.re * o.im + self.im * o.re,
+                    )
+                } else {
+                    <$t>::new(
+                        self.re.mul_add(o.re, -(self.im * o.im)),
+                        self.re.mul_add(o.im, self.im * o.re),
+                    )
+                }
             }
             complex_div!($t, $f);
         }
@@ -2811,6 +2818,19 @@ mod tests {
         let onei = C64v::new(1.0, 1.0);
         assert_eq!(cplx_div_flags(onei, zero, Arith::a_div(onei, zero)), fpe::DIVIDE);
         assert_eq!(cplx_div_flags(zero, zero, Arith::a_div(zero, zero)), fpe::INVALID);
+    }
+
+    #[test]
+    fn complex_multiply_matches_platform_contraction() {
+        let x = C32::new(67.76322937011719, 12.938271522521973);
+        let y = C32::new(64.82955932617188, -69.42171478271484);
+        let r = Arith::a_mul(x, y);
+        let expected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            (0x45a5_5a0e, 0xc571_9751)
+        } else {
+            (0x45a5_5a0f, 0xc571_9750)
+        };
+        assert_eq!((r.re.to_bits(), r.im.to_bits()), expected);
     }
 
     #[test]
