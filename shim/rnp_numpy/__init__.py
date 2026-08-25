@@ -171,6 +171,55 @@ def _flatten_nested_ndarrays(obj, dtypes):
     return obj
 
 
+def _protocol_array_value(obj):
+    """Return the ndarray represented by one array-like, if any."""
+    if isinstance(obj, ndarray):
+        return obj
+    if isinstance(obj, memoryview) and isinstance(obj.obj, ndarray):
+        # The PEP 3118 view of an object array carries pointer-sized cells;
+        # coercion still discovers the exporting array's Python objects.
+        return obj.obj
+    struct = getattr(obj, "__array_struct__", None)
+    if isinstance(struct, _arraycompat_mod()._ArrayStructProxy):
+        return struct.array
+    if isinstance(obj, memoryview) or hasattr(obj, "__array_interface__"):
+        try:
+            return _rnp_array(obj, None, copy=None)
+        except (TypeError, ValueError):
+            pass
+    if hasattr(type(obj), "__array__"):
+        try:
+            return _arraycompat_mod().array_from_protocol(
+                obj, None, None
+            )
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _flatten_nested_arraylikes(obj, dtypes):
+    """Render nested protocol arrays as the values shape discovery sees."""
+    if isinstance(obj, (list, tuple)):
+        return [_flatten_nested_arraylikes(value, dtypes) for value in obj]
+    arr = _protocol_array_value(obj)
+    if arr is None:
+        return obj
+    dtypes.append(arr.dtype)
+    return _flatten_nested_arraylikes(arr.tolist(), dtypes)
+
+
+def _has_nested_arraylike(obj, seen=None):
+    if not isinstance(obj, (list, tuple)):
+        return _protocol_array_value(obj) is not None
+    if seen is None:
+        seen = set()
+    marker = id(obj)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    return _builtins.any(_has_nested_arraylike(value, seen) for value in obj)
+
+
 def _nested_sequence_shape(obj):
     """Infer a regular shape while retaining empty ndarray dimensions."""
     if isinstance(obj, ndarray):
@@ -262,11 +311,47 @@ def _text_scalar(obj, dtype):
     return _rnp_array(obj, None).astype(dt)
 
 
+def _probe_array_discovery_errors(obj):
+    """Preserve fatal errors raised while NumPy discovers array protocols.
+
+    The Rust fast path asks whether an attribute exists before fetching it.
+    CPython's generic ``hasattr``-style probes can clear exceptions raised by
+    a dynamic ``__getattr__``.  NumPy treats recursion and allocation failures
+    as fatal during both protocol and sequence discovery, so fetch the three
+    protocol attributes through normal Python lookup and preflight a foreign
+    sequence's length before entering that fast path.
+    """
+    if isinstance(obj, (ndarray, list, tuple, type)):
+        return
+    for name in ("__array_struct__", "__array_interface__", "__array__"):
+        try:
+            getattr(obj, name)
+        except AttributeError:
+            pass
+    cls = type(obj)
+    if hasattr(cls, "__len__") and hasattr(cls, "__getitem__"):
+        try:
+            len(obj)
+        except (RecursionError, MemoryError):
+            raise
+        except Exception:
+            pass
+
+
 def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
           like=None):
     # `copy` is numpy 2.x's tri-state and the engine understands all three:
     # True always copies, False refuses to, None copies only when it must.
     _copy = copy
+    _probe_array_discovery_errors(obj)
+    _struct = getattr(obj, "__array_struct__", None)
+    if isinstance(_struct, _arraycompat_mod()._ArrayStructProxy):
+        obj = _struct.array
+    if isinstance(obj, type) and dtype is None:
+        res = _arraycompat_mod()._object_array(obj)
+        return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                if order not in (None, "K", "k") or ndmin else res)
+    _void_dt = None
     if dtype is not None:
         try:
             _void_dt = globals()["dtype"](dtype)
@@ -292,8 +377,37 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0,
                     (len(value) for value in _vals), default=0)
                 return _rnp_array(obj, f"S{_width}", copy=_copy).view(
                     f"V{_width}")
+    if (isinstance(obj, ndarray) and _void_dt is not None
+            and (obj.dtype.kind in "OSUV" or _void_dt.kind in "OSUV")):
+        if copy is False and _void_dt != obj.dtype:
+            raise ValueError(
+                "Unable to avoid copy while creating an array as requested."
+            )
+        res = obj.astype(
+            _void_dt, order=order, copy=(copy is not False), subok=subok
+        )
+        return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                if ndmin else res)
+    if (_void_dt is not None and _void_dt.kind == "O"
+            and (isinstance(obj, memoryview)
+                 or hasattr(obj, "__array_interface__"))):
+        base = _rnp_array(obj, None, copy=_copy)
+        res = base.astype(_void_dt)
+        return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                if ndmin else res)
     if isinstance(dtype, str) and dtype in _CHAR_TYPECODES:
         obj, dtype = _char_typecode_elements(obj), "S1"
+    if (_void_dt is not None and _void_dt.kind == "O"
+            and isinstance(obj, (list, tuple))):
+        res = _arraycompat_mod().object_array_discovery(obj)
+        return (_arraycompat_mod().finish_array(res, order, ndmin, copy)
+                if order not in (None, "K", "k") or ndmin else res)
+    if (isinstance(obj, (list, tuple))
+            and ((_void_dt is not None and _void_dt.kind in "SU")
+                 or (_void_dt is not None and _void_dt.kind != "O"
+                     and _has_nested_arraylike(obj)))):
+        _arraylike_dtypes = []
+        obj = _flatten_nested_arraylikes(obj, _arraylike_dtypes)
     _text = _text_scalar(obj, dtype)
     if _text is not None:
         obj, dtype, _copy = _text, None, False

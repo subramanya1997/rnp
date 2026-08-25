@@ -61,6 +61,9 @@ def _discover_array_parameters(obj, dtype=None):
             dtype = np.dtypes._default_for_discovery(dtype)
         else:
             dtype = dtype()
+    if dtype is not None and np.dtype(dtype).kind == "O":
+        from .. import _arraycompat
+        return np.dtype(dtype), _arraycompat._discovery_shape(obj)
     arr = np.asarray(obj, dtype=dtype)
     return arr.dtype, arr.shape
 

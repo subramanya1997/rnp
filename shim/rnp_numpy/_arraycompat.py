@@ -692,6 +692,75 @@ def _object_array(obj):
     return out
 
 
+def _common_shape_prefix(shapes):
+    if not shapes:
+        return ()
+    limit = min(map(len, shapes))
+    pos = 0
+    while pos < limit and all(shape[pos] == shapes[0][pos]
+                              for shape in shapes[1:]):
+        pos += 1
+    return shapes[0][:pos]
+
+
+def _discovery_shape(obj, depth=0, memo=None):
+    """NumPy's common-prefix shape discovery for object construction."""
+    if depth >= _MAXDIMS:
+        return ()
+    arr = _pkg()._protocol_array_value(obj)
+    if arr is not None:
+        return tuple(arr.shape[:_MAXDIMS - depth])
+    if not isinstance(obj, (_b.list, _b.tuple)):
+        return ()
+    if not obj:
+        return (0,)
+    if memo is None:
+        memo = {}
+    key = (id(obj), depth)
+    if key in memo:
+        return memo[key]
+    children = [_discovery_shape(value, depth + 1, memo) for value in obj]
+    shape = (len(obj),) + _common_shape_prefix(children)
+    memo[key] = shape
+    return shape
+
+
+def _fill_discovered_object(out, obj, prefix):
+    if len(prefix) == out.ndim:
+        out[prefix] = obj
+        return
+    arr = _pkg()._protocol_array_value(obj)
+    if arr is not None:
+        remaining = out.ndim - len(prefix)
+        if arr.ndim > remaining:
+            if arr.size != 1:
+                raise ValueError(
+                    "could not broadcast input array into discovered shape"
+                )
+            value = arr.item()
+            for _ in range(remaining):
+                value = [value]
+            return _fill_discovered_object(out, value, prefix)
+        obj = arr.tolist()
+    if not isinstance(obj, (_b.list, _b.tuple)):
+        raise ValueError("could not broadcast input array into discovered shape")
+    expected = out.shape[len(prefix)]
+    if len(obj) != expected:
+        raise ValueError("could not broadcast input array into discovered shape")
+    for i, value in enumerate(obj):
+        _fill_discovered_object(out, value, prefix + (i,))
+
+
+def object_array_discovery(obj):
+    """Build an object array after protocol-aware ragged shape discovery."""
+    shape = _discovery_shape(obj)
+    out = _empty(shape, _dtype("O"))
+    # Even a zero-sized result validates every nested array-like.  This is
+    # why ``[[], empty((0, 1))]`` raises instead of silently producing (2, 0).
+    _fill_discovered_object(out, obj, ())
+    return out
+
+
 #: numpy's `NPY_MAXDIMS`. Nesting deeper than this is how a co-recursive
 #: list (gh-11154) announces itself; numpy answers with a ValueError rather
 #: than blowing the C stack, and so must the port.
@@ -700,8 +769,8 @@ _MAXDIMS = 64
 
 def _too_deep(found):
     return ValueError(
-        f"maximum supported dimension for an ndarray is {_MAXDIMS}, "
-        f"found {found}")
+        "setting an array element with a sequence. The requested array "
+        f"would exceed the maximum number of dimension of {_MAXDIMS}.")
 
 
 def _as_lists(obj, _depth=0):
@@ -829,6 +898,19 @@ _NO_COPY_MSG = (
     "For more details, see "
     "https://numpy.org/devdocs/numpy_2_0_migration_guide.html"
     "#adapting-to-changes-in-the-copy-keyword.")
+
+
+class _ArrayStructProxy:
+    """In-process stand-in for the C ``PyArrayInterface`` capsule."""
+
+    def __init__(self, array):
+        self.array = array
+
+
+def array_struct(self):
+    # Foreign consumers use ``__array_interface__``; rnp's own coercion path
+    # needs only the exporting array and its ownership lifetime.
+    return _ArrayStructProxy(self)
 
 
 def array_protocol(self, dtype=None, copy=None):
@@ -1147,6 +1229,7 @@ def install():
 
     ndarray.astype = astype
     ndarray.__array__ = array_protocol
+    ndarray.__array_struct__ = property(array_struct)
     ndarray.__array_wrap__ = array_wrap
     ndarray.copy = copy_method
     ndarray.ravel = ravel_method

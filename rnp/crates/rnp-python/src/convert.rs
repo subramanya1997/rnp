@@ -241,10 +241,10 @@ fn discover_shape(obj: &Bound<'_, PyAny>, shape: &mut Vec<isize>) -> PyResult<()
     // numpy's `NPY_MAXDIMS`. A co-recursive list (gh-11154) is unbounded, and
     // numpy answers with this ValueError rather than overflowing the stack.
     if shape.len() >= 64 {
-        return Err(PyValueError::new_err(format!(
-            "maximum supported dimension for an ndarray is 64, found {}",
-            shape.len() + 1
-        )));
+        return Err(PyValueError::new_err(
+            "setting an array element with a sequence. The requested array \
+             would exceed the maximum number of dimension of 64.",
+        ));
     }
     let seq = obj.cast::<PySequence>()?;
     let n = seq.len()?;
@@ -858,10 +858,10 @@ fn array_from_records(obj: &Bound<'_, PyAny>, id: u32) -> PyResult<NdArray> {
     let mut cur = obj.clone();
     while is_sequence(&cur) && cur.cast::<PyTuple>().is_err() {
         if shape.len() >= 64 {
-            return Err(PyValueError::new_err(format!(
-                "maximum supported dimension for an ndarray is 64, found {}",
-                shape.len() + 1
-            )));
+            return Err(PyValueError::new_err(
+                "setting an array element with a sequence. The requested \
+                 array would exceed the maximum number of dimension of 64.",
+            ));
         }
         let seq = cur.cast::<PySequence>()?;
         let n = seq.len()?;
