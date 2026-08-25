@@ -1043,24 +1043,45 @@ def copy(a):
     return _asarr(a).copy()
 
 
+_LIKE_EMPTY = object()
+
+
+def _new_like_subclass(a, dtype, fill_value=_LIKE_EMPTY, shape=None):
+    result = ndarray.__new__(type(a), a.shape if shape is None else shape, dtype)
+    finalize = getattr(result, "__array_finalize__", None)
+    if finalize is not None:
+        finalize(a)
+    if fill_value is not _LIKE_EMPTY:
+        result[...] = fill_value
+    return result
+
+
 def zeros_like(a, dtype=None):
     a = _asarr(a)
-    return zeros(a.shape, a.dtype if dtype is None else dtype)
+    dtype = a.dtype if dtype is None else dtype
+    return (zeros(a.shape, dtype) if type(a) is ndarray else
+            _new_like_subclass(a, dtype, 0))
 
 
 def ones_like(a, dtype=None):
     a = _asarr(a)
-    return ones(a.shape, a.dtype if dtype is None else dtype)
+    dtype = a.dtype if dtype is None else dtype
+    return (ones(a.shape, dtype) if type(a) is ndarray else
+            _new_like_subclass(a, dtype, 1))
 
 
 def empty_like(a, dtype=None):
     a = _asarr(a)
-    return empty(a.shape, a.dtype if dtype is None else dtype)
+    dtype = a.dtype if dtype is None else dtype
+    return (empty(a.shape, dtype) if type(a) is ndarray else
+            _new_like_subclass(a, dtype))
 
 
 def full_like(a, fill_value, dtype=None):
     a = _asarr(a)
-    return full(a.shape, fill_value, a.dtype if dtype is None else dtype)
+    dtype = a.dtype if dtype is None else dtype
+    return (full(a.shape, fill_value, dtype) if type(a) is ndarray else
+            _new_like_subclass(a, dtype, fill_value))
 
 
 def size(a, axis=None):
@@ -1658,6 +1679,8 @@ _wire_subsystem(
 
 def dot(a, b, out=None):
     """Dot product of two arrays (numpy's `np.dot`)."""
+    a = asarray(a)
+    b = asarray(b)
     if (getattr(getattr(a, "dtype", None), "kind", None) == "O" or
             getattr(getattr(b, "dtype", None), "kind", None) == "O"):
         from .lib._rnp_corecompat import dot as _compat_dot
