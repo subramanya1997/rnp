@@ -681,10 +681,34 @@ def _install_operators(cls):
             def fwd(self, other, *, _c=code):
                 if getattr(other, "__array_ufunc__", _NO_ARRAY_UFUNC) is None:
                     return NotImplemented
+                if name == "divide" and self.dtype.kind in "iu" \
+                        and isinstance(other, int) \
+                        and not isinstance(other, _builtins.bool):
+                    lo, hi = _INT_RANGE[self.dtype.name]
+                    if not lo <= other <= hi:
+                        return _sb2(_c, float64(self._v), float64(other))
+                if name == "multiply" and (
+                        hasattr(other, "__array__")
+                        or isinstance(other, memoryview)) \
+                        and not isinstance(other, (generic, ndarray)):
+                    from . import asarray as _asarray
+                    return _asarray(other).__rmul__(self)
                 r = _sb2(_c, self, other)
                 return NotImplemented if r is None else r
 
             def rev(self, other, *, _c=code):
+                if name == "divide" and self.dtype.kind in "iu" \
+                        and isinstance(other, int) \
+                        and not isinstance(other, _builtins.bool):
+                    lo, hi = _INT_RANGE[self.dtype.name]
+                    if not lo <= other <= hi:
+                        return _sb2(_c, float64(other), float64(self._v))
+                if name == "multiply" and (
+                        hasattr(other, "__array__")
+                        or isinstance(other, memoryview)) \
+                        and not isinstance(other, (generic, ndarray)):
+                    from . import asarray as _asarray
+                    return _asarray(other).__mul__(self)
                 r = _sb2(_c, other, self)
                 return NotImplemented if r is None else r
 
@@ -832,6 +856,27 @@ def _make_numeric(name, spec, base, builtin=None, clsname=None):
 
         _same_type_add.__name__ = "__add__"
         cls.__add__ = _same_type_add
+    if k in "iu":
+        if d.isnative and d.kind == "i":
+            _generic_abs = cls.__abs__
+
+            def _signed_abs(self, *, _fallback=_generic_abs, _lo=_INT_RANGE[d.name][0]):
+                result = _fallback(self)
+                if self._v == _lo:
+                    _report_fpe(2, "scalar absolute", stacklevel=3)
+                return result
+
+            cls.__abs__ = _signed_abs
+        elif d.isnative and d.kind == "u":
+            _generic_neg = cls.__neg__
+
+            def _unsigned_neg(self, *, _fallback=_generic_neg):
+                result = _fallback(self)
+                if self._v != 0:
+                    _report_fpe(2, "scalar negative", stacklevel=3)
+                return result
+
+            cls.__neg__ = _unsigned_neg
     _install_numeric_extras(cls, d)
     _SCALAR_BY_NAME.setdefault(d.name, cls)
     # Lets the Rust fast path recognise an operand by its type pointer instead
@@ -994,13 +1039,23 @@ def _install_numeric_extras(cls, d):
     kind = d.kind
 
     cls.__bool__ = lambda self: _builtins.bool(self._v)
-    cls.__int__ = lambda self: _builtins.int(self._v.real if kind == "c"
-                                             else self._v)
+    if kind == "c":
+        def _complex_int(self):
+            from .exceptions import ComplexWarning
+            _warnings.warn(
+                "Casting complex values to real discards the imaginary part",
+                ComplexWarning, stacklevel=2,
+            )
+            return _builtins.int(self._v.real)
+
+        cls.__int__ = _complex_int
+    else:
+        cls.__int__ = lambda self: _builtins.int(self._v)
     cls.__float__ = lambda self: _builtins.float(
         self._v.real if kind == "c" else self._v)
     cls.__complex__ = lambda self: complex(self._v)
 
-    if kind in "biu":
+    if kind in "iu":
         cls.__index__ = lambda self: _builtins.int(self._v)
         cls.bit_count = lambda self: _builtins.int(self._v).bit_count()
         cls.__lshift__ = cls.__lshift__
@@ -1133,6 +1188,59 @@ complex128 = _make_numeric("complex128", "complex128", complexfloating,
 # type number (13/16) and its own scalar class.
 longdouble = _make_numeric("longdouble", "g", floating)
 clongdouble = _make_numeric("clongdouble", "G", complexfloating)
+
+
+def _install_extended_precision_operators(cls):
+    """Keep macOS long-double scalar semantics despite f64/c128 storage.
+
+    On arm64 Darwin the storage formats alias double and complex double, but
+    NumPy keeps distinct scalar classes and converts wide Python integers to
+    those formats before entering the loop.  The Rust scalar bridge models
+    storage dtypes only, so this small wrapper restores the scalar-class and
+    pre-conversion parts without changing the shared arithmetic kernels.
+    """
+    for op in (
+            "lt", "le", "eq", "ne", "ge", "gt", "add", "floordiv",
+            "mod", "mul", "pow", "sub", "truediv"):
+        reflected_variants = (False,) if op in (
+            "lt", "le", "eq", "ne", "ge", "gt"
+        ) else (False, True)
+        for reflected in reflected_variants:
+            method_name = f"__{'r' if reflected else ''}{op}__"
+            original = getattr(cls, method_name)
+
+            def method(self, other, *, _original=original, _op=op,
+                       _reflected=reflected, _cls=cls):
+                if isinstance(other, int) \
+                        and not isinstance(other, _builtins.bool) \
+                        and not -2**63 <= other <= 2**63 - 1:
+                    other = _cls(other)
+                elif isinstance(other, (list, tuple)) \
+                        and _op in ("add", "pow", "sub"):
+                    from . import asarray as _asarray
+                    arr = _asarray(other)
+                    array_method = f"__{'' if _reflected else 'r'}{_op}__"
+                    return getattr(arr, array_method)(self)
+
+                result = _original(self, other)
+                if result is NotImplemented or not isinstance(result, generic):
+                    return result
+                target = clongdouble if (
+                    isinstance(self, clongdouble)
+                    or isinstance(other, clongdouble)
+                ) else longdouble
+                if target is longdouble and result.dtype.kind == "f":
+                    return longdouble._wrap(_builtins.float(result))
+                if target is clongdouble and result.dtype.kind == "c":
+                    return clongdouble._wrap(complex(result))
+                return result
+
+            method.__name__ = method_name
+            setattr(cls, method_name, method)
+
+
+_install_extended_precision_operators(longdouble)
+_install_extended_precision_operators(clongdouble)
 
 #: `np.complex64(1+2j).real` is a float32.
 complex64_real = float32

@@ -495,6 +495,9 @@ fn unsupported(op: UnOp) -> Error {
 pub trait FloatUn: Element + FpClass {
     fn fu(self, op: UnOp) -> Self;
     fn fu_signbit(self) -> bool;
+    /// True for a zero or subnormal result, the range where exp/exp2 can
+    /// signal underflow without producing a non-finite value.
+    fn fu_tiny(self) -> bool;
     /// The conditions numpy's `spacing` loop reports for `spacing(self) == r`.
     ///
     /// `npy_spacing` (float and double) raises nothing for a non-finite
@@ -570,6 +573,10 @@ macro_rules! impl_float_un {
                 self.is_sign_negative()
             }
             #[inline]
+            fn fu_tiny(self) -> bool {
+                self == 0.0 || self.is_subnormal()
+            }
+            #[inline]
             fn fu_spacing_flags(self, r: Self) -> u8 {
                 if r.is_infinite() && self.is_finite() {
                     crate::fpe::OVER
@@ -602,6 +609,10 @@ impl FloatUn for F16 {
     #[inline]
     fn fu_signbit(self) -> bool {
         self.0 & 0x8000 != 0
+    }
+    #[inline]
+    fn fu_tiny(self) -> bool {
+        self.0 & 0x7C00 == 0
     }
     #[inline]
     fn fu_spacing_flags(self, _r: Self) -> u8 {
@@ -1129,6 +1140,36 @@ fn is_pole_op(op: UnOp) -> bool {
     )
 }
 
+#[inline]
+fn float_unary_flags<T: FloatUn>(
+    op: UnOp,
+    x: T,
+    r: T,
+    watch_underflow: bool,
+) -> u8 {
+    if r.fp_nan() {
+        if x.fp_nan() {
+            0
+        } else {
+            fpe::INVALID
+        }
+    } else if r.fp_inf() && x.fp_finite() {
+        if is_pole_op(op) {
+            fpe::DIVIDE
+        } else {
+            fpe::OVER
+        }
+    } else if watch_underflow
+        && matches!(op, UnOp::Exp | UnOp::Exp2)
+        && x.fp_finite()
+        && r.fu_tiny()
+    {
+        fpe::UNDER
+    } else {
+        0
+    }
+}
+
 /// Dispatch a float unary loop with the op as a *compile-time* constant.
 ///
 /// Passing `op` into the closure as a runtime value would leave the whole
@@ -1192,7 +1233,7 @@ where
         return;
     }
 
-    let pole = is_pole_op(op);
+    let watch_underflow = fpe::watch_underflow();
     macro_rules! flagged {
         ($c:expr) => {
             unary1_flagged::<T, T, _, _, _>(
@@ -1200,24 +1241,13 @@ where
                 o,
                 n,
                 |x| x.fu($c),
-                |_x: T, r: T| !r.fp_finite(),
-                move |x, r| {
-                    if r.fp_nan() {
-                        if x.fp_nan() {
-                            0
-                        } else {
-                            fpe::INVALID
-                        }
-                    } else if r.fp_inf() && x.fp_finite() {
-                        if pole {
-                            fpe::DIVIDE
-                        } else {
-                            fpe::OVER
-                        }
-                    } else {
-                        0
-                    }
+                |_x: T, r: T| {
+                    !r.fp_finite()
+                        || (watch_underflow
+                            && matches!($c, UnOp::Exp | UnOp::Exp2)
+                            && r.fu_tiny())
                 },
+                move |x, r| float_unary_flags($c, x, r, watch_underflow),
             )
         };
     }
@@ -1301,6 +1331,21 @@ mod tests {
         assert!(get_f(&l, 0) == f64::NEG_INFINITY);
         assert!(get_f(&l, 1).is_nan());
         assert_eq!(get_f(&l, 2), 0.0);
+    }
+
+    #[test]
+    fn exp_zero_and_subnormal_results_report_underflow_when_watched() {
+        assert_eq!(
+            float_unary_flags(UnOp::Exp, -1000.0f64, 0.0, true),
+            fpe::UNDER
+        );
+        assert_eq!(
+            float_unary_flags(UnOp::Exp2, -1074.0f64, f64::from_bits(1), true),
+            fpe::UNDER
+        );
+        assert_eq!(float_unary_flags(UnOp::Exp, -1000.0f64, 0.0, false), 0);
+        assert_eq!(float_unary_flags(UnOp::Exp, f64::NEG_INFINITY, 0.0, true), 0);
+        assert_eq!(float_unary_flags(UnOp::Sin, 0.0f64, 0.0, true), 0);
     }
 
     #[test]
