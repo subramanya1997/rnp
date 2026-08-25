@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-08-25T00:50:25.218711+00:00",
-  "overall_passed": 4201,
+  "timestamp": "2026-08-25T01:54:41.303136+00:00",
+  "overall_passed": 4183,
   "overall_total": 4759,
   "files": [
     {
@@ -45,8 +45,8 @@
     },
     {
       "file": "lib/test_arraysetops.py",
-      "passed": 109,
-      "failed": 8,
+      "passed": 98,
+      "failed": 19,
       "errors": 0,
       "skipped": 0,
       "total": 117
@@ -69,8 +69,8 @@
     },
     {
       "file": "lib/test_function_base.py",
-      "passed": 1309,
-      "failed": 114,
+      "passed": 1304,
+      "failed": 119,
       "errors": 0,
       "skipped": 73,
       "total": 1496
@@ -93,8 +93,8 @@
     },
     {
       "file": "lib/test_io.py",
-      "passed": 107,
-      "failed": 107,
+      "passed": 106,
+      "failed": 108,
       "errors": 0,
       "skipped": 1,
       "total": 215
@@ -117,8 +117,8 @@
     },
     {
       "file": "lib/test_nanfunctions.py",
-      "passed": 1089,
-      "failed": 104,
+      "passed": 1088,
+      "failed": 105,
       "errors": 0,
       "skipped": 86,
       "total": 1279
@@ -141,16 +141,16 @@
     },
     {
       "file": "lib/test_recfunctions.py",
-      "passed": 12,
-      "failed": 39,
+      "passed": 13,
+      "failed": 38,
       "errors": 0,
       "skipped": 0,
       "total": 51
     },
     {
       "file": "lib/test_regression.py",
-      "passed": 20,
-      "failed": 5,
+      "passed": 19,
+      "failed": 6,
       "errors": 0,
       "skipped": 0,
       "total": 25
