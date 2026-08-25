@@ -501,6 +501,10 @@ def ravel_method(self, /, order="C"):
     return _orig_ravel(self.transpose(perm))
 
 
+def flatten_method(self, /, order="C"):
+    return ravel_method(self, order).copy()
+
+
 def copy(a, order="K", subok=False):
     a = a if isinstance(a, ndarray) else _pkg().asarray(a)
     return _ordered_copy(a, a.dtype, _norm_order(order, "K"))
@@ -865,7 +869,8 @@ def getitem(self, key):
 def array_wrap(self, array, context=None, return_scalar=False):
     """Wrap ufunc-style results in the receiver's ndarray subclass."""
     result = array
-    if isinstance(result, ndarray) and type(self) is not ndarray:
+    if (isinstance(result, ndarray) and type(self) is not ndarray
+            and type(result) is not type(self)):
         result = result.view(type(self))
     if return_scalar and isinstance(result, ndarray) and result.ndim == 0:
         return result[()]
@@ -1305,6 +1310,7 @@ def install():
     ndarray.__array_wrap__ = array_wrap
     ndarray.copy = copy_method
     ndarray.ravel = ravel_method
+    ndarray.flatten = flatten_method
     ndarray.__getitem__ = getitem
     ndarray.__setitem__ = setitem
     ndarray.sort = sort_method
