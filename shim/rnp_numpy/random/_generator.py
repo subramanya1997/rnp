@@ -1,6 +1,8 @@
 """Bit-exact high-level Generator operations."""
 
 import bisect
+from collections.abc import Sequence
+import itertools
 import math
 import operator
 import warnings
@@ -10,11 +12,13 @@ from .. import (
     array,
     asarray,
     broadcast_to,
+    can_cast,
     dtype as _dtype,
     empty,
     float32,
     float64,
     int64,
+    ndarray,
     uint32,
 )
 from .._arraycompat import broadcast_arrays
@@ -59,6 +63,23 @@ def _gen_mask(maximum):
     mask |= mask >> 16
     mask |= mask >> 32
     return mask
+
+
+def _indices(shape):
+    """Yield C-order index tuples without depending on ndarray iteration."""
+    if not shape:
+        yield ()
+        return
+    yield from itertools.product(*(range(dim) for dim in shape))
+
+
+def _flat_indices(shape, fortran=False):
+    """Yield flat-iteration coordinates in C or Fortran memory order."""
+    if not fortran:
+        yield from _indices(shape)
+        return
+    for reversed_index in _indices(tuple(reversed(shape))):
+        yield tuple(reversed(reversed_index))
 
 
 class Generator:
@@ -107,6 +128,11 @@ class Generator:
 
     def __str__(self):
         return f"Generator({type(self._bit_generator).__name__})"
+
+    def __reduce__(self):
+        from . import _pickle
+        constructor = getattr(_pickle, "__generator_ctor")
+        return constructor, (self._bit_generator,), None
 
     def random(self, size=None, dtype=float64, out=None):
         name = _dtype_name(dtype)
@@ -246,6 +272,7 @@ class Generator:
         return product >> bits
 
     def integers(self, low, high=None, size=None, dtype=int64, endpoint=False):
+        single_argument = high is None
         if high is None:
             low, high = 0, low
         name = _dtype_name(dtype)
@@ -286,7 +313,7 @@ class Generator:
             if last > dtype_high:
                 raise ValueError(f"high is out of bounds for {name}")
             if last < low_value:
-                if low_value == 0:
+                if single_argument:
                     raise ValueError("high <= 0" if not endpoint else "high < 0")
                 raise ValueError("low >= high" if not endpoint else "low > high")
             count = 1 if size is None else _count(shape)
@@ -309,6 +336,8 @@ class Generator:
                 if last > dtype_high:
                     raise ValueError(f"high is out of bounds for {name}")
                 if last < lo:
+                    if single_argument:
+                        raise ValueError("high <= 0" if not endpoint else "high < 0")
                     raise ValueError("low >= high" if not endpoint else "low > high")
                 inclusive_range = last - lo
                 if bits < 32:
@@ -361,28 +390,108 @@ class Generator:
 
     def shuffle(self, x, axis=0):
         if hasattr(x, "ndim"):
-            ndim = x.ndim
+            values = x if isinstance(x, ndarray) else asarray(x)
+            ndim = values.ndim
+            if ndim == 0:
+                raise TypeError("len() of unsized object")
+            if not values.flags.writeable:
+                raise ValueError("array is read-only")
             axis = operator.index(axis)
             if axis < 0:
                 axis += ndim
             if axis < 0 or axis >= ndim:
                 raise AxisError(axis, ndim=ndim)
-            n = x.shape[axis]
+            n = values.shape[axis]
             order = list(range(n))
             for i in range(n - 1, 0, -1):
                 j = self._random_interval(i)
                 order[i], order[j] = order[j], order[i]
             if n:
-                original = x.copy()
-                shuffled = original.take(array(order, dtype=int64), axis=axis)
-                x[...] = shuffled
+                if values.dtype.names:
+                    for field_name in values.dtype.names:
+                        field = values[field_name]
+                        original = field.copy()
+                        for index in _indices(tuple(field.shape)):
+                            base = index[:values.ndim]
+                            source_base = (base[:axis]
+                                           + (order[base[axis]],)
+                                           + base[axis + 1:])
+                            source = source_base + index[values.ndim:]
+                            field[index] = original[source]
+                else:
+                    original = values.copy()
+                    for index in _indices(tuple(values.shape)):
+                        source = (index[:axis] + (order[index[axis]],)
+                                  + index[axis + 1:])
+                        values[index] = original[source]
             return None
         if axis != 0:
             raise NotImplementedError("Axis argument is only supported on ndarray objects")
+        if not isinstance(x, Sequence):
+            warnings.warn(
+                f"you are shuffling a '{type(x).__name__}' object which is "
+                "not a subclass of 'Sequence'; `shuffle` is not guaranteed "
+                "to behave correctly.",
+                UserWarning,
+                stacklevel=2,
+            )
         for i in range(len(x) - 1, 0, -1):
             j = self._random_interval(i)
             x[i], x[j] = x[j], x[i]
         return None
+
+    def permuted(self, x, *, axis=None, out=None):
+        x = asarray(x)
+        if out is None:
+            out = x.copy(order="K")
+        else:
+            if not isinstance(out, ndarray):
+                raise TypeError("out must be a numpy array")
+            if not out.flags.writeable:
+                raise ValueError("array is read-only")
+            if tuple(out.shape) != tuple(x.shape):
+                raise ValueError("out must have the same shape as x")
+            if not can_cast(x.dtype, out.dtype, casting="safe"):
+                raise TypeError(
+                    f"Cannot cast array data from dtype('{x.dtype}') to "
+                    f"dtype('{out.dtype}') according to the rule 'safe'"
+                )
+            if out is not x:
+                # ``out`` may overlap ``x`` (for example reversed views).
+                # Preserve all source values before writing any destination.
+                x = x.copy(order="K")
+                for index in _indices(tuple(x.shape)):
+                    out[index] = x[index]
+
+        if axis is None:
+            coordinates = list(_flat_indices(
+                tuple(out.shape),
+                fortran=out.flags.f_contiguous and not out.flags.c_contiguous,
+            ))
+            for i in range(len(coordinates) - 1, 0, -1):
+                j = self._random_interval(i)
+                left, right = coordinates[i], coordinates[j]
+                temporary = out[left]
+                out[left] = out[right]
+                out[right] = temporary
+            return out
+
+        ndim = out.ndim
+        axis = operator.index(axis)
+        if axis < 0:
+            axis += ndim
+        if axis < 0 or axis >= ndim:
+            raise AxisError(axis, ndim=ndim)
+        other_shape = tuple(out.shape[:axis]) + tuple(out.shape[axis + 1:])
+        for other in _indices(other_shape):
+            for i in range(out.shape[axis] - 1, 0, -1):
+                j = self._random_interval(i)
+                left = other[:axis] + (i,) + other[axis:]
+                right = other[:axis] + (j,) + other[axis:]
+                temporary = out[left]
+                out[left] = out[right]
+                out[right] = temporary
+        return out
 
     def permutation(self, x, axis=0):
         try:
@@ -391,15 +500,24 @@ class Generator:
             result = asarray(x).copy()
         else:
             result = arange(n)
+        if result.ndim == 0:
+            raise AxisError(axis, ndim=0)
         self.shuffle(result, axis=axis)
         return result
 
     def choice(self, a, size=None, replace=True, p=None, axis=0, shuffle=True):
-        try:
-            pop_size = operator.index(a)
+        original = a
+        source = asarray(a)
+        if source.ndim == 0:
+            try:
+                pop_size = operator.index(source.item())
+            except TypeError as exc:
+                raise ValueError(
+                    "a must be a sequence or an integer, "
+                    f"not {type(original)}"
+                ) from exc
             source = None
-        except TypeError:
-            source = asarray(a)
+        else:
             axis = operator.index(axis)
             if axis < 0:
                 axis += source.ndim
@@ -418,7 +536,13 @@ class Generator:
 
         weights = None
         if p is not None:
-            weights = [float(v) for v in asarray(p).flat]
+            p_array = asarray(p)
+            if p_array.ndim != 1:
+                raise ValueError("p must be 1-dimensional")
+            try:
+                weights = [float(v) for v in p_array.flat]
+            except (TypeError, ValueError):
+                raise ValueError("Probabilities contain NaN") from None
             if len(weights) != pop_size:
                 raise ValueError("a and p must have same size")
             if any(math.isnan(v) for v in weights):
@@ -426,7 +550,12 @@ class Generator:
             if any(v < 0 for v in weights):
                 raise ValueError("Probabilities are not non-negative")
             total = math.fsum(weights)
-            if abs(total - 1.0) > math.sqrt(2.220446049250313e-16):
+            eps = {
+                "float16": 0.0009765625,
+                "float32": 1.1920928955078125e-07,
+                "float64": 2.220446049250313e-16,
+            }.get(str(p_array.dtype), 2.220446049250313e-16)
+            if abs(total - 1.0) > math.sqrt(eps):
                 raise ValueError("Probabilities do not sum to 1. See Notes section of docstring for more information.")
 
         if replace:
@@ -486,7 +615,8 @@ class Generator:
             index = indices[0]
             if source is None:
                 return int(index)
-            return source.take(index, axis=axis)
+            result = source.take(index, axis=axis)
+            return result[()] if result.ndim == 0 else result
         index_array = array(indices, dtype=int64).reshape(shape)
         if source is None:
             return index_array
@@ -521,7 +651,10 @@ class Generator:
         try:
             arrays = [broadcast_to(value, shape) for value in arrays]
         except ValueError:
-            raise ValueError("shape mismatch: objects cannot be broadcast to a single shape") from None
+            raise ValueError(
+                f"Output size {shape} is not compatible with broadcast "
+                "dimensions of inputs."
+            ) from None
         rows = [tuple(float(value.flat[i]) for value in arrays)
                 for i in range(_count(shape))]
         for values in rows:
@@ -539,8 +672,17 @@ class Generator:
             return draw()
         shape = tuple(out.shape) if out is not None and size is None else _shape(size)
         if out is not None:
-            if tuple(out.shape) != shape or str(out.dtype) != name:
+            if str(out.dtype) != name:
+                raise TypeError(
+                    f"Supplied output array has the wrong type. Expected {name}, "
+                    f"got {out.dtype}"
+                )
+            if tuple(out.shape) != shape:
                 raise ValueError("size must match out.shape when used together")
+            if not (out.flags.c_contiguous or out.flags.f_contiguous):
+                raise ValueError("Supplied output array must be contiguous, writable, aligned, and in machine byte-order.")
+            if not out.flags.writeable:
+                raise ValueError("Supplied output array must be contiguous, writable, aligned, and in machine byte-order.")
             target = out
         else:
             target = empty(shape, dtype=dtype)
@@ -561,8 +703,12 @@ class Generator:
             raise ValueError(f"Method {method} is not supported")
         if method == "inv":
             if _dtype_name(dtype) == "float32":
-                raise TypeError("Unsupported dtype float32 for method inv")
-            draw = lambda: -math.log1p(-self._bit_generator.next_double())
+                draw = lambda: -math.log1p(
+                    -((self._bit_generator.next_uint32() >> 8)
+                      * (1.0 / 16777216.0))
+                )
+            else:
+                draw = lambda: -math.log1p(-self._bit_generator.next_double())
         else:
             draw = (self._distributions.standard_exponential_f
                     if _dtype_name(dtype) == "float32"
@@ -572,8 +718,6 @@ class Generator:
     def standard_gamma(self, shape, size=None, dtype=float64, out=None):
         shape_arr = asarray(shape)
         if shape_arr.ndim != 0:
-            if out is not None:
-                raise NotImplementedError("array shape with out is not supported")
             def validate(values):
                 value = values[0]
                 if (math.isnan(value) or value < 0.0
@@ -582,9 +726,26 @@ class Generator:
             kernel = (self._distributions.standard_gamma_f
                       if _dtype_name(dtype) == "float32"
                       else self._distributions.standard_gamma)
-            return self._broadcast_kernel(
-                (shape,), size, validate, lambda v: kernel(v[0]), dtype=dtype
+            if out is not None:
+                name = _dtype_name(dtype)
+                if str(out.dtype) != name:
+                    raise TypeError(
+                        f"Supplied output array has the wrong type. Expected {name}, "
+                        f"got {out.dtype}"
+                    )
+                if not out.flags.c_contiguous or not out.flags.writeable:
+                    raise ValueError("Supplied output array must be contiguous, writable, aligned, and in machine byte-order.")
+            effective_size = tuple(out.shape) if out is not None and size is None else size
+            result = self._broadcast_kernel(
+                (shape,), effective_size, validate, lambda v: kernel(v[0]), dtype=dtype
             )
+            if out is None:
+                return result
+            if tuple(out.shape) != tuple(result.shape):
+                raise ValueError("size must match out.shape when used together")
+            for i in range(result.size):
+                out.flat[i] = result.flat[i]
+            return out
         shape_value = float(shape)
         if (math.isnan(shape_value) or shape_value < 0.0
                 or (shape_value == 0.0 and math.copysign(1.0, shape_value) < 0.0)):
@@ -795,24 +956,64 @@ class Generator:
         )
 
     def multinomial(self, n, pvals, size=None):
-        if asarray(pvals).ndim == 0:
-            raise ValueError("pvals must be at least 1-dimensional")
-        n = operator.index(n)
-        probs = [float(v) for v in asarray(pvals).flat]
-        if n < 0:
-            raise ValueError("n < 0")
-        if not probs:
-            raise ValueError("pvals must have at least 1 dimension")
-        if any(v < 0.0 or math.isnan(v) for v in probs):
+        p_array = asarray(pvals)
+        if p_array.ndim == 0 or p_array.shape[-1] == 0:
+            raise ValueError(
+                "pvals must have at least 1 dimension and the last dimension "
+                "of pvals must be greater than 0."
+            )
+        d = p_array.shape[-1]
+        try:
+            p_rows = [[float(p_array.flat[offset + j]) for j in range(d)]
+                      for offset in range(0, p_array.size, d)]
+        except (TypeError, ValueError):
+            raise ValueError("pvals < 0, pvals > 1 or pvals contains NaNs") from None
+        if any(v < 0.0 or v > 1.0 or math.isnan(v)
+               for row in p_rows for v in row):
             raise ValueError("pvals < 0, pvals > 1 or pvals contains NaNs")
-        if math.fsum(probs[:-1]) > 1.0 + math.sqrt(2.220446049250313e-16):
-            raise ValueError("sum(pvals[:-1]) > 1.0")
-        shape = _shape(size) + (len(probs),)
-        rows = 1 if size is None else _count(_shape(size))
+        for row in p_rows:
+            if math.fsum(row[:-1]) > 1.0 + 1e-12:
+                if (str(p_array.dtype) in ("float16", "float32")
+                        and math.fsum(row) < 1.0001):
+                    raise ValueError(
+                        "sum(pvals[:-1].astype(np.float64)) > 1.0. The pvals "
+                        "array is cast to 64-bit floating point prior to "
+                        "checking the sum. Precision changes when casting may "
+                        "cause problems even if the sum of the original pvals "
+                        "is valid."
+                    )
+                raise ValueError("sum(pvals[:-1]) > 1.0")
+
+        n_array = asarray(n)
+        p_param_shape = tuple(p_array.shape[:-1])
+        if size is None:
+            n_broadcast, marker = broadcast_arrays(n_array, empty(p_param_shape))
+            row_shape = tuple(n_broadcast.shape)
+        else:
+            row_shape = _shape(size)
+        try:
+            n_broadcast = broadcast_to(n_array, row_shape)
+            p_broadcast = broadcast_to(p_array, row_shape + (d,))
+        except ValueError:
+            raise ValueError(
+                f"Output size {row_shape} is not compatible with broadcast "
+                "dimensions of inputs."
+            ) from None
+        try:
+            n_values = [operator.index(v) for v in n_broadcast.flat]
+        except TypeError:
+            raise TypeError("n must be an integer") from None
+        if any(value < 0 for value in n_values):
+            raise ValueError("n < 0")
+
+        shape = row_shape + (d,)
+        rows = _count(row_shape)
         values = []
-        for _ in range(rows):
-            remaining = n
+        for row_index in range(rows):
+            remaining = n_values[row_index]
             remaining_p = 1.0
+            probs = [float(p_broadcast.flat[row_index * d + j])
+                     for j in range(d)]
             for p in probs[:-1]:
                 if remaining <= 0:
                     draw = 0
@@ -890,6 +1091,13 @@ class Generator:
         if any(v < 0 for v in values):
             raise ValueError("colors must be nonnegative")
         total = sum(values)
+        if method == "marginals" and total >= 10**9:
+            raise ValueError(
+                "When method is 'marginals', the sum of colors must be less "
+                "than 1000000000"
+            )
+        if method == "count" and total > ((1 << 63) - 1) // 8:
+            raise ValueError("colors is too large for the count method")
         if nsample < 0 or nsample > total:
             raise ValueError("nsample must be nonnegative and no greater than colors.sum()")
         out_shape = _shape(size) + (len(values),)

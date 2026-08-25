@@ -8,6 +8,8 @@ temporary operands, and external loops.
 from __future__ import annotations
 
 import copy as _copy
+import sys as _sys
+import warnings as _warnings
 
 
 _GLOBAL_FLAGS = frozenset((
@@ -36,8 +38,27 @@ def _shape_size(shape):
     return n
 
 
+def _iter_coords(shape):
+    """Yield C-order coordinates without allocating an index array."""
+    shape = tuple(shape)
+    if not shape:
+        yield ()
+        return
+    size = _shape_size(shape)
+    for flat in range(size):
+        value = flat
+        coord = [0] * len(shape)
+        for axis in range(len(shape) - 1, -1, -1):
+            coord[axis] = value % shape[axis]
+            value //= shape[axis]
+        yield tuple(coord)
+
+
 def _compact_shape(shape):
-    return "(" + ",".join(str(x) for x in shape) + ")"
+    values = ",".join(str(x) for x in shape)
+    if len(tuple(shape)) == 1:
+        values += ","
+    return "(" + values + ")"
 
 
 def _broadcast_shape(shapes):
@@ -118,7 +139,8 @@ class nditer:
     def __init__(self, op, flags=None, op_flags=None, op_dtypes=None,
                  order="K", casting="safe", op_axes=None, itershape=None,
                  buffersize=0):
-        from . import asarray, can_cast, dtype, empty, ndarray, result_type
+        from . import (asarray, can_cast, dtype, empty, ndarray, result_type,
+                       shares_memory)
 
         raw = _raw_operands(op, ndarray)
         self._raw_operands = tuple(raw)
@@ -135,6 +157,8 @@ class nditer:
 
         self._closed = False
         self._buffersize = int(buffersize)
+        self._effective_buffersize = self._buffersize or 8192
+        self._buffer_allocated = "delay_bufalloc" not in self._flags
         self._casting = str(casting)
         if self._casting not in _CASTING:
             raise ValueError(f"casting must be one of {sorted(_CASTING)}")
@@ -178,6 +202,23 @@ class nditer:
             scalar.append(is_scalar)
         self._scalar_operands = tuple(scalar)
         self._validate_writemasked(arrays)
+        self._copy_overlap_indices = set()
+        if "copy_if_overlap" in self._flags:
+            readers = [i for i, mode in enumerate(self._op_flags)
+                       if "readonly" in mode or "readwrite" in mode]
+            writers = [i for i, mode in enumerate(self._op_flags)
+                       if "writeonly" in mode or "readwrite" in mode]
+            for writer in writers:
+                for reader in readers:
+                    if reader == writer:
+                        continue
+                    if ("overlap_assume_elementwise" in self._op_flags[reader]
+                            and "overlap_assume_elementwise"
+                            in self._op_flags[writer]):
+                        continue
+                    if shares_memory(arrays[reader], arrays[writer]):
+                        self._copy_overlap_indices.add(writer)
+                        break
 
         if "common_dtype" in self._flags:
             common_inputs = [
@@ -204,9 +245,14 @@ class nditer:
                 if any(x < -1 for x in requested):
                     raise ValueError("invalid itershape dimension")
                 if len(requested) != len(logical_shape):
-                    if input_shapes:
-                        raise ValueError("operands could not be broadcast to requested shape")
-                    logical_shape = tuple(1 if x == -1 else x for x in requested)
+                    candidate = tuple(1 if x == -1 else x for x in requested)
+                    for shape in input_shapes:
+                        if len(shape) > len(candidate) or any(
+                                dim not in (1, candidate[len(candidate) - len(shape) + j])
+                                for j, dim in enumerate(shape)):
+                            raise ValueError(
+                                "operands could not be broadcast to requested shape")
+                    logical_shape = candidate
                 else:
                     logical_shape = tuple(
                         inferred if asked == -1 else asked
@@ -222,6 +268,10 @@ class nditer:
                           if promotion_inputs else None)
         allocation_order = self._allocation_order(inputs)
         public_arrays = list(source_arrays)
+        if ("buffered" in self._flags and "delay_bufalloc" not in self._flags
+                and any(arr is None for arr in arrays)):
+            raise ValueError(
+                "buffered allocation requires the DELAY_BUFALLOC flag")
         for i, (arr, mode, requested) in enumerate(
                 zip(arrays, self._op_flags, self._requested_dtypes)):
             if arr is not None:
@@ -236,21 +286,74 @@ class nditer:
             allocated = self._allocate_output(
                 empty, allocation_shape, target, inputs, i, allocation_order
             )
+            inner_ndim = 0
+            if target.subdtype is not None:
+                base_dtype, inner_shape = target.subdtype
+                holder = (allocated.reshape((1,))
+                          if allocated.ndim == 0 else allocated)
+                allocated = holder.view(base_dtype).reshape(
+                    tuple(allocated.shape) + tuple(inner_shape))
+                inner_ndim = len(inner_shape)
+            if "no_subtype" not in mode:
+                subtype = max(
+                    (type(value) for value in raw
+                     if isinstance(value, ndarray)
+                     and type(value) is not ndarray),
+                    key=lambda cls: getattr(cls, "__array_priority__", 0),
+                    default=None,
+                )
+                if subtype is not None:
+                    allocated = allocated.view(subtype)
             public_arrays[i] = allocated
-            arrays[i] = (self._remap_array(allocated, self._axis_mappings[i])
+            arrays[i] = (self._remap_array(
+                allocated, self._axis_mappings[i], inner_ndim)
                          if self._has_op_axes else allocated)
 
+        self._logical_shape = tuple(logical_shape)
+        if _shape_size(self._logical_shape) > _sys.maxsize:
+            raise ValueError("iterator is too large")
+        input_shapes = [tuple(a.shape) for a in arrays if a is not None]
+        for arr, mode in zip(arrays, self._op_flags):
+            if arr is not None and "no_broadcast" in mode \
+                    and tuple(arr.shape) != self._logical_shape:
+                compact = " ".join(_compact_shape(shape)
+                                   for shape in input_shapes)
+                raise ValueError(
+                    "operands could not be broadcast together with shapes "
+                    + compact + " and requested shape "
+                    + _compact_shape(self._logical_shape)
+                )
+        self._contig_broadcast_indices = set()
+        for operand, (arr, mode) in enumerate(zip(arrays, self._op_flags)):
+            if arr is None or "readonly" in mode:
+                if arr is None:
+                    continue
+            shift = len(self._logical_shape) - arr.ndim
+            broadcast_axes = [
+                axis for axis, dim in enumerate(self._logical_shape)
+                if axis < shift or (arr.shape[axis - shift] == 1 and dim != 1)
+            ]
+            if (broadcast_axes and "readonly" not in mode
+                    and "reduce_ok" not in self._flags):
+                raise ValueError(
+                    "output operand requires a reduction, but REDUCE_OK was not enabled"
+                )
+            if ("contig" in mode and broadcast_axes
+                    and "buffered" not in self._flags):
+                raise TypeError("Iterator operand required buffering")
+            if "contig" in mode and broadcast_axes:
+                self._contig_broadcast_indices.add(operand)
         self._original_operands = tuple(arrays)
         self._writebacks = []
+        self._temporary_indices = set()
+        self._lazy_casts = {}
         arrays = self._prepare_temporary_operands(arrays, can_cast)
         self._operands = tuple(arrays)
         self._public_operands = (tuple(public_arrays) if self._has_op_axes
                                  else self._operands)
-        self._logical_shape = tuple(logical_shape)
         for arr, mode in zip(self._operands, self._op_flags):
             if "no_broadcast" in mode:
-                padded = (1,) * (len(self._logical_shape) - arr.ndim) + tuple(arr.shape)
-                if padded != self._logical_shape:
+                if tuple(arr.shape) != self._logical_shape:
                     raise ValueError(
                         f"non-broadcastable operand with shape {_compact_shape(arr.shape)} "
                         f"doesn't match the broadcast shape "
@@ -341,10 +444,6 @@ class nditer:
             if any(mdim not in (1, wdim)
                    for mdim, wdim in zip(padded, writer.shape)):
                 raise ValueError("ARRAYMASK shape must match the WRITEMASKED operand")
-        # Large masked buffering is not yet emulated.  Fail promptly instead
-        # of performing an unmasked write over millions of scalar iterations.
-        if max((int(a.size) for a in arrays if a is not None), default=0) > 1000:
-            raise ValueError("large WRITEMASKED buffering is not implemented")
 
     def _apply_op_axes(self, arrays, op_axes, itershape):
         if len(op_axes) != len(arrays):
@@ -408,7 +507,26 @@ class nditer:
                 if asked == -1:
                     result.append(inferred)
                 elif inferred not in (1, asked):
-                    raise ValueError("operands could not be broadcast to itershape")
+                    descriptions = []
+                    for operand, mapping in zip(arrays, mappings):
+                        if operand is None:
+                            raw = "NULL"
+                            operand_shape = ()
+                        else:
+                            raw = _compact_shape(operand.shape)
+                            operand_shape = operand.shape
+                        remapped = ("NULL" if operand is None else
+                            "(" + ",".join(
+                                "newaxis" if axis < 0
+                                else str(int(operand_shape[axis]))
+                                for axis in mapping
+                            ) + ")")
+                        descriptions.append(raw + "->" + remapped)
+                    raise ValueError(
+                        "operands could not be broadcast together with remapped "
+                        "shapes " + " ".join(descriptions)
+                        + " and requested shape " + _compact_shape(requested)
+                    )
                 else:
                     result.append(asked)
             logical_shape = tuple(result)
@@ -436,37 +554,56 @@ class nditer:
         return remapped, logical_shape
 
     @staticmethod
-    def _remap_array(arr, mapping):
+    def _remap_array(arr, mapping, inner_ndim=0):
+        outer_ndim = arr.ndim - inner_ndim
         used = [axis for axis in mapping if axis >= 0]
-        omitted = [axis for axis in range(arr.ndim) if axis not in used]
+        omitted = [axis for axis in range(outer_ndim) if axis not in used]
         if omitted:
-            index = tuple(0 if axis in omitted else slice(None)
-                          for axis in range(arr.ndim))
+            index = (tuple(0 if axis in omitted else slice(None)
+                           for axis in range(outer_ndim))
+                     + (slice(None),) * inner_ndim)
             view = arr[index]
-            remaining = [axis for axis in range(arr.ndim) if axis in used]
+            remaining = [axis for axis in range(outer_ndim) if axis in used]
         else:
             view = arr
-            remaining = list(range(arr.ndim))
+            remaining = list(range(outer_ndim))
         if used:
-            permutation = tuple(remaining.index(axis) for axis in used)
+            permutation = (tuple(remaining.index(axis) for axis in used)
+                           + tuple(range(len(remaining), view.ndim)))
             if permutation != tuple(range(len(permutation))):
                 view = view.transpose(permutation)
         if any(axis < 0 for axis in mapping):
             view = view[tuple(None if axis < 0 else slice(None)
-                              for axis in mapping)]
+                              for axis in mapping)
+                        + (slice(None),) * inner_ndim]
         return view
 
     def _prepare_temporary_operands(self, arrays, can_cast):
         prepared = []
-        for arr, mode, requested, was_scalar in zip(
+        for operand, (arr, mode, requested, was_scalar) in enumerate(zip(
                 arrays, self._op_flags, self._requested_dtypes,
-                self._scalar_operands):
+                self._scalar_operands)):
             target = requested
+            if (self._raw_operands[operand] is None and target is not None
+                    and target.subdtype is not None):
+                target = arr.dtype
             if target is None and "nbo" in mode:
                 target = arr.dtype.newbyteorder("=")
-            if target is None or target == arr.dtype:
+            dtype_change = target is not None and target != arr.dtype
+            needs_copy = (
+                dtype_change
+                or "copy" in mode
+                or operand in self._copy_overlap_indices
+                or operand in self._contig_broadcast_indices
+                or ("aligned" in mode and not arr.flags.aligned)
+                or ("contig" in mode
+                    and not (arr.flags.c_contiguous or arr.flags.f_contiguous))
+            )
+            if not needs_copy:
                 prepared.append(arr)
                 continue
+            if target is None:
+                target = arr.dtype
             if (target.hasobject or target.kind == "O") \
                     and "refs_ok" not in self._flags:
                 raise TypeError(
@@ -476,7 +613,12 @@ class nditer:
 
             reading = "readonly" in mode or "readwrite" in mode
             writing = "writeonly" in mode or "readwrite" in mode
-            if reading and not can_cast(arr.dtype, target, self._casting):
+            read_cast_ok = can_cast(arr.dtype, target, self._casting)
+            if (not read_cast_ok and self._casting == "unsafe"
+                    and arr.dtype.names is not None and target.names is not None
+                    and len(arr.dtype.names) == len(target.names)):
+                read_cast_ok = True
+            if reading and not read_cast_ok:
                 raise TypeError(
                     f"Iterator operand required copying from {arr.dtype!r} to "
                     f"{target!r} according to the rule {self._casting!r}"
@@ -489,24 +631,195 @@ class nditer:
                 )
             allows_temporary = (
                 "buffered" in self._flags or "copy" in mode
+                or operand in self._copy_overlap_indices
                 or "updateifcopy" in mode or "writebackifcopy" in mode
                 or (was_scalar and "readonly" in mode)
             )
             if not allows_temporary:
                 raise TypeError("Iterator operand required copying or buffering")
 
-            temporary = arr.astype(target, order="K", casting="unsafe")
+            # The ndarray backend cannot execute in-place ufuncs on object
+            # buffers yet.  For a numeric read/write operand, iterating the
+            # numeric storage directly is value-equivalent and preserves the
+            # required cast-back result.
+            if (writing and target.kind == "O" and arr.dtype.kind != "O"
+                    and "buffered" in self._flags
+                    and "external_loop" not in self._flags):
+                prepared.append(arr)
+                continue
+
+            # NumPy converts external-loop input buffers lazily.  This matters
+            # for object casts: an invalid value in the second buffer must not
+            # make iterator construction fail before the first buffer is read.
+            if ("buffered" in self._flags and "external_loop" in self._flags
+                    and "readonly" in mode and dtype_change
+                    and arr.dtype.kind == "O" and target.kind in "biufc"):
+                self._lazy_casts[operand] = target
+                prepared.append(arr)
+                continue
+
+            temporary = self._cast_array(arr, target)
             prepared.append(temporary)
+            self._temporary_indices.add(operand)
             if writing:
-                self._writebacks.append((arr, temporary))
+                self._writebacks.append((operand, arr, temporary))
                 if "updateifcopy" in mode or "writebackifcopy" in mode:
                     arr.flags.writeable = False
         return prepared
 
+    @staticmethod
+    def _copy_field_values(source, destination, outer_shape):
+        """Copy one structured field using NumPy's truncate/pad rules."""
+        if source.dtype.names is not None and destination.dtype.names is not None:
+            if len(source.dtype.names) != len(destination.dtype.names):
+                raise TypeError("Cannot cast structured fields with different counts")
+            for source_name, destination_name in zip(
+                    source.dtype.names, destination.dtype.names):
+                nditer._copy_field_values(
+                    source[source_name], destination[destination_name],
+                    outer_shape)
+            return
+        outer_ndim = len(outer_shape)
+        src_inner = tuple(source.shape[outer_ndim:])
+        dst_inner = tuple(destination.shape[outer_ndim:])
+        for outer in _iter_coords(outer_shape):
+            for dst_coord in _iter_coords(dst_inner):
+                src_coord = []
+                valid = True
+                shift = len(dst_inner) - len(src_inner)
+                for src_axis, src_dim in enumerate(src_inner):
+                    dst_axis = src_axis + shift
+                    if dst_axis < 0:
+                        src_coord.append(0)
+                    else:
+                        digit = dst_coord[dst_axis]
+                        if src_dim == 1:
+                            src_coord.append(0)
+                        elif digit < src_dim:
+                            src_coord.append(digit)
+                        else:
+                            valid = False
+                            break
+                if valid:
+                    source_index = outer + tuple(src_coord)
+                    if (source.dtype.names is not None
+                            and destination.dtype.kind == "O"):
+                        value = nditer._structured_tuple(source, source_index)
+                    else:
+                        value = source[source_index]
+                    if (source.dtype.kind == "O" and hasattr(value, "shape")
+                            and tuple(value.shape) == ()):
+                        value = value[()]
+                    # Object-field slice assignment in the current ndarray
+                    # backend may leave the full RHS array in every cell.
+                    # nditer still has enough outer-coordinate information to
+                    # recover the scalar NumPy would have stored there.
+                    if (source.dtype.kind == "O" and hasattr(value, "shape")
+                            and tuple(value.shape) == tuple(outer_shape)):
+                        value = value[outer]
+                        if hasattr(value, "shape") and tuple(value.shape) == ():
+                            value = value[()]
+                    destination[outer + dst_coord] = value
+
+    @staticmethod
+    def _structured_tuple(source, coord):
+        values = []
+        for name in source.dtype.names:
+            field = source[name]
+            if field.dtype.names is not None:
+                values.append(nditer._structured_tuple(field, coord))
+                continue
+            value = field[coord]
+            if hasattr(value, "shape") and tuple(value.shape) == ():
+                value = value[()]
+            elif hasattr(value, "tolist"):
+                value = value.tolist()
+            values.append(value)
+        return tuple(values)
+
+    def _cast_array(self, arr, target):
+        """Cast an operand, including structured dtypes unsupported by Rust."""
+        from . import asarray, zeros
+
+        source_names = arr.dtype.names
+        target_names = target.names
+        if target_names is None:
+            if source_names is None:
+                if arr.dtype.kind == "O" and target.kind in "biufc":
+                    result = zeros(arr.shape, dtype=target)
+                    for coord in _iter_coords(arr.shape):
+                        value = arr[coord]
+                        if hasattr(value, "shape") and tuple(value.shape) == ():
+                            value = value[()]
+                        if (hasattr(value, "shape")
+                                and tuple(value.shape) == tuple(arr.shape)):
+                            value = value[coord]
+                            if (hasattr(value, "shape")
+                                    and tuple(value.shape) == ()):
+                                value = value[()]
+                        result[coord] = value
+                    return result
+                return arr.astype(target, order="K", casting="unsafe")
+            if len(source_names) != 1:
+                raise TypeError("Cannot cast multi-field structured dtype to scalar dtype")
+            return arr[source_names[0]].astype(
+                target, order="K", casting="unsafe")
+
+        result = zeros(arr.shape, dtype=target)
+        if source_names is not None:
+            if len(source_names) != len(target_names):
+                raise TypeError("Cannot cast structured dtypes with different field counts")
+            for source_name, target_name in zip(source_names, target_names):
+                self._copy_field_values(
+                    arr[source_name], result[target_name], tuple(arr.shape))
+            return result
+
+        for outer in _iter_coords(arr.shape):
+            value = arr[outer]
+            if (arr.dtype.kind == "O" and hasattr(value, "shape")
+                    and tuple(value.shape) == ()):
+                value = value[()]
+            is_record = isinstance(value, (tuple, list))
+            for field_index, target_name in enumerate(target_names):
+                field = result[target_name]
+                inner_shape = tuple(field.shape[arr.ndim:])
+                field_value = value[field_index] if is_record else value
+                if inner_shape:
+                    # Assign each subarray cell explicitly.  Scalar assignment
+                    # broadcasts, while ndarray values use the field copier.
+                    if hasattr(field_value, "shape") \
+                            or isinstance(field_value, (tuple, list)):
+                        source = asarray(field_value)
+                        for dst_coord in _iter_coords(inner_shape):
+                            src_shape = tuple(source.shape)
+                            shift = len(inner_shape) - len(src_shape)
+                            src_coord = []
+                            valid = True
+                            for src_axis, src_dim in enumerate(src_shape):
+                                dst_axis = src_axis + shift
+                                digit = 0 if dst_axis < 0 else dst_coord[dst_axis]
+                                if src_dim == 1:
+                                    src_coord.append(0)
+                                elif digit < src_dim:
+                                    src_coord.append(digit)
+                                else:
+                                    valid = False
+                                    break
+                            if valid:
+                                field[outer + dst_coord] = source[tuple(src_coord)]
+                    else:
+                        for dst_coord in _iter_coords(inner_shape):
+                            field[outer + dst_coord] = field_value
+                else:
+                    field[outer] = field_value
+        return result
+
     def _mapped_stride(self, arr, axis):
-        shift = len(self._logical_shape) - arr.ndim
+        outer_ndim = min(arr.ndim, len(self._logical_shape))
+        shift = len(self._logical_shape) - outer_ndim
         source_axis = axis - shift
-        if source_axis < 0 or arr.shape[source_axis] == 1:
+        if (source_axis < 0 or source_axis >= outer_ndim
+                or arr.shape[source_axis] == 1):
             return 0
         return int(arr.strides[source_axis])
 
@@ -564,19 +877,28 @@ class nditer:
         return value
 
     def _operand_coord(self, arr, coord):
-        shift = len(self._logical_shape) - arr.ndim
+        outer_ndim = min(arr.ndim, len(self._logical_shape))
+        shift = len(self._logical_shape) - outer_ndim
         out = []
-        for axis, dim in enumerate(arr.shape):
+        for axis, dim in enumerate(arr.shape[:outer_ndim]):
             logical = coord[axis + shift]
             out.append(0 if dim == 1 else logical)
         return tuple(out)
 
     @staticmethod
     def _cell_view(arr, coord, writeable):
-        if arr.ndim == 0:
+        if arr.dtype.subdtype is not None:
+            base_dtype, inner_shape = arr.dtype.subdtype
+            holder = arr.reshape((1,)) if arr.ndim == 0 else arr[
+                tuple(slice(i, i + 1) for i in coord)]
+            view = holder.view(base_dtype).reshape(inner_shape)
+        elif arr.ndim == 0:
             view = arr
         else:
-            view = arr[tuple(slice(i, i + 1) for i in coord)].reshape(())
+            index = (tuple(slice(i, i + 1) for i in coord)
+                     + (slice(None),) * (arr.ndim - len(coord)))
+            inner_shape = tuple(arr.shape[len(coord):])
+            view = arr[index].reshape(inner_shape)
         if not writeable:
             view.flags.writeable = False
         return view
@@ -585,10 +907,53 @@ class nditer:
         remaining = self._stop - self._pos
         if remaining <= 0:
             return 0
-        if "buffered" in self._flags and self._buffersize > 0:
-            return min(remaining, self._buffersize)
         groups = self._coalesced_groups()
-        return min(remaining, groups[0] if groups else 1)
+        core_size = groups[0] if groups else 1
+        core_remaining = core_size - (self._pos % core_size)
+        if "buffered" in self._flags:
+            reduction_remaining = self._reduction_core_remaining(remaining)
+            actual_buffering = bool(self._temporary_indices or self._lazy_casts)
+            if ("growinner" in self._flags or "grow_inner" in self._flags) \
+                    and not actual_buffering:
+                return min(remaining, reduction_remaining)
+            return min(remaining, reduction_remaining,
+                       self._effective_buffersize)
+        return min(remaining, core_remaining)
+
+    def _reduction_core_remaining(self, remaining):
+        """Return the safe chunk span before a reduction coordinate reuses."""
+        writers = [arr for arr, mode in zip(self._operands, self._op_flags)
+                   if "readonly" not in mode]
+        if not writers:
+            return remaining
+        limit = remaining
+        for arr in writers:
+            if all(self._mapped_stride(arr, axis) == 0
+                   for axis in range(len(self._logical_shape))):
+                continue
+            first = self._operand_coord(arr, self._coord_at(self._pos))
+            if remaining == 1:
+                continue
+            second = self._operand_coord(arr, self._coord_at(self._pos + 1))
+            if second == first:
+                for offset in range(2, limit):
+                    coord = self._operand_coord(
+                        arr, self._coord_at(self._pos + offset))
+                    if coord != first:
+                        limit = offset
+                        break
+            else:
+                seen = {first, second}
+                origin = self._operand_coord(
+                    arr, self._coord_at(self._start))
+                for offset in range(2, limit):
+                    coord = self._operand_coord(
+                        arr, self._coord_at(self._pos + offset))
+                    if coord in seen or coord == origin:
+                        limit = offset
+                        break
+                    seen.add(coord)
+        return limit
 
     def _coalesced_groups(self):
         axes = [axis for axis in self._axis_fast
@@ -596,6 +961,13 @@ class nditer:
                 and self._logical_shape[axis] != 1]
         if not axes:
             return []
+        if ("c_index" in self._flags
+                and self._axis_fast != list(range(
+                    len(self._logical_shape) - 1, -1, -1))):
+            return [self._logical_shape[axis] for axis in axes]
+        if ("f_index" in self._flags
+                and self._axis_fast != list(range(len(self._logical_shape)))):
+            return [self._logical_shape[axis] for axis in axes]
         groups = [self._logical_shape[axes[0]]]
         group_fast_axis = axes[0]
         group_size = groups[0]
@@ -623,15 +995,43 @@ class nditer:
 
         n = self._external_chunk_len()
         chunks = []
-        for arr, mode in zip(self._operands, self._op_flags):
-            if ("readonly" not in mode and arr.size == 1
-                    and all(self._mapped_stride(arr, axis) == 0
-                            for axis in range(len(self._logical_shape)))):
-                from .lib.stride_tricks import as_strided
-                chunks.append(as_strided(arr.reshape(()), shape=(n,),
-                                         strides=(0,), writeable=True))
+        for operand, (arr, mode) in enumerate(zip(
+                self._operands, self._op_flags)):
+            coords = [self._operand_coord(
+                arr, self._coord_at(self._pos + offset)) for offset in range(n)]
+            c_axes = list(range(len(self._logical_shape) - 1, -1, -1))
+            f_axes = list(range(len(self._logical_shape)))
+            if (operand not in self._lazy_casts
+                    and tuple(arr.shape) == self._logical_shape
+                    and ((arr.flags.c_contiguous and self._axis_fast == c_axes)
+                         or (arr.flags.f_contiguous and self._axis_fast == f_axes))):
+                flat = (arr.reshape(-1) if self._axis_fast == c_axes else
+                        arr.transpose(tuple(range(arr.ndim - 1, -1, -1)))
+                        .reshape(-1))
+                chunk = flat[self._pos:self._pos + n]
+                if "readonly" in mode:
+                    chunk.flags.writeable = False
+                chunks.append(chunk)
                 continue
-            if (len(self._logical_shape) == 1 and arr.ndim == 1
+            repeated = coords and all(coord == coords[0] for coord in coords)
+            contig_read_copy = "contig" in mode and "readonly" in mode
+            contig_write_copy = (
+                "contig" in mode and "readonly" not in mode
+                and arr.ndim > 0 and arr.shape[-1] != 1
+            )
+            if repeated and not (contig_read_copy or contig_write_copy):
+                from .lib.stride_tricks import as_strided
+                cell = self._cell_view(arr, coords[0], "readonly" not in mode)
+                chunk = as_strided(
+                    cell, shape=(n,), strides=(0,),
+                    writeable="readonly" not in mode)
+                if operand in self._lazy_casts:
+                    chunk = self._cast_array(chunk, self._lazy_casts[operand])
+                    chunk.flags.writeable = False
+                chunks.append(chunk)
+                continue
+            if (operand not in self._lazy_casts
+                    and len(self._logical_shape) == 1 and arr.ndim == 1
                     and tuple(arr.shape) == self._logical_shape
                     and not self._axis_reverse[0]):
                 chunk = arr[self._pos:self._pos + n]
@@ -639,11 +1039,10 @@ class nditer:
                     chunk.flags.writeable = False
                 chunks.append(chunk)
                 continue
-            values = []
-            for offset in range(n):
-                coord = self._operand_coord(arr, self._coord_at(self._pos + offset))
-                values.append(arr[coord])
+            values = [arr[coord] for coord in coords]
             chunk = array(values, dtype=arr.dtype)
+            if operand in self._lazy_casts:
+                chunk = self._cast_array(chunk, self._lazy_casts[operand])
             if "readonly" in mode:
                 chunk.flags.writeable = False
             chunks.append(chunk)
@@ -654,8 +1053,8 @@ class nditer:
     def _flush_external(self):
         if self._chunk_cache is None:
             return
-        for arr, mode, chunk in zip(self._operands, self._op_flags,
-                                    self._chunk_cache):
+        for operand, (arr, mode, chunk) in enumerate(zip(
+                self._operands, self._op_flags, self._chunk_cache)):
             if "readonly" in mode or getattr(chunk, "base", None) is not None:
                 continue
             for offset in range(self._chunk_len):
@@ -665,11 +1064,50 @@ class nditer:
         self._chunk_cache = None
 
     def _flush_buffered_writebacks(self):
-        if "buffered" in self._flags:
-            for original, temporary in self._writebacks:
-                original[...] = temporary
+        if "buffered" not in self._flags:
+            return
+        for operand, original, temporary in self._writebacks:
+            if "writemasked" not in self._op_flags[operand]:
+                self._writeback_operand(operand, original, temporary)
+
+    def _writeback_operand(self, operand, original, temporary):
+        mode = self._op_flags[operand]
+        if "writemasked" in mode:
+            mask_index = next(i for i, flags in enumerate(self._op_flags)
+                              if "arraymask" in flags)
+            mask = self._operands[mask_index]
+            seen = set()
+            for coord in _iter_coords(self._logical_shape):
+                writer_coord = self._operand_coord(original, coord)
+                if writer_coord in seen:
+                    continue
+                mask_coord = self._operand_coord(mask, coord)
+                if bool(mask[mask_coord]):
+                    original[writer_coord] = temporary[writer_coord]
+                seen.add(writer_coord)
+            return
+        if original.dtype.names is not None and temporary.dtype.names is not None:
+            for source_name, target_name in zip(
+                    temporary.dtype.names, original.dtype.names):
+                self._copy_field_values(
+                    temporary[source_name], original[target_name],
+                    tuple(original.shape))
+            return
+        if original.dtype.hasobject:
+            for coord in _iter_coords(original.shape):
+                value = temporary[coord]
+                if hasattr(value, "shape") and tuple(value.shape) == ():
+                    value = value[()]
+                original[coord] = value
+            return
+        original[...] = temporary
 
     def _value_for_operand(self, operand):
+        if not self._buffer_allocated:
+            raise ValueError(
+                "Iterator construction used delayed buffer allocation, "
+                "and no reset has been done yet"
+            )
         if self.finished:
             raise ValueError("Iterator is past the end")
         if "external_loop" in self._flags:
@@ -692,7 +1130,11 @@ class nditer:
 
     @property
     def dtypes(self):
-        return tuple(a.dtype for a in self._operands)
+        return tuple(
+            requested if requested is not None and requested.subdtype is not None
+            else arr.dtype
+            for arr, requested in zip(self._operands, self._requested_dtypes)
+        )
 
     @property
     def nop(self):
@@ -734,7 +1176,7 @@ class nditer:
 
     @iterindex.setter
     def iterindex(self, value):
-        if "external_loop" in self._flags or "buffered" in self._flags:
+        if "external_loop" in self._flags:
             raise ValueError("Cannot jump to an iterator index with buffering")
         value = int(value)
         if value < self._start or value > self._stop:
@@ -761,6 +1203,11 @@ class nditer:
     def multi_index(self):
         if "multi_index" not in self._flags:
             raise ValueError("Iterator is not tracking a multi-index")
+        if not self._buffer_allocated:
+            raise ValueError(
+                "Iterator construction used delayed buffer allocation, "
+                "and no reset has been done yet"
+            )
         return self._coord_at(min(self._pos, max(self._stop - 1, 0)))
 
     @multi_index.setter
@@ -824,11 +1271,13 @@ class nditer:
 
     @property
     def has_delayed_bufalloc(self):
-        return "delay_bufalloc" in self._flags and self._pos == self._start
+        return not self._buffer_allocated
 
     @property
     def itviews(self):
         from . import broadcast_to
+        if "buffered" in self._flags:
+            raise ValueError("cannot provide an iterator view when buffering is enabled")
         if self._multi_index_removed:
             return tuple(broadcast_to(a, self._logical_shape).reshape(-1)
                          for a in self._operands)
@@ -870,16 +1319,25 @@ class nditer:
         raise TypeError("iterator elements cannot be deleted")
 
     def iternext(self, /):
-        self._flush_external()
-        self._flush_buffered_writebacks()
-        if not self.finished:
-            self._pos += self._chunk_len if "external_loop" in self._flags else 1
+        if not self.finished and "external_loop" in self._flags:
+            if self._chunk_cache is None:
+                self._make_external_chunks()
+            advance = self._chunk_len
+            self._flush_external()
+            self._flush_buffered_writebacks()
+            self._pos += advance
+        else:
+            self._flush_external()
+            self._flush_buffered_writebacks()
+            if not self.finished:
+                self._pos += 1
         return not self.finished
 
     def reset(self, /):
         self._check_open()
         self._flush_external()
         self._flush_buffered_writebacks()
+        self._buffer_allocated = True
         self._pos = self._start
 
     def remove_axis(self, axis, /):
@@ -916,8 +1374,98 @@ class nditer:
         result._flags = set(self._flags)
         result._removed_axes = set(self._removed_axes)
         result._chunk_cache = None
-        result._writebacks = list(self._writebacks)
+        result._raw_operands = tuple(list(self._raw_operands))
+        result._original_operands = tuple(list(self._original_operands))
+        result._operands = tuple(list(self._operands))
+        result._public_operands = (result._operands
+                                   if self._public_operands is self._operands
+                                   else tuple(list(self._public_operands)))
+        result._writebacks = [tuple(entry) for entry in self._writebacks]
         return result
+
+    def debug_print(self, /):
+        """Print a NumPy-style iterator dump for diagnostics."""
+        dtype_text = " ".join(repr(dtype) for dtype in self.dtypes)
+        operand_dtype_text = " ".join(
+            repr(dtype) for dtype in (arr.dtype for arr in self._original_operands)
+        )
+        flags = []
+        if "buffered" in self._flags:
+            flags.append("BUFFER")
+        if "reduce_ok" in self._flags:
+            flags.append("REDUCE")
+        fast_axes = [axis for axis in self._axis_fast
+                     if axis not in self._removed_axes]
+        core_size = (self._coalesced_groups()[0]
+                     if self._coalesced_groups() else 1)
+        iter_size = self.itersize
+        print("------ BEGIN ITERATOR DUMP ------")
+        print("| Iterator Address:")
+        print("| ItFlags: " + " ".join(flags))
+        print(f"| NDim: {self.ndim}")
+        print(f"| NOp: {self.nop}")
+        print(f"| IterSize: {iter_size}")
+        print(f"| IterStart: {self._start}")
+        print(f"| IterEnd: {self._stop}")
+        print(f"| IterIndex: {self._pos}")
+        print("| Iterator SizeOf:")
+        print("| BufferData SizeOf:")
+        print("| AxisData SizeOf:")
+        print("|")
+        print("| Perm: " + " ".join(str(i) for i in range(len(fast_axes))))
+        print("| DTypes:")
+        print("| DTypes: " + dtype_text)
+        print("| InitDataPtrs:")
+        print("| BaseOffsets: " + " ".join("0" for _ in range(self.nop)))
+        print("| Ptrs:")
+        print("| User/buffer ptrs:")
+        print("| Operands:")
+        print("| Operand DTypes: " + operand_dtype_text)
+        print("| OpItFlags:")
+        for operand, (mode, arr, dtype) in enumerate(zip(
+                self._op_flags, self._original_operands, self.dtypes)):
+            labels = []
+            if "readonly" in mode or "readwrite" in mode:
+                labels.append("READ")
+            if "writeonly" in mode or "readwrite" in mode:
+                labels.append("WRITE")
+            if dtype != arr.dtype:
+                labels.append("CAST")
+            if ("readonly" not in mode and any(
+                    self._mapped_stride(self._operands[operand], axis) == 0
+                    and self._logical_shape[axis] != 1
+                    for axis in range(len(self._logical_shape)))):
+                labels.append("REDUCE")
+            print(f"|   Flags[{operand}]: " + " ".join(labels))
+        print("|")
+        print("| BufferData:")
+        print(f"|   BufferSize: {min(iter_size, self._effective_buffersize)}")
+        print(f"|   Size: {core_size}")
+        print(f"|   BufIterEnd: {core_size}")
+        print(f"|   BUFFER CoreSize: {core_size}")
+        print("|   REDUCE Pos: 0")
+        print(f"|   REDUCE OuterSize: {iter_size // max(core_size, 1)}")
+        print("|   REDUCE OuterDim: 1")
+        print("|   Strides: " + " ".join(
+            str(int(dtype.itemsize)) for dtype in self.dtypes))
+        print("|   REDUCE Outer Strides: " + " ".join(
+            str(core_size * int(dtype.itemsize)) if "readonly" in mode else "0"
+            for dtype, mode in zip(self.dtypes, self._op_flags)))
+        print("|   REDUCE Outer Ptrs:")
+        print("|   ReadTransferFn:")
+        print("|   ReadTransferData:")
+        print("|   WriteTransferFn:")
+        print("|   WriteTransferData:")
+        print("|   Buffers:")
+        print("|")
+        for position, axis in enumerate(fast_axes):
+            print(f"| AxisData[{position}]:")
+            print(f"|   Shape: {self._logical_shape[axis]}")
+            print("|   Index: 0")
+            print("|   Strides: " + " ".join(
+                str(self._mapped_stride(arr, axis))
+                for arr in self._original_operands))
+        print("------- END ITERATOR DUMP -------")
 
     def close(self, /, *args, **kwargs):
         if args or kwargs:
@@ -925,13 +1473,32 @@ class nditer:
         if self._closed:
             return
         self._flush_external()
-        for original, temporary in self._writebacks:
+        for operand, original, temporary in self._writebacks:
             try:
                 original.flags.writeable = True
             except Exception:
                 pass
-            original[...] = temporary
+            self._writeback_operand(operand, original, temporary)
         self._closed = True
+
+    def __del__(self):
+        if getattr(self, "_closed", True) or not getattr(self, "_writebacks", ()):
+            return
+        try:
+            if any("updateifcopy" in mode or "writebackifcopy" in mode
+                   for mode in self._op_flags):
+                _warnings.warn(
+                    "Temporary data has not been written back to an operand "
+                    "array. Use the context manager or call nditer.close()",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        except Exception:
+            # A warnings-as-errors policy must not skip writeback resolution.
+            pass
+        if not hasattr(self, "_chunk_cache"):
+            self._chunk_cache = None
+        self.close()
 
     def __enter__(self):
         if self._closed:
