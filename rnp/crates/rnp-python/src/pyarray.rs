@@ -1788,6 +1788,16 @@ impl PyNdArray {
             }
         }
         let ax = resolve_axis(&self.arr, axis)?;
+        if m == TakeMode::Raise
+            && ax == Some(0)
+            && out.is_none_or(|o| o.is_none())
+        {
+            if let Some(res) = rnp_core::indexing::gather_contiguous_axis0(&self.arr, &idx)
+                .map_err(crate::err)?
+            {
+                return Ok(PyNdArray::into_py_any(res, py)?.into_bound(py).into_any());
+            }
+        }
         let res = rnp_core::indexing::take(&self.arr, &idx, ax, m).map_err(crate::err)?;
         store_or_wrap(py, res, out)
     }
