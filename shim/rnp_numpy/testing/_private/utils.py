@@ -131,6 +131,15 @@ def _values_equal(a, b):
         af, ashape = _flat(a)
         bf, bshape = _flat(b)
         return ashape == bshape and all(_values_equal(x, y) for x, y in zip(af, bf))
+    try:
+        a_is_nat = np.isnat(a)
+        b_is_nat = np.isnat(b)
+        same_datetime_kind = (
+            np.asarray(a).dtype.type == np.asarray(b).dtype.type)
+        if a_is_nat and b_is_nat:
+            return same_datetime_kind
+    except (AttributeError, TypeError, ValueError, NotImplementedError):
+        pass
     # NumPy compares an integer array against an inexact sequence after
     # applying the array comparison's common dtype.  This matters for Python
     # integer lists containing values above INT64_MAX: ``asarray`` discovers
@@ -314,13 +323,13 @@ def assert_array_almost_equal_nulp(x, y, nulp=1):
         if np.iscomplexobj(x) or np.iscomplexobj(y):
             msg = f"Arrays are not equal to {nulp} ULP"
         else:
-            max_nulp = np.max(_nulp_diff(x, y))
+            max_nulp = np.max(nulp_diff(x, y))
             msg = f"Arrays are not equal to {nulp} ULP (max is {max_nulp:g})"
         raise AssertionError(msg)
 
 
 def assert_array_max_ulp(a, b, maxulp=1, dtype=None):
-    ret = _nulp_diff(a, b, dtype)
+    ret = nulp_diff(a, b, dtype)
     if not np.all(ret <= maxulp):
         raise AssertionError(
             f"Arrays are not almost equal up to {maxulp:g} ULP "
@@ -328,51 +337,64 @@ def assert_array_max_ulp(a, b, maxulp=1, dtype=None):
     return ret
 
 
-def _integer_repr(x, view_dtype, complement):
-    """Interpret float bits in monotonic signed-magnitude order."""
-    result = x.view(view_dtype)
-    if result.size != 1:
-        negative = result < 0
-        result[negative] = complement - result[negative]
-    elif result < 0:
-        result = complement - result
-    return result
-
-
-def _float_integer_repr(x):
-    if x.dtype == np.float16:
-        return _integer_repr(x, np.int16, np.int16(-(2 ** 15)))
-    if x.dtype == np.float32:
-        return _integer_repr(x, np.int32, np.int32(-(2 ** 31)))
-    if x.dtype == np.float64:
-        return _integer_repr(x, np.int64, np.int64(-(2 ** 63)))
-    raise ValueError(f"Unsupported dtype {x.dtype}")
-
-
-def _nulp_diff(x, y, dtype=None):
-    """Return elementwise distance in representable floating-point values."""
-    if dtype is not None:
+def nulp_diff(x, y, dtype=None):
+    """For each item, return the number of representable floats between it."""
+    if dtype:
         x = np.asarray(x, dtype=dtype)
         y = np.asarray(y, dtype=dtype)
     else:
         x = np.asarray(x)
         y = np.asarray(y)
 
-    common = np.common_type(x, y)
+    t = np.common_type(x, y)
     if np.iscomplexobj(x) or np.iscomplexobj(y):
         raise NotImplementedError("_nulp not implemented for complex array")
 
-    x = np.array([x], dtype=common)
-    y = np.array([y], dtype=common)
+    x = np.array([x], dtype=t)
+    y = np.array([y], dtype=t)
+
     x[np.isnan(x)] = np.nan
     y[np.isnan(y)] = np.nan
-    if x.shape != y.shape:
-        raise ValueError(
-            f"Arrays do not have the same shape: {x.shape} - {y.shape}")
 
-    rx = _float_integer_repr(x)
-    ry = _float_integer_repr(y)
-    return np.abs(np.asarray(rx - ry, dtype=common))
+    if not x.shape == y.shape:
+        raise ValueError(f"Arrays do not have the same shape: {x.shape} - {y.shape}")
+
+    def _diff(rx, ry, vdt):
+        diff = np.asarray(rx - ry, dtype=vdt)
+        return np.abs(diff)
+
+    rx = integer_repr(x)
+    ry = integer_repr(y)
+    return _diff(rx, ry, t)
+
+
+def _integer_repr(x, vdt, comp):
+    # Reinterpret binary representation of the float as sign-magnitude:
+    # take into account two-complement representation
+    # See also
+    # https://randomascii.wordpress.com/2012/02/25/comparing-floating-point-numbers-2012-edition/
+    rx = x.view(vdt)
+    if not (rx.size == 1):
+        rx[rx < 0] = comp - rx[rx < 0]
+    elif rx < 0:
+        rx = comp - rx
+
+    return rx
+
+
+def integer_repr(x):
+    """Return the signed-magnitude interpretation of the float's bits."""
+    if x.dtype == np.float16:
+        return _integer_repr(x, np.int16, np.int16(-2**15))
+    elif x.dtype == np.float32:
+        return _integer_repr(x, np.int32, np.int32(-2**31))
+    elif x.dtype == np.float64:
+        return _integer_repr(x, np.int64, np.int64(-2**63))
+    else:
+        raise ValueError(f'Unsupported dtype {x.dtype}')
+
+
+_nulp_diff = nulp_diff
 
 
 def assert_string_equal(actual, desired):
