@@ -1578,7 +1578,7 @@ class _TimeScalar:
         target = cls._char if suffix is None else f"{cls._char}[{suffix}]"
         no_arg = value is None
         if no_arg:
-            value = "NaT"
+            value = 0 if cls._char == "m8" else "NaT"
         elif cls._char == "M8" and suffix is None and isinstance(
                 value, (int, _builtins.bool)) and not isinstance(value, generic):
             # numpy refuses to guess a unit for a bare integer datetime.

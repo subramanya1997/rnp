@@ -79,7 +79,14 @@ def _vec_string(char_array, dtype, method, args=()):
     return _impl(char_array, dtype, method, args)
 
 
-scalar = not_implemented("numpy._core.multiarray.scalar")
+def scalar(dtype_):
+    """Create the zero/default scalar for a builtin descriptor."""
+    dt = dtype(dtype_)
+    if dt.kind in "OT":
+        raise TypeError(f"Cannot create a scalar with {dt!r}")
+    if dt.kind == "V":
+        return dt.type(b"\x00")
+    return dt.type()
 set_datetimeparse_function = not_implemented(
     "numpy._core.multiarray.set_datetimeparse_function")
 from .._datetime import (  # noqa: E402
