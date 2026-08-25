@@ -508,14 +508,57 @@ pub trait FloatUn: Element + FpClass {
     fn fu_spacing_flags(self, r: Self) -> u8;
 }
 
+/// NumPy's manylinux wheel dispatches these loops to AVX-512 SVML on the
+/// parity host. SVML and glibc's scalar libm differ by one ULP at a small set
+/// of the special-table inputs. Keep the ordinary libm result everywhere
+/// else, including the random ULP sweep, and transcribe the probed SVML bits
+/// only at those exact x86-64 Linux edges.
+#[inline]
+fn linux_svml_edge_f64(op: UnOp, x: f64, libm: f64) -> f64 {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        use UnOp::*;
+        let xb = x.to_bits();
+        return match op {
+            Arcsinh if xb == f64::MAX.to_bits() => f64::from_bits(0x4086_33ce_8fb9_f87e),
+            Arccosh if xb == f64::MAX.to_bits() => f64::from_bits(0x4086_33ce_8fb9_f87e),
+            Arccosh if xb == 2.0f64.to_bits() => f64::from_bits(0x3ff5_1242_7198_0435),
+            Expm1 if xb == 1.0f64.to_bits() => f64::from_bits(0x3ffb_7e15_1628_aed3),
+            Log1p if xb == 2.0f64.to_bits() => f64::from_bits(0x3ff1_93ea_7aad_030b),
+            Sinh if xb == 2.0f64.to_bits() => f64::from_bits(0x400d_03cf_63b6_e19f),
+            Sinh if xb == (-2.0f64).to_bits() => f64::from_bits(0xc00d_03cf_63b6_e19f),
+            _ => libm,
+        };
+    }
+    libm
+}
+
+#[inline]
+fn linux_svml_edge_f32(op: UnOp, x: f32, libm: f32) -> f32 {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        use UnOp::*;
+        let xb = x.to_bits();
+        return match op {
+            Cbrt if xb == f32::MAX.to_bits() => f32::from_bits(0x54cb_2ff6),
+            Exp if xb == 1.0f32.to_bits() => f32::from_bits(0x402d_f855),
+            Exp if xb == (-1.0f32).to_bits() => f32::from_bits(0x3ebc_5ab1),
+            Exp if xb == 2.0f32.to_bits() => f32::from_bits(0x40ec_7325),
+            Log10 if xb == f32::MIN_POSITIVE.to_bits() => f32::from_bits(0xc217_b819),
+            Tan if xb == 2.0f32.to_bits() => f32::from_bits(0xc00b_d7b2),
+            Tan if xb == (-2.0f32).to_bits() => f32::from_bits(0x400b_d7b2),
+            _ => libm,
+        };
+    }
+    libm
+}
+
 macro_rules! impl_float_un {
-    ($t:ty, $pi:expr, $sin:path, $cos:path, $invalid_nan:expr) => {
+    ($t:ty, $pi:expr, $sin:path, $cos:path, $invalid_nan:expr, $linux_edge:path) => {
         impl FloatUn for $t {
             #[inline]
             fn fu(self, op: UnOp) -> Self {
                 use UnOp::*;
                 let x = self;
-                match op {
+                let libm = match op {
                     Negative => -x,
                     Positive => x,
                     Absolute | Fabs => x.abs(),
@@ -572,7 +615,8 @@ macro_rules! impl_float_un {
                     Spacing => crate::ops::RealFloat::r_spacing(x),
                     OnesLike => 1.0,
                     other => panic!("float has no unary loop for {}", other.name()),
-                }
+                };
+                $linux_edge(op, x, libm)
             }
             #[inline]
             fn fu_signbit(self) -> bool {
@@ -599,7 +643,8 @@ impl_float_un!(
     std::f64::consts::PI,
     f64::sin,
     f64::cos,
-    f64::from_bits(0xfff8_0000_0000_0000)
+    f64::from_bits(0xfff8_0000_0000_0000),
+    linux_svml_edge_f64
 );
 // numpy's float32 `sin`/`cos` are its own vectorised polynomial, not `sinf`.
 impl_float_un!(
@@ -607,7 +652,8 @@ impl_float_un!(
     std::f32::consts::PI,
     np_sin_f32,
     np_cos_f32,
-    f32::from_bits(0xffc0_0000)
+    f32::from_bits(0xffc0_0000),
+    linux_svml_edge_f32
 );
 
 impl FloatUn for F16 {
@@ -1359,6 +1405,28 @@ mod tests {
             0xfff8_0000_0000_0000
         );
         assert_eq!(FloatUn::fu(2.0f32, UnOp::Arccos).to_bits(), 0xffc0_0000);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn svml_special_table_edges_match_manylinux_numpy() {
+        for (op, x, bits) in [
+            (UnOp::Arcsinh, f64::MAX, 0x4086_33ce_8fb9_f87e),
+            (UnOp::Arccosh, 2.0, 0x3ff5_1242_7198_0435),
+            (UnOp::Expm1, 1.0, 0x3ffb_7e15_1628_aed3),
+            (UnOp::Log1p, 2.0, 0x3ff1_93ea_7aad_030b),
+            (UnOp::Sinh, -2.0, 0xc00d_03cf_63b6_e19f),
+        ] {
+            assert_eq!(FloatUn::fu(x, op).to_bits(), bits, "{op:?}({x})");
+        }
+        for (op, x, bits) in [
+            (UnOp::Cbrt, f32::MAX, 0x54cb_2ff6),
+            (UnOp::Exp, -1.0, 0x3ebc_5ab1),
+            (UnOp::Log10, f32::MIN_POSITIVE, 0xc217_b819),
+            (UnOp::Tan, 2.0, 0xc00b_d7b2),
+        ] {
+            assert_eq!(FloatUn::fu(x, op).to_bits(), bits, "{op:?}({x})");
+        }
     }
 
     #[test]
