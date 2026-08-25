@@ -1675,23 +1675,34 @@ def join_by(key, r1, r2, jointype='inner', r1postfix='1', r2postfix='2',
     cmn = max(r1cmn, r2cmn)
     # Construct an empty array
     output = ma.masked_all((cmn + r1spc + r2spc,), dtype=ndtype)
+    # rnp's masked-array field views currently reshape the field mask through
+    # a copy, so assigning through ``output[field]`` updates the record data
+    # but not the parent mask.  Also initialize every structured mask field
+    # explicitly: the engine's scalar ``ones`` fill only reaches the leading
+    # bytes of a void record.  Keeping both operations here makes join_by's
+    # missing-side masks and filled output independent of those two lower
+    # level limitations.
+    output._mask[...] = True
+
+    def assign(field, destination, values):
+        output[field][destination] = values
+        output._mask[field][destination] = ma.getmaskarray(values)
+
     names = output.dtype.names
     for f in r1names:
         selected = s1[f]
         if f not in names or (f in r2names and not r2postfix and f not in key):
             f += r1postfix
-        current = output[f]
-        current[:r1cmn] = selected[:r1cmn]
+        assign(f, slice(None, r1cmn), selected[:r1cmn])
         if jointype in ('outer', 'leftouter'):
-            current[cmn:cmn + r1spc] = selected[r1cmn:]
+            assign(f, slice(cmn, cmn + r1spc), selected[r1cmn:])
     for f in r2names:
         selected = s2[f]
         if f not in names or (f in r1names and not r1postfix and f not in key):
             f += r2postfix
-        current = output[f]
-        current[:r2cmn] = selected[:r2cmn]
+        assign(f, slice(None, r2cmn), selected[:r2cmn])
         if (jointype == 'outer') and r2spc:
-            current[-r2spc:] = selected[r2cmn:]
+            assign(f, slice(-r2spc, None), selected[r2cmn:])
     # Sort and finalize the output
     output_order = _structured_argsort(output, key)
     output = ma.array(output._data[output_order],
