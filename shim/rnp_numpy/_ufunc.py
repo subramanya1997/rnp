@@ -404,6 +404,23 @@ def _is_scalarish(x):
     return not isinstance(x, (list, tuple))
 
 
+def _array_wrap_candidate(operands):
+    """Return NumPy's highest-priority legacy ``__array_wrap__`` operand."""
+    candidate = None
+    priority = float("-inf")
+    for operand in operands:
+        if operand is None or type(operand) is ndarray:
+            continue
+        wrap = getattr(operand, "__array_wrap__", None)
+        if not callable(wrap):
+            continue
+        value = getattr(operand, "__array_priority__", 0.0)
+        if candidate is None or value > priority:
+            candidate = operand
+            priority = value
+    return candidate
+
+
 class ufunc:
     """A numpy ufunc."""
 
@@ -505,6 +522,7 @@ class ufunc:
                     f"invalid number of arguments to ufunc {self.__name__!r}")
             return self._call_gufunc(args, out, casting, dtype, axes, axis)
         where = True if where is _UNSET else where
+        input_args = args[:self.nin]
         if len(args) > self.nin:
             # numpy allows the outputs to be passed positionally.
             out = args[self.nin] if out is None else out
@@ -514,6 +532,14 @@ class ufunc:
                 f"invalid number of arguments to ufunc {self.__name__!r}")
         if isinstance(out, tuple):
             out = out[0] if len(out) == 1 else out
+        outputs = out if isinstance(out, tuple) else (out,)
+        concrete_outputs = tuple(o for o in outputs if o is not None)
+        context_args = tuple(input_args) + concrete_outputs
+        # A concrete output controls wrapping.  In particular, an exact
+        # ndarray ``out`` suppresses wrapping requested by an input subtype.
+        wrap_source = concrete_outputs if concrete_outputs else input_args
+        wrap_candidate = (_array_wrap_candidate(wrap_source)
+                          if subok or concrete_outputs else None)
         # NumPy's private quantile path uses ``out=...`` to request a newly
         # allocated ndarray.  It differs from omitted ``out`` only for scalar
         # inputs, where the result must remain a 0-d array rather than being
@@ -537,6 +563,15 @@ class ufunc:
         if self._pyfunc is not None:
             return self._call_pyfunc(
                 args, out, where, casting, dtype, allocate_out, scalar_out)
+        # Legacy array-like objects participate through ``__array__`` and
+        # receive the result through ``__array_wrap__``.  Keep ``input_args``
+        # untouched for the wrap context while giving the engine concrete
+        # operands.
+        args = tuple(
+            _rnp.asarray(a)
+            if not isinstance(a, ndarray) and hasattr(a, "__array__") else a
+            for a in args
+        )
         res = None
         if (self.__name__ == "isnan" and out is None and dtype is None
                 and where is True):
@@ -564,7 +599,21 @@ class ufunc:
                 raise
         _errstate.drain(self.__name__)
         if isinstance(res, tuple):
-            return tuple(_maybe_scalar(r, scalar_out) for r in res)
+            wrapped = []
+            for index, result in enumerate(res):
+                candidate = wrap_candidate
+                if concrete_outputs and index < len(outputs):
+                    candidate = _array_wrap_candidate((outputs[index],))
+                if candidate is not None:
+                    result = candidate.__array_wrap__(
+                        result, (self, context_args, index), scalar_out)
+                else:
+                    result = _maybe_scalar(result, scalar_out)
+                wrapped.append(result)
+            return tuple(wrapped)
+        if wrap_candidate is not None:
+            return wrap_candidate.__array_wrap__(
+                res, (self, context_args, 0), scalar_out)
         return _maybe_scalar(res, scalar_out)
 
     def _dispatch_pyfunc_override(self, args, out):
@@ -1034,9 +1083,13 @@ class ufunc:
                 "signature")
         if not self._ok or self.nin != 2:
             self._nope("outer")
-        a = _rnp.asarray(a)
-        b = _rnp.asarray(b)
-        a2 = a.reshape(a.shape + (1,) * b.ndim)
+        a = _rnp.asarray(a) if not isinstance(a, ndarray) else a
+        b = _rnp.asarray(b) if not isinstance(b, ndarray) else b
+        # Basic indexing preserves ndarray subtypes and invokes
+        # ``__array_finalize__``; the engine's reshape currently returns an
+        # exact ndarray and would discard the outer operand's subtype before
+        # the normal ufunc wrapping step can see it.
+        a2 = a[(Ellipsis,) + (None,) * b.ndim]
         return self(a2, b, **kwargs)
 
     def at(self, a, indices, b=None):

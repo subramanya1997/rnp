@@ -486,7 +486,10 @@ def astype(self, /, dtype, order="K", casting="unsafe", subok=True,
 # ---------------------------------------------------------------------------
 
 def copy_method(self, /, order="C"):
-    return _ordered_copy(self, self.dtype, _norm_order(order, "C"))
+    result = _ordered_copy(self, self.dtype, _norm_order(order, "C"))
+    if type(self) is not ndarray and type(result) is ndarray:
+        result = result.view(type(self))
+    return result
 
 
 def ravel_method(self, /, order="C"):

@@ -140,6 +140,14 @@ def _values_equal(a, b):
             return same_datetime_kind
     except (AttributeError, TypeError, ValueError, NotImplementedError):
         pass
+    # Match NumPy testing's scalar NaN rule for every inexact scalar type,
+    # including float16/float32 and complex values with a NaN in either
+    # component.  Restricting this to Python ``float`` misses NumPy scalars.
+    try:
+        if bool(np.isnan(a)) and bool(np.isnan(b)):
+            return True
+    except (AttributeError, TypeError, ValueError, NotImplementedError):
+        pass
     # NumPy compares an integer array against an inexact sequence after
     # applying the array comparison's common dtype.  This matters for Python
     # integer lists containing values above INT64_MAX: ``asarray`` discovers
@@ -149,9 +157,6 @@ def _values_equal(a, b):
     if ((isinstance(a, int) and isinstance(b, float)) or
             (isinstance(a, float) and isinstance(b, int))):
         return float(a) == float(b)
-    if isinstance(a, float) and isinstance(b, float):
-        if a != a and b != b:
-            return True
     if isinstance(a, complex) or isinstance(b, complex):
         ar, ai = complex(a).real, complex(a).imag
         br, bi = complex(b).real, complex(b).imag
