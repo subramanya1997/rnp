@@ -454,13 +454,17 @@ macro_rules! impl_int_ufuncs {
             #[inline] fn i_sign(self) -> Self {
                 if self > 0 { 1 } else if $signed && SignedBits::i_is_negative(self) { !0 } else { 0 }
             }
-            // Probed from numpy: `reciprocal(0)` is -1 for int8/int16 (which
-            // compute in `int` and truncate), the type's maximum for
-            // int32/int64, and all-ones for every unsigned type.
+            // The C integer loop's zero-divisor result is platform-specific.
+            // Apple keeps -1 for narrow signed types and MAX otherwise;
+            // Linux x86-64 returns MIN for i32/i64 and zero for every other
+            // integer loop (including the i8 loop used for bool).
             #[inline] fn i_reciprocal(self) -> Self {
                 if self == 0 {
                     // numpy reports both conditions here.
                     fpe::raise(fpe::DIVIDE | fpe::INVALID);
+                    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                        return if $signed && $bits >= 32 { Self::MIN } else { 0 };
+                    }
                     return if $bits <= 16 && $signed { !0 } else { Self::MAX };
                 }
                 (1 as Self).wrapping_div(self)
@@ -695,6 +699,22 @@ pub trait RealFloat: Element + FpClass {
     fn r_remainder_flags(self, o: Self) -> u8;
     fn r_ldexp(self, n: i64) -> Self;
     fn r_signbit(self) -> bool;
+}
+
+/// The invalid condition left by glibc's `fmod`-based loops.
+///
+/// NumPy's Linux loops preserve the hardware invalid flag for an infinite
+/// dividend or a zero divisor. Accelerate's corresponding loops clear it.
+#[inline]
+fn platform_mod_invalid_flags<T: FpClass>(x: T, y: T) -> u8 {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && !x.fp_nan()
+        && (y.fp_zero() || (x.fp_inf() && !y.fp_nan()))
+    {
+        fpe::INVALID
+    } else {
+        0
+    }
 }
 
 /// `nextafter` over the raw bits — the standard formulation, and the one
@@ -946,7 +966,9 @@ impl RealFloat for f64 {
     }
     #[inline]
     fn r_remainder_flags(self, o: Self) -> u8 {
-        if o != 0.0 && self.is_finite() && o.is_finite() && ((self - self % o) / o).is_infinite() {
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            platform_mod_invalid_flags(self, o)
+        } else if o != 0.0 && self.is_finite() && o.is_finite() && ((self - self % o) / o).is_infinite() {
             fpe::OVER | fpe::INVALID
         } else {
             0
@@ -1094,7 +1116,9 @@ impl RealFloat for f32 {
     }
     #[inline]
     fn r_remainder_flags(self, o: Self) -> u8 {
-        if o != 0.0 && self.is_finite() && o.is_finite() && ((self - self % o) / o).is_infinite() {
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            platform_mod_invalid_flags(self, o)
+        } else if o != 0.0 && self.is_finite() && o.is_finite() && ((self - self % o) / o).is_infinite() {
             fpe::OVER | fpe::INVALID
         } else {
             0
@@ -1203,8 +1227,8 @@ impl RealFloat for F16 {
     /// what numpy does: `np.remainder(np.float16(1), np.float16(0))` is a
     /// silent NaN.
     #[inline]
-    fn r_remainder_flags(self, _o: Self) -> u8 {
-        0
+    fn r_remainder_flags(self, o: Self) -> u8 {
+        platform_mod_invalid_flags(self, o)
     }
     #[inline]
     fn r_ldexp(self, n: i64) -> Self {
@@ -2134,8 +2158,7 @@ where
             n,
             |x, y| x.r_fmod(y),
             watch_nonfinite,
-            // numpy's fmod raises nothing at all, even for `fmod(1.0, 0.0)`.
-            |_, _, _| 0,
+            |x, y, _| platform_mod_invalid_flags(x, y),
         ),
         BinOp::Arctan2 => binary2::<T, T, _>(a, b, o, n, |x, y| x.r_atan2(y)),
         BinOp::Hypot => binary2_flagged::<T, T, _, _, _>(
@@ -2673,10 +2696,21 @@ mod tests {
         assert_eq!(RealFloat::r_divmod_flags(max, 2.0), 0);
         // `remainder` keeps only the overflow half, and half precision keeps
         // nothing at all.
-        assert_eq!(RealFloat::r_remainder_flags(1.0f64, 0.0), 0);
+        assert_eq!(
+            RealFloat::r_remainder_flags(1.0f64, 0.0),
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                fpe::INVALID
+            } else {
+                0
+            }
+        );
         assert_eq!(
             RealFloat::r_remainder_flags(max, tiny),
-            fpe::OVER | fpe::INVALID
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                0
+            } else {
+                fpe::OVER | fpe::INVALID
+            }
         );
         assert_eq!(
             RealFloat::r_remainder_flags(F16::from_f32(65504.0), F16::from_f32(6.103515625e-5)),
@@ -2686,6 +2720,39 @@ mod tests {
         assert_eq!(
             RealFloat::r_divmod_flags(f32::MAX, f32::MIN_POSITIVE),
             fpe::OVER | fpe::INVALID
+        );
+        assert_eq!(
+            platform_mod_invalid_flags(f64::INFINITY, 2.0),
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                fpe::INVALID
+            } else {
+                0
+            }
+        );
+    }
+
+    #[test]
+    fn integer_reciprocal_zero_matches_platform_loop() {
+        fpe::clear();
+        let i32_zero = IntOps::i_reciprocal(0i32);
+        assert_eq!(
+            i32_zero,
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        );
+        assert_eq!(fpe::take(), fpe::DIVIDE | fpe::INVALID);
+
+        let u8_zero = IntOps::i_reciprocal(0u8);
+        assert_eq!(
+            u8_zero,
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                0
+            } else {
+                u8::MAX
+            }
         );
     }
 
