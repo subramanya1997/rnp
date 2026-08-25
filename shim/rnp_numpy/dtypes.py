@@ -33,6 +33,9 @@ class _DTypeMeta(type):
 
     def __call__(cls, *args, **kwargs):
         if cls is dtype:
+            if (len(args) == 1 and isinstance(args[0], dtype)
+                    and not kwargs):
+                return args[0]
             return _concrete(_raw_dtype(*args, **kwargs))
         return super().__call__(*args, **kwargs)
 
@@ -53,7 +56,7 @@ class dtype(_raw_dtype, metaclass=_DTypeMeta):
     _is_numeric = False
 
     def newbyteorder(self, new_order="S", /):
-        return _concrete(_raw_dtype.newbyteorder(self, new_order))
+        return _allocate(type(self), _raw_dtype.newbyteorder(self, new_order))
 
     @property
     def base(self):
