@@ -7,9 +7,51 @@ unchanged with only the import swapped.
 """
 
 import importlib as _importlib
+import importlib.abc as _abc
+import importlib.util as _ilu
 import sys as _sys
 
+# The shim's internals (modules ported nearly verbatim from numpy) import
+# `numpy.*` by absolute name, so importing rnp claims the `numpy` name for
+# this process: a meta-path finder maps the whole `numpy` namespace onto
+# `rnp_numpy`, returning the same module objects so identity checks hold.
+# Mixing engines in one process is not supported — fail loudly rather than
+# hand back a chimera of real-numpy and rnp arrays.
+if "numpy" in _sys.modules and not getattr(
+        _sys.modules["numpy"], "__rnp__", False):
+    raise ImportError(
+        "cannot import rnp after real numpy is already imported: rnp takes "
+        "over the 'numpy' module namespace for the whole process. Import rnp "
+        "first (or drop the real-numpy import).")
+
+
+class _Redirector(_abc.MetaPathFinder, _abc.Loader):
+    def find_spec(self, fullname, path=None, target=None):
+        # `numpy` and `numpy.*` — and `rnp.*` submodule imports — all map
+        # onto the corresponding rnp_numpy module (same object, so identity
+        # checks hold across spellings).
+        if fullname == "numpy" or fullname.startswith("numpy."):
+            return _ilu.spec_from_loader(fullname, self)
+        if fullname.startswith("rnp."):
+            return _ilu.spec_from_loader(fullname, self)
+        return None
+
+    def create_module(self, spec):
+        stem = spec.name.split(".", 1)
+        return _importlib.import_module(
+            "rnp_numpy" + ("." + stem[1] if len(stem) > 1 else ""))
+
+    def exec_module(self, module):
+        pass
+
+
+if not any(isinstance(f, _Redirector) for f in _sys.meta_path):
+    _sys.meta_path.insert(0, _Redirector())
+
 import rnp_numpy as _base
+
+_base.__rnp__ = True
+_sys.modules.setdefault("numpy", _base)
 
 # Adopt the full top-level namespace.
 _this = _sys.modules[__name__]
