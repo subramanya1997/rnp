@@ -424,7 +424,7 @@ impl PyFlatIter {
             resolved.push(v as usize);
         }
         if !self.arr.dtype().is_flexible() {
-            if let Some(s) = crate::convert::any_scalar(value)? {
+            if let Some(s) = crate::convert::assignment_scalar(value, self.arr.dtype())? {
                 for &v in &resolved {
                     self.arr.write_at(self.offset(v), s);
                 }
@@ -2226,7 +2226,7 @@ impl PyNdArray {
                     return Ok(());
                 }
                 if !view.dtype().is_flexible() {
-                    if let Some(s) = crate::convert::any_scalar(value)? {
+                    if let Some(s) = crate::convert::assignment_scalar(value, view.dtype())? {
                         // Keep the original scalar until the storage cast so
                         // overflow/invalid is attributed to this assignment.
                         view.fill(s);

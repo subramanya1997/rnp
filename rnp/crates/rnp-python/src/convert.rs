@@ -57,6 +57,22 @@ pub fn any_scalar(obj: &Bound<'_, PyAny>) -> PyResult<Option<Scalar>> {
     Ok(scalar_from_py(obj))
 }
 
+/// A scalar used as the right-hand side of assignment.  Unlike direct 0-d
+/// construction (`np.array(np.float64(np.nan), dtype=int)`), assignment uses
+/// NumPy's scalar-to-C conversion rules and therefore performs the same
+/// integer validation as a scalar nested inside a sequence.
+pub fn assignment_scalar(obj: &Bound<'_, PyAny>, target: DType) -> PyResult<Option<Scalar>> {
+    if let Some((src, value)) = np_scalar(obj)? {
+        check_int_store(target, Some(src), value)?;
+        return Ok(Some(value));
+    }
+    if let Some(value) = scalar_from_py(obj) {
+        check_int_store(target, None, value)?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
 /// Recognise one of the shim's numpy scalar objects.
 ///
 /// The protocol is deliberately narrow: a numpy scalar carries both a `_v`
@@ -410,12 +426,14 @@ pub fn too_large() -> PyErr {
 /// | numpy scalar             | OverflowError | wraps silently  |
 ///
 /// and, either way, a value outside the C conversion type raises
-/// [`too_large`] instead. Python `bool` and non-finite floats are never
-/// checked.
+/// [`too_large`] instead. Python `bool` is never checked. Non-finite floats
+/// raise through integer conversion, except that numpy float scalars assigned
+/// to unsigned arrays use the unsigned casting loop and wrap.
 pub fn check_int_store(target: DType, src: Option<DType>, v: Scalar) -> PyResult<()> {
     let Some((lo, hi)) = int_bounds(target) else {
         return Ok(());
     };
+    let signed = target.category() == rnp_core::dtype::Kind::Int;
     let n: i128 = match v {
         // `np.array([True], dtype=np.int8)` is 1, never an error.
         Scalar::Bool(_) => return Ok(()),
@@ -424,7 +442,16 @@ pub fn check_int_store(target: DType, src: Option<DType>, v: Scalar) -> PyResult
         // numpy converts through `int(obj)`, which truncates toward zero.
         Scalar::Float(f) => {
             if !f.is_finite() {
-                return Ok(());
+                if src.is_some() && !signed {
+                    return Ok(());
+                }
+                return Err(if f.is_nan() {
+                    PyValueError::new_err("cannot convert float NaN to integer")
+                } else {
+                    pyo3::exceptions::PyOverflowError::new_err(
+                        "cannot convert float infinity to integer",
+                    )
+                });
             }
             let t = f.trunc();
             if t >= 1.7e38 {
@@ -437,7 +464,6 @@ pub fn check_int_store(target: DType, src: Option<DType>, v: Scalar) -> PyResult
         }
         Scalar::Complex(_) => return Ok(()),
     };
-    let signed = target.category() == rnp_core::dtype::Kind::Int;
     // An *unsigned* target does not check a numpy scalar at all: probed,
     // `np.array([np.int64(-1)], dtype=np.uint8)` is 255 and
     // `np.array([np.uint64(2**63)], dtype=np.uint8)` is 0, while the same
