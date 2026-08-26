@@ -48,10 +48,13 @@ scalar aliases.
 ## Full-suite scoreboard, Linux x86_64 (2026-08-25, main @ f036983)
 
 core 32316/34229 (94.4%), lib 4153/4759, ma 4177/4376, fft 157/159,
-random 1324/1349, polynomial 566/610, top 129/207, matrixlib 99/209,
-linalg 158/485 — GRAND TOTAL 43079/46383 (92.9%).
+random 1324/1349, polynomial 566/610, top 129/207, matrixlib 189/209,
+linalg 485/485 (100%) — GRAND TOTAL 43938/46383 (94.7%).
 
-Known gap driving linalg (32.6% vs 100% on macOS) and matrixlib: the Linux
-runtime backend dlopens numpy's bundled scipy-openblas64 for BLAS (gemm/dotc)
-but does not yet resolve its LAPACK entry points; macOS links Accelerate
-LAPACK. Extending the dlopen backend to LAPACK closes it.
+The linalg gap (originally 158/485) was closed by extending the dlopen
+backend to the bundled library's LAPACK entry points. Symbol scheme note:
+numpy's scipy-openblas64 exports Fortran LAPACK as scipy_<routine>_64_
+(e.g. scipy_dgesv_64_) and CBLAS as scipy_cblas_<routine>64_ — plain,
+LAPACKE, and unsuffixed forms are absent. 26 routines resolved; Linux
+routes through the same linalg kernels as macOS with runtime backend
+gating, and the F80/C160 long-double paths cover linalg on Linux too.
