@@ -2297,7 +2297,16 @@ impl PyNdArray {
                         crate::objects::write(&view, view.byte_offset, value);
                         return Ok(());
                     }
-                    let src = crate::objects::array_from_objects(value)?;
+                    let src = if let Ok(array) = value.cast::<PyNdArray>() {
+                        let array = array.borrow().arr.clone();
+                        if array.dtype().is_object() {
+                            array.copy()
+                        } else {
+                            crate::objects::astype_object(slf.py(), &array)?
+                        }
+                    } else {
+                        crate::objects::array_from_objects(value)?
+                    };
                     let src = if src.shape == view.shape {
                         src
                     } else {
@@ -3218,6 +3227,18 @@ impl PyNdArray {
         let me = slf.borrow().arr.clone();
         if !me.flags.writeable {
             return Err(PyValueError::new_err("output array is read-only"));
+        }
+        if me.dtype().is_object() {
+            let operands = [slf.as_any().clone(), other.clone()];
+            crate::objloops::call(
+                py,
+                op.name(),
+                &operands,
+                Some(slf.as_any()),
+                None,
+                None,
+            )?;
+            return Ok(());
         }
         let rhs = operand_for(other, me.dtype(), false)?
             .ok_or_else(|| PyTypeError::new_err("unsupported operand for in-place op"))?;
