@@ -134,6 +134,12 @@ class Generator:
         constructor = getattr(_pickle, "__generator_ctor")
         return constructor, (self._bit_generator,), None
 
+    def __setstate__(self, bit_gen):
+        if isinstance(bit_gen, dict):
+            # NumPy < 2.0 pickles stored only the underlying bit-generator
+            # state and applied it to Generator via pickle's BUILD opcode.
+            self.bit_generator.state = bit_gen
+
     def random(self, size=None, dtype=float64, out=None):
         name = _dtype_name(dtype)
         if name == "float64":
