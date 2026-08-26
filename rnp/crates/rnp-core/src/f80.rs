@@ -299,6 +299,40 @@ impl F80 {
         )
     }
 
+    /// Square root in x87 precision.
+    ///
+    /// A binary64 seed supplies 53 correct significand bits; Newton's method
+    /// doubles that precision on the first refinement, after which the normal
+    /// F80 arithmetic rounds the result to the stored 64-bit significand.
+    pub fn sqrt(self) -> F80 {
+        if self.is_nan() || self.is_zero() {
+            return self;
+        }
+        if self.is_sign_negative() {
+            return F80::NAN;
+        }
+        if self.is_infinite() {
+            return self;
+        }
+        let finite = self.finite().expect("finite nonzero value");
+        let mut exponent = finite.exponent;
+        let mut mantissa = finite.significand as f64 / INTEGER_BIT as f64;
+        if exponent & 1 != 0 {
+            mantissa *= 2.0;
+            exponent -= 1;
+        }
+        let seed = F80::from_f64(mantissa.sqrt());
+        let mut root = F80::from_scaled(
+            false,
+            seed.significand as u128,
+            exponent / 2 - 63,
+            false,
+        );
+        let half = F80::from_parts(false, (EXP_BIAS - 1) as u16, INTEGER_BIT);
+        root = root.add(self.div(root)).mul(half);
+        root.add(self.div(root)).mul(half)
+    }
+
     pub fn partial_cmp_value(self, other: F80) -> Option<Ordering> {
         if self.is_nan() || other.is_nan() {
             return None;
@@ -740,5 +774,18 @@ mod tests {
             F80::from_parts(false, 1, INTEGER_BIT).to_shortest_string(),
             "3.3621031431120935063e-4932"
         );
+    }
+
+    #[test]
+    fn square_root_keeps_extended_precision_and_special_values() {
+        let two = F80::from_u64(2);
+        assert!(two.sqrt().same_bits(F80::from_parts(
+            false,
+            EXP_BIAS as u16,
+            0xb504_f333_f9de_6484,
+        )));
+        assert!(F80::ZERO.neg().sqrt().same_bits(F80::ZERO.neg()));
+        assert!(F80::ONE.neg().sqrt().is_nan());
+        assert!(F80::INFINITY.sqrt().same_bits(F80::INFINITY));
     }
 }
