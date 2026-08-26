@@ -6,9 +6,245 @@
 
 use num_complex::Complex;
 
-use crate::{DType, Error, NdArray, Result, Scalar};
+use crate::{C160, DType, Error, F80, NdArray, Result, Scalar};
 
 type C64 = Complex<f64>;
+
+fn f80_twiddle(phase: usize, n: usize, forward: bool) -> C160 {
+    let angle = F80::PI
+        .add(F80::PI)
+        .mul(F80::from_u64((phase % n) as u64))
+        .div(F80::from_u64(n as u64));
+    let (sin, cos) = angle.sin_cos_0_2pi();
+    C160 {
+        re: cos,
+        im: if forward { sin.neg() } else { sin },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct F80Accum {
+    high: F80,
+    low: F80,
+}
+
+impl F80Accum {
+    fn zero() -> Self {
+        Self { high: F80::ZERO, low: F80::ZERO }
+    }
+
+    fn add(&mut self, value: F80) {
+        let sum = self.high.add(value);
+        let virtual_value = sum.sub(self.high);
+        let error = self
+            .high
+            .sub(sum.sub(virtual_value))
+            .add(value.sub(virtual_value));
+        let tail = self.low.add(error);
+        let high = sum.add(tail);
+        self.low = tail.sub(high.sub(sum));
+        self.high = high;
+    }
+
+    fn add_product(&mut self, left: F80, right: F80, negative: bool) {
+        let product = left.mul(right);
+        let splitter = F80::from_u64((1u64 << 32) + 1);
+        let split_left = splitter.mul(left);
+        let left_high = split_left.sub(split_left.sub(left));
+        let left_low = left.sub(left_high);
+        let split_right = splitter.mul(right);
+        let right_high = split_right.sub(split_right.sub(right));
+        let right_low = right.sub(right_high);
+        let error = left_high
+            .mul(right_high)
+            .sub(product)
+            .add(left_high.mul(right_low))
+            .add(left_low.mul(right_high))
+            .add(left_low.mul(right_low));
+        if negative {
+            self.add(product.neg());
+            self.add(error.neg());
+        } else {
+            self.add(product);
+            self.add(error);
+        }
+    }
+
+    fn value(self) -> F80 {
+        self.high.add(self.low)
+    }
+}
+
+fn f80_twiddles(n: usize, forward: bool) -> Vec<C160> {
+    let mut twiddles = vec![C160::ZERO; n];
+    twiddles[0] = C160 { re: F80::ONE, im: F80::ZERO };
+    for phase in 1..=n / 2 {
+        let value = f80_twiddle(phase, n, forward);
+        twiddles[phase] = value;
+        if phase != n - phase {
+            twiddles[n - phase] = C160 { re: value.re, im: value.im.neg() };
+        }
+    }
+    twiddles
+}
+
+fn c2c_f80_unscaled(input: &[C160], forward: bool) -> Vec<C160> {
+    let n = input.len();
+    if n <= 1 {
+        return input.to_vec();
+    }
+    let twiddles = f80_twiddles(n, forward);
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut re = F80Accum::zero();
+        let mut im = F80Accum::zero();
+        for (j, value) in input.iter().enumerate() {
+            let phase = ((k as u128 * j as u128) % n as u128) as usize;
+            let twiddle = twiddles[phase];
+            re.add_product(value.re, twiddle.re, false);
+            re.add_product(value.im, twiddle.im, true);
+            im.add_product(value.re, twiddle.im, false);
+            im.add_product(value.im, twiddle.re, false);
+        }
+        out.push(C160 { re: re.value(), im: im.value() });
+    }
+    out
+}
+
+/// Extended-precision complex transform.
+///
+/// This path deliberately favors correctness over speed.  The software F80
+/// backend only exists on Linux/x86-64, and a compensated DFT keeps every
+/// operation, including twiddle construction and normalization, in that
+/// format instead of silently passing through binary64.
+fn c2c_f80(input: &[C160], forward: bool, scale: F80) -> Vec<C160> {
+    if forward {
+        return c2c_f80_unscaled(input, true)
+            .into_iter()
+            .map(|value| C160 {
+                re: value.re.mul(scale),
+                im: value.im.mul(scale),
+            })
+            .collect();
+    }
+
+    let n = input.len();
+    let inverse_n = F80::ONE.div(F80::from_u64(n as u64));
+    let mut estimate: Vec<C160> = c2c_f80_unscaled(input, false)
+        .into_iter()
+        .map(|value| C160 {
+            re: value.re.mul(inverse_n),
+            im: value.im.mul(inverse_n),
+        })
+        .collect();
+    // The rounded F80 twiddle matrix is not perfectly unitary.  One residual
+    // correction makes this software inverse solve the matrix actually used
+    // by the forward transform, rather than assuming its conjugate is exact.
+    let projected = c2c_f80_unscaled(&estimate, true);
+    let residual: Vec<C160> = input
+        .iter()
+        .zip(projected)
+        .map(|(&wanted, actual)| wanted.sub(actual))
+        .collect();
+    let correction = c2c_f80_unscaled(&residual, false);
+    for (value, correction) in estimate.iter_mut().zip(correction) {
+        value.re = value.re.add(correction.re.mul(inverse_n));
+        value.im = value.im.add(correction.im.mul(inverse_n));
+    }
+    let factor = if scale.same_bits(inverse_n) {
+        F80::ONE
+    } else {
+        scale.mul(F80::from_u64(n as u64))
+    };
+    estimate
+        .into_iter()
+        .map(|value| C160 {
+            re: value.re.mul(factor),
+            im: value.im.mul(factor),
+        })
+        .collect()
+}
+
+fn scale_f80(scale: f64, n: usize) -> F80 {
+    if scale == 1.0 {
+        F80::ONE
+    } else if scale == 1.0 / n as f64 {
+        F80::ONE.div(F80::from_u64(n as u64))
+    } else {
+        F80::ONE.div(F80::from_u64(n as u64).sqrt())
+    }
+}
+
+fn r2c_f80(input: &[F80], scale: F80) -> Vec<C160> {
+    let n = input.len();
+    let twiddles = f80_twiddles(n, true);
+    let mut out = Vec::with_capacity(n / 2 + 1);
+    for k in 0..=n / 2 {
+        let mut re = F80Accum::zero();
+        let mut im = F80Accum::zero();
+        for (j, &value) in input.iter().enumerate() {
+            let phase = ((k as u128 * j as u128) % n as u128) as usize;
+            re.add_product(value, twiddles[phase].re, false);
+            im.add_product(value, twiddles[phase].im, false);
+        }
+        out.push(C160 {
+            re: re.value().mul(scale),
+            im: im.value().mul(scale),
+        });
+    }
+    out
+}
+
+fn hermitian_f80(input: &[C160], n: usize) -> Vec<C160> {
+    let mut spectrum = vec![C160::ZERO; n];
+    let take = input.len().min(n / 2 + 1);
+    if take != 0 {
+        spectrum[0].re = input[0].re;
+    }
+    for k in 1..take {
+        spectrum[k] = input[k];
+        if k == n - k {
+            spectrum[k].im = F80::ZERO;
+        } else {
+            spectrum[n - k] = C160 {
+                re: input[k].re,
+                im: input[k].im.neg(),
+            };
+        }
+    }
+    spectrum
+}
+
+fn c2r_f80(input: &[C160], n: usize, scale: F80) -> Vec<F80> {
+    let spectrum = hermitian_f80(input, n);
+    let mut result: Vec<F80> = c2c_f80(&spectrum, false, scale)
+        .into_iter()
+        .map(|value| value.re)
+        .collect();
+    for _ in 0..2 {
+        let projected = r2c_f80(&result, F80::ONE);
+        let residual: Vec<C160> = input
+            .iter()
+            .take(projected.len())
+            .zip(projected)
+            .enumerate()
+            .map(|(index, (&wanted, actual))| C160 {
+                re: wanted.re.sub(actual.re),
+                im: if index == 0 || (n & 1 == 0 && index == n / 2) {
+                    F80::ZERO
+                } else {
+                    wanted.im.sub(actual.im)
+                },
+            })
+            .collect();
+        let correction_spectrum = hermitian_f80(&residual, n);
+        let correction = c2c_f80(&correction_spectrum, false, scale);
+        for (value, correction) in result.iter_mut().zip(correction) {
+            *value = value.add(correction.re);
+        }
+    }
+    result
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct C {
@@ -2037,6 +2273,29 @@ pub fn c2c_axis(
     for batch in 0..batches {
         decode_batch(batch, &shape, axis, &mut src_index);
         dst_index.copy_from_slice(&src_index);
+        if out_dtype == DType::C160 {
+            let mut line = vec![C160::ZERO; n];
+            for (j, value) in line.iter_mut().take(take).enumerate() {
+                src_index[axis] = j as isize;
+                *value = match input.read_at(input.byte_index(&src_index)) {
+                    Scalar::Complex160(value) => value,
+                    Scalar::Float80(value) => C160 { re: value, im: F80::ZERO },
+                    Scalar::Complex(value) => C160 {
+                        re: F80::from_f64(value.re),
+                        im: F80::from_f64(value.im),
+                    },
+                    other => C160 { re: F80::from_f64(other.as_f64()), im: F80::ZERO },
+                };
+            }
+            for (j, value) in c2c_f80(&line, forward, scale_f80(scale, n))
+                .into_iter()
+                .enumerate()
+            {
+                dst_index[axis] = j as isize;
+                output.write_at(output.byte_index(&dst_index), Scalar::Complex160(value));
+            }
+            continue;
+        }
         if scaled_single {
             let mut line = vec![Complex::<f32>::new(0.0, 0.0); n];
             for (j, value) in line.iter_mut().take(take).enumerate() {
@@ -2105,6 +2364,21 @@ pub fn r2c_axis(
     for batch in 0..batches {
         decode_batch(batch, &shape, axis, &mut si);
         di.copy_from_slice(&si);
+        if out_dtype == DType::C160 {
+            let mut line = vec![F80::ZERO; n];
+            for j in 0..take {
+                si[axis] = j as isize;
+                line[j] = match input.read_at(input.byte_index(&si)) {
+                    Scalar::Float80(value) => value,
+                    other => F80::from_f64(other.as_f64()),
+                };
+            }
+            for (j, value) in r2c_f80(&line, scale_f80(scale, n)).into_iter().enumerate() {
+                di[axis] = j as isize;
+                output.write_at(output.byte_index(&di), Scalar::Complex160(value));
+            }
+            continue;
+        }
         if scaled_single {
             let mut line = vec![0.0f32; n];
             for j in 0..take {
@@ -2159,6 +2433,26 @@ pub fn c2r_axis(
     for batch in 0..batches {
         decode_batch(batch, &shape, axis, &mut si);
         di.copy_from_slice(&si);
+        if out_dtype == DType::F80 {
+            let mut line = vec![C160::ZERO; take];
+            for (j, value) in line.iter_mut().enumerate() {
+                si[axis] = j as isize;
+                *value = match input.read_at(input.byte_index(&si)) {
+                    Scalar::Complex160(value) => value,
+                    Scalar::Float80(value) => C160 { re: value, im: F80::ZERO },
+                    Scalar::Complex(value) => C160 {
+                        re: F80::from_f64(value.re),
+                        im: F80::from_f64(value.im),
+                    },
+                    other => C160 { re: F80::from_f64(other.as_f64()), im: F80::ZERO },
+                };
+            }
+            for (j, value) in c2r_f80(&line, n, scale_f80(scale, n)).into_iter().enumerate() {
+                di[axis] = j as isize;
+                output.write_at(output.byte_index(&di), Scalar::Float80(value));
+            }
+            continue;
+        }
         if scaled_single {
             let mut line = vec![Complex::<f32>::new(0.0, 0.0); take];
             for (j, value) in line.iter_mut().enumerate() {
@@ -2230,5 +2524,71 @@ mod tests {
         let spectrum = r2c(&input, 1.0);
         let back = c2r(&spectrum, input.len(), 1.0 / input.len() as f64);
         assert_eq!(back, input);
+    }
+
+    #[test]
+    fn f80_round_trip_meets_numpy_longdouble_tolerance() {
+        let tolerance = F80::EPSILON.mul(F80::from_u64(5));
+        let reversed_tolerance = F80::EPSILON.mul(F80::from_u64(6));
+        for n in 1..32 {
+            let input: Vec<C160> = (0..n)
+                .map(|i| C160 {
+                    re: F80::from_f64(((i * 17 + 3) % 29) as f64 / 29.0),
+                    im: F80::from_f64(((i * 11 + 5) % 31) as f64 / 31.0),
+                })
+                .collect();
+            let transformed = c2c_f80(&input, true, F80::ONE);
+            let back = c2c_f80(
+                &transformed,
+                false,
+                F80::ONE.div(F80::from_u64(n as u64)),
+            );
+            for (actual, expected) in back.iter().zip(&input) {
+                let re_error = actual.re.sub(expected.re).abs();
+                let im_error = actual.im.sub(expected.im).abs();
+                assert!(re_error.partial_cmp_value(tolerance)
+                    != Some(std::cmp::Ordering::Greater), "n={n}, re error={} eps",
+                    re_error.div(F80::EPSILON).to_f64());
+                assert!(im_error.partial_cmp_value(tolerance)
+                    != Some(std::cmp::Ordering::Greater), "n={n}, im error={} eps",
+                    im_error.div(F80::EPSILON).to_f64());
+            }
+
+            let real_input: Vec<F80> = input.iter().map(|value| value.re).collect();
+            let spectrum = r2c_f80(&real_input, F80::ONE);
+            let real_back = c2r_f80(
+                &spectrum,
+                n,
+                F80::ONE.div(F80::from_u64(n as u64)),
+            );
+            for (actual, expected) in real_back.iter().zip(&real_input) {
+                assert!(actual.sub(*expected).abs().partial_cmp_value(tolerance)
+                    != Some(std::cmp::Ordering::Greater), "real n={n}");
+            }
+
+            let take = n / 2 + 1;
+            let arbitrary_spectrum = input[..take].to_vec();
+            let mut expected_spectrum = arbitrary_spectrum.clone();
+            expected_spectrum[0].im = F80::ZERO;
+            if n & 1 == 0 {
+                expected_spectrum[n / 2].im = F80::ZERO;
+            }
+            let reconstructed = c2r_f80(
+                &arbitrary_spectrum,
+                n,
+                F80::ONE.div(F80::from_u64(n as u64)),
+            );
+            let spectrum_back = r2c_f80(&reconstructed, F80::ONE);
+            for (actual, expected) in spectrum_back.iter().zip(&expected_spectrum) {
+                let re_error = actual.re.sub(expected.re).abs();
+                let im_error = actual.im.sub(expected.im).abs();
+                assert!(re_error.partial_cmp_value(reversed_tolerance)
+                    != Some(std::cmp::Ordering::Greater), "reversed real n={n}, error={} eps",
+                    re_error.div(F80::EPSILON).to_f64());
+                assert!(im_error.partial_cmp_value(reversed_tolerance)
+                    != Some(std::cmp::Ordering::Greater), "reversed imag n={n}, error={} eps",
+                    im_error.div(F80::EPSILON).to_f64());
+            }
+        }
     }
 }

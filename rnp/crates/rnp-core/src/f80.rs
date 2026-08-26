@@ -40,6 +40,11 @@ impl F80 {
     pub const ZERO: F80 = F80::from_parts(false, 0, 0);
     pub const ONE: F80 = F80::from_parts(false, EXP_BIAS as u16, INTEGER_BIT);
     pub const TEN: F80 = F80::from_parts(false, (EXP_BIAS + 3) as u16, 0xa000_0000_0000_0000);
+    pub const EPSILON: F80 = F80::from_parts(false, (EXP_BIAS - 63) as u16, INTEGER_BIT);
+    pub const PI: F80 = F80::from_parts(false, (EXP_BIAS + 1) as u16, 0xc90f_daa2_2168_c235);
+    pub const FRAC_PI_2: F80 = F80::from_parts(false, EXP_BIAS as u16, 0xc90f_daa2_2168_c235);
+    pub const FRAC_PI_4: F80 =
+        F80::from_parts(false, (EXP_BIAS - 1) as u16, 0xc90f_daa2_2168_c235);
     pub const INFINITY: F80 = F80::from_parts(false, 0x7fff, INTEGER_BIT);
     pub const NAN: F80 = F80::from_parts(false, 0x7fff, 0xc000_0000_0000_0000);
 
@@ -331,6 +336,59 @@ impl F80 {
         let half = F80::from_parts(false, (EXP_BIAS - 1) as u16, INTEGER_BIT);
         root = root.add(self.div(root)).mul(half);
         root.add(self.div(root)).mul(half)
+    }
+
+    /// Sine and cosine in x87 precision for an angle in `[0, 2*pi]`.
+    ///
+    /// FFT twiddle construction is the only caller.  Quadrant reduction keeps
+    /// the Taylor series on `[0, pi/4]`; 16 terms then leave substantially
+    /// less than half an F80 ulp of truncation error at the endpoint.
+    pub fn sin_cos_0_2pi(self) -> (F80, F80) {
+        debug_assert!(!self.is_sign_negative());
+        let two_pi = F80::PI.add(F80::PI);
+        debug_assert!(self.partial_cmp_value(two_pi) != Some(Ordering::Greater));
+
+        let mut x = self;
+        let mut sin_negative = false;
+        let mut cos_negative = false;
+        if x.partial_cmp_value(F80::PI) == Some(Ordering::Greater) {
+            x = two_pi.sub(x);
+            sin_negative = true;
+        }
+        if x.partial_cmp_value(F80::FRAC_PI_2) == Some(Ordering::Greater) {
+            x = F80::PI.sub(x);
+            cos_negative = true;
+        }
+        let swap = x.partial_cmp_value(F80::FRAC_PI_4) == Some(Ordering::Greater);
+        if swap {
+            x = F80::FRAC_PI_2.sub(x);
+        }
+
+        let xx = x.mul(x).neg();
+        let mut sin_term = x;
+        let mut cos_term = F80::ONE;
+        let mut sin = sin_term;
+        let mut cos = cos_term;
+        for k in 1..=16u64 {
+            sin_term = sin_term
+                .mul(xx)
+                .div(F80::from_u64((2 * k) * (2 * k + 1)));
+            cos_term = cos_term
+                .mul(xx)
+                .div(F80::from_u64((2 * k - 1) * (2 * k)));
+            sin = sin.add(sin_term);
+            cos = cos.add(cos_term);
+        }
+        if swap {
+            std::mem::swap(&mut sin, &mut cos);
+        }
+        if sin_negative {
+            sin = sin.neg();
+        }
+        if cos_negative {
+            cos = cos.neg();
+        }
+        (sin, cos)
     }
 
     pub fn partial_cmp_value(self, other: F80) -> Option<Ordering> {
@@ -787,5 +845,16 @@ mod tests {
         assert!(F80::ZERO.neg().sqrt().same_bits(F80::ZERO.neg()));
         assert!(F80::ONE.neg().sqrt().is_nan());
         assert!(F80::INFINITY.sqrt().same_bits(F80::INFINITY));
+    }
+
+    #[test]
+    fn trigonometry_keeps_extended_precision() {
+        let (sin, cos) = F80::FRAC_PI_4.sin_cos_0_2pi();
+        let root_half = F80::from_u64(2).sqrt().div(F80::from_u64(2));
+        assert!(sin.same_bits(root_half));
+        assert!(cos.same_bits(root_half));
+        let (sin, cos) = F80::PI.sin_cos_0_2pi();
+        assert!(sin.abs().partial_cmp_value(F80::EPSILON) == Some(Ordering::Less));
+        assert!(cos.same_bits(F80::ONE.neg()));
     }
 }
