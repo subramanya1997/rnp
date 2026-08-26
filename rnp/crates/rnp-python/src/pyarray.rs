@@ -3094,10 +3094,11 @@ impl PyNdArray {
             let z = NdArray::zeros(a.shape.clone(), a.dtype()).map_err(crate::err)?;
             return PyNdArray::into_py_any(z, slf.py());
         }
-        let comp = if a.dtype() == DType::C64 {
-            DType::F32
-        } else {
-            DType::F64
+        let comp = match a.dtype() {
+            DType::C64 => DType::F32,
+            DType::C128 => DType::F64,
+            DType::C160 => DType::F80,
+            _ => unreachable!("component view requires a complex dtype"),
         };
         let mut v = a.clone();
         // The component view keeps the parent's byte order: a `'>c16'` array
