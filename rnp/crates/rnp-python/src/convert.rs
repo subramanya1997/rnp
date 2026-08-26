@@ -20,6 +20,13 @@ impl PyF80Value {
     fn __float__(&self) -> f64 { self.value.to_f64() }
     fn __int__(&self) -> i64 { self.value.to_f64() as i64 }
     fn __bool__(&self) -> bool { !self.value.is_zero() }
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        let Some(Scalar::Float80(value)) = scalar_from_py(other).map(|s| s.cast(DType::F80)) else {
+            return false;
+        };
+        self.value.partial_cmp_value(value) == Some(std::cmp::Ordering::Equal)
+    }
+    fn __ne__(&self, other: &Bound<'_, PyAny>) -> bool { !self.__eq__(other) }
     fn __str__(&self) -> String { self.value.to_shortest_string() }
     fn __repr__(&self) -> String { self.value.to_shortest_string() }
     #[getter] fn real(&self) -> Self { *self }
@@ -36,6 +43,14 @@ impl PyC160Value {
         PyComplex::from_doubles(py, self.value.re.to_f64(), self.value.im.to_f64())
     }
     fn __bool__(&self) -> bool { !self.value.re.is_zero() || !self.value.im.is_zero() }
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        let Some(Scalar::Complex160(value)) = scalar_from_py(other).map(|s| s.cast(DType::C160)) else {
+            return false;
+        };
+        self.value.re.partial_cmp_value(value.re) == Some(std::cmp::Ordering::Equal)
+            && self.value.im.partial_cmp_value(value.im) == Some(std::cmp::Ordering::Equal)
+    }
+    fn __ne__(&self, other: &Bound<'_, PyAny>) -> bool { !self.__eq__(other) }
     #[getter] fn real(&self) -> PyF80Value { PyF80Value { value: self.value.re } }
     #[getter] fn imag(&self) -> PyF80Value { PyF80Value { value: self.value.im } }
     fn conjugate(&self) -> Self { Self { value: C160 { re: self.value.re, im: self.value.im.neg() } } }

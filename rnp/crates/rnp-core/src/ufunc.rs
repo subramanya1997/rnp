@@ -1094,6 +1094,7 @@ fn unary_native(a: &NdArray, op: UnOp) -> Result<NdArray> {
                 UnOp::Negative => unary1::<F80, F80, _>(src, o, n, F80::neg),
                 UnOp::Positive | UnOp::Conjugate => unary1::<F80, F80, _>(src, o, n, |x| x),
                 UnOp::Absolute | UnOp::Fabs => unary1::<F80, F80, _>(src, o, n, F80::abs),
+                UnOp::Reciprocal => unary1::<F80, F80, _>(src, o, n, |x| F80::ONE.div(x)),
                 UnOp::OnesLike => unary1::<F80, F80, _>(src, o, n, |_| F80::ONE),
                 other => return Err(Error::NotImplemented(format!("unary {other:?} on F80"))),
             }

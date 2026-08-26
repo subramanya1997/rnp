@@ -267,6 +267,104 @@ macro_rules! pairwise_complex {
 pairwise_complex!(pairwise_c64, f32);
 pairwise_complex!(pairwise_c128, f64);
 
+/// NumPy's long-double pairwise sum, using the same eight-lane tree as the
+/// native float loops while keeping every operation in x87 precision.
+unsafe fn pairwise_f80(a: *const u8, n: usize, stride: isize) -> F80 {
+    let load = |i: usize| -> F80 {
+        // SAFETY: caller guarantees element `i` is in bounds.
+        unsafe { std::ptr::read_unaligned(a.offset(i as isize * stride) as *const F80) }
+    };
+    if n < 8 {
+        let mut res = F80::ZERO.neg();
+        for i in 0..n {
+            res = res.add(load(i));
+        }
+        return res;
+    }
+    if n <= PW_BLOCKSIZE {
+        let mut r = [load(0), load(1), load(2), load(3), load(4), load(5), load(6), load(7)];
+        let mut i = 8usize;
+        while i < n - (n % 8) {
+            for k in 0..8 {
+                r[k] = r[k].add(load(i + k));
+            }
+            i += 8;
+        }
+        let mut res = r[0].add(r[1]).add(r[2].add(r[3]))
+            .add(r[4].add(r[5]).add(r[6].add(r[7])));
+        while i < n {
+            res = res.add(load(i));
+            i += 1;
+        }
+        return res;
+    }
+    let mut n2 = n / 2;
+    n2 -= n2 % 8;
+    // SAFETY: both halves lie inside the caller's range.
+    let right = unsafe { a.offset(n2 as isize * stride) };
+    // SAFETY: both recursive calls cover disjoint in-bounds halves.
+    unsafe { pairwise_f80(a, n2, stride).add(pairwise_f80(right, n - n2, stride)) }
+}
+
+/// Long-complex counterpart of NumPy's component-wise pairwise sum.
+unsafe fn pairwise_c160(a: *const u8, n: usize, stride: isize) -> (F80, F80) {
+    let re = |i: usize| -> F80 {
+        // SAFETY: caller guarantees the component is in bounds.
+        unsafe { std::ptr::read_unaligned(a.offset(i as isize * stride) as *const F80) }
+    };
+    let im = |i: usize| -> F80 {
+        // SAFETY: the imaginary component follows the real component.
+        unsafe {
+            std::ptr::read_unaligned(
+                a.offset(i as isize * stride + std::mem::size_of::<F80>() as isize)
+                    as *const F80,
+            )
+        }
+    };
+    if n < 8 {
+        let (mut rr, mut ri) = (F80::ZERO.neg(), F80::ZERO.neg());
+        let mut i = 0usize;
+        while i < n {
+            rr = rr.add(re(i));
+            ri = ri.add(im(i));
+            i += 2;
+        }
+        return (rr, ri);
+    }
+    if n <= PW_BLOCKSIZE {
+        let mut r = [re(0), im(0), re(2), im(2), re(4), im(4), re(6), im(6)];
+        let mut i = 8usize;
+        while i < n - (n % 8) {
+            r[0] = r[0].add(re(i));
+            r[1] = r[1].add(im(i));
+            r[2] = r[2].add(re(i + 2));
+            r[3] = r[3].add(im(i + 2));
+            r[4] = r[4].add(re(i + 4));
+            r[5] = r[5].add(im(i + 4));
+            r[6] = r[6].add(re(i + 6));
+            r[7] = r[7].add(im(i + 6));
+            i += 8;
+        }
+        let mut rr = r[0].add(r[2]).add(r[4].add(r[6]));
+        let mut ri = r[1].add(r[3]).add(r[5].add(r[7]));
+        while i < n {
+            rr = rr.add(re(i));
+            ri = ri.add(im(i));
+            i += 2;
+        }
+        return (rr, ri);
+    }
+    let mut n2 = n / 2;
+    n2 -= n2 % 8;
+    // SAFETY: both halves lie inside the caller's range.
+    let right = unsafe { a.offset(n2 as isize * stride) };
+    // SAFETY: both recursive calls cover disjoint in-bounds halves.
+    let (rr1, ri1) = unsafe { pairwise_c160(a, n2, stride) };
+    // SAFETY: as above.
+    let (rr2, ri2) = unsafe { pairwise_c160(right, n - n2, stride) };
+    (rr1.add(rr2), ri1.add(ri2))
+}
+
 // ---------------------------------------------------------------------------
 // Partial accumulator
 // ---------------------------------------------------------------------------
@@ -279,8 +377,10 @@ enum Acc {
     F16(f32),
     F32(f32),
     F64(f64),
+    F80(F80),
     C64(C32),
     C128(C64v),
+    C160(C160),
 }
 
 impl Acc {
@@ -289,8 +389,10 @@ impl Acc {
             DType::F16 => Acc::F16(0.0),
             DType::F32 => Acc::F32(0.0),
             DType::F64 => Acc::F64(0.0),
+            DType::F80 => Acc::F80(F80::ZERO),
             DType::C64 => Acc::C64(C32::new(0.0, 0.0)),
             DType::C128 => Acc::C128(C64v::new(0.0, 0.0)),
+            DType::C160 => Acc::C160(C160::ZERO),
             d if d.is_unsigned() => Acc::Uint(0),
             _ => Acc::Int(0),
         }
@@ -321,6 +423,10 @@ impl Acc {
                 Scalar::Float(v) => v,
                 _ => 0.0,
             }),
+            Acc::F80(_) => Acc::F80(match s.cast(DType::F80) {
+                Scalar::Float80(v) => v,
+                _ => F80::ZERO,
+            }),
             Acc::C64(_) => Acc::C64(match s.cast(DType::C64) {
                 Scalar::Complex(c) => C32::new(c.re as f32, c.im as f32),
                 _ => C32::new(0.0, 0.0),
@@ -328,6 +434,10 @@ impl Acc {
             Acc::C128(_) => Acc::C128(match s.cast(DType::C128) {
                 Scalar::Complex(c) => c,
                 _ => C64v::new(0.0, 0.0),
+            }),
+            Acc::C160(_) => Acc::C160(match s.cast(DType::C160) {
+                Scalar::Complex160(v) => v,
+                _ => C160::ZERO,
             }),
         }
     }
@@ -339,8 +449,10 @@ impl Acc {
             (Acc::F16(a), Acc::F16(b)) => Acc::F16(a + b),
             (Acc::F32(a), Acc::F32(b)) => Acc::F32(a + b),
             (Acc::F64(a), Acc::F64(b)) => Acc::F64(a + b),
+            (Acc::F80(a), Acc::F80(b)) => Acc::F80(a.add(b)),
             (Acc::C64(a), Acc::C64(b)) => Acc::C64(a + b),
             (Acc::C128(a), Acc::C128(b)) => Acc::C128(a + b),
+            (Acc::C160(a), Acc::C160(b)) => Acc::C160(a.add(b)),
             _ => self,
         }
     }
@@ -365,8 +477,10 @@ impl Acc {
             Acc::F16(v) => Scalar::Float(F16::from_f32(v).to_f64()),
             Acc::F32(v) => Scalar::Float(v as f64),
             Acc::F64(v) => Scalar::Float(v),
+            Acc::F80(v) => Scalar::Float80(v),
             Acc::C64(v) => Scalar::Complex(C64v::new(v.re as f64, v.im as f64)),
             Acc::C128(v) => Scalar::Complex(v),
+            Acc::C160(v) => Scalar::Complex160(v),
         }
     }
 }
@@ -383,6 +497,7 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
         DType::F16 => Acc::F16(unsafe { pairwise_f16(p, n, stride) }),
         DType::F32 => Acc::F32(unsafe { pairwise_f32(p, n, stride) }),
         DType::F64 => Acc::F64(unsafe { pairwise_f64(p, n, stride) }),
+        DType::F80 => Acc::F80(unsafe { pairwise_f80(p, n, stride) }),
         DType::C64 => {
             let (re, im) = unsafe { pairwise_c64(p, 2 * n, stride / 2) };
             Acc::C64(C32::new(re, im))
@@ -390,6 +505,10 @@ unsafe fn sum_run(arr: &NdArray, off: isize, n: usize, stride: isize) -> Acc {
         DType::C128 => {
             let (re, im) = unsafe { pairwise_c128(p, 2 * n, stride / 2) };
             Acc::C128(C64v::new(re, im))
+        }
+        DType::C160 => {
+            let (re, im) = unsafe { pairwise_c160(p, 2 * n, stride / 2) };
+            Acc::C160(C160 { re, im })
         }
         d if d.is_unsigned() => {
             let mut acc = 0u64;
