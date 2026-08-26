@@ -2688,7 +2688,15 @@ impl PyNdArray {
             } else {
                 std::ptr::null_mut()
             };
-            (*view).ndim = arr.ndim() as c_int;
+            // A PyBUF_SIMPLE consumer asks for one flat byte span.  NumPy
+            // reports ndim=1 in that case even when the logical array is
+            // multidimensional; hashlib rejects exporters that report the
+            // original ndim while omitting shape and strides.
+            (*view).ndim = if (flags & ffi::PyBUF_ND) == ffi::PyBUF_ND {
+                arr.ndim() as c_int
+            } else {
+                1
+            };
             (*view).shape = if (flags & ffi::PyBUF_ND) == ffi::PyBUF_ND {
                 info.shape.as_ptr() as *mut ffi::Py_ssize_t
             } else {
